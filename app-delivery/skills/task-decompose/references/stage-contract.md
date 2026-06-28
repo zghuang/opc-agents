@@ -27,10 +27,13 @@ Constraints:
 - All file paths must be project-root-relative. Use `backend/...`, `frontend/...`, `mock-server/...`, or `docs/...` paths, not backend-root-relative shortcuts like `src/...` or `tests/...`.
 - For backend code paths, use `backend/src/...` and backend test paths such as `backend/src/tests/...` or `backend/tests/...`.
 - For frontend code paths, use `frontend/src/...`; for browser/e2e tests use `frontend/e2e/...` when the test is file-based.
-- Dependencies should only reference preceding feature tasks when necessary.
+- Add dependency edges only for real prerequisites: technical/shared foundation needs or product workflow/domain ordering. If feature B only makes sense after feature A, make B depend on A.
 - Ensure every requirement is covered by at least one feature task.
+- Do not use a foundation/support slice to claim full user-visible requirement coverage when it only creates scaffolding, stubs, wiring, or shared primitives; keep that full requirement on the owning feature slice and any validation task.
 - Prefer whole-feature sequencing: from infrastructure/shared foundations into functional slices, then final verification.
 - Each acceptance_scenario should have corresponding output tests that exercise it.
+- If a task owns a user-visible acceptance scenario and includes `frontend/src/...` output paths, its `output_tests` should normally include at least one browser/e2e test for that flow. Do not defer all browser evidence to a later validation task unless that downstream validation task explicitly owns the same scenario.
+- Validation tasks may deepen browser coverage, but they should not be the first and only browser evidence for a user-visible frontend feature slice.
 - Do not create a generic end-to-end verification suite task. The framework already provides T-FINAL for cross-project verification.
 - Use `task_kind: "feature"` for normal implementation slices and `task_kind: "validation"` for validation-focused work items.
 - If the project is medium-or-larger (`M`, `L`, or `XL`), add validation-focused work items into `items` so module or milestone QA happens during implementation, not only at T-FINAL.

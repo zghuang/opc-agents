@@ -88,6 +88,12 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
     gate_rows = gates_payload.get("gates") if isinstance(gates_payload.get("gates"), list) else []
     blocked_gates = [gate for gate in gate_rows if isinstance(gate, dict) and str(gate.get("status") or "").strip() == "blocked"]
     task_by_id = {task.id: task for task in tasks}
+    actionable = [
+        task
+        for task in tasks
+        if task.id != FINAL_VERIFY_TASK_ID and task.status != "cancelled" and getattr(task, "task_kind", "feature") != "repair"
+    ]
+    all_actionable_verified = bool(actionable) and all(task.status == "verified" for task in actionable)
     final_task = task_by_id.get(FINAL_VERIFY_TASK_ID)
     final_task_status = final_task.status if final_task is not None else None
     final_runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_dir, FINAL_VERIFY_TASK_ID))
@@ -121,10 +127,25 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
         must_continue = next_step is not None
         control_status = "in_progress" if must_continue else "blocked"
     elif isinstance(base.get("active_task"), dict):
-        next_step = None
-        must_continue = False
-        control_status = "running"
-    elif final_task_status == "blocked":
+        runtime_attention = base.get("runtime_attention") if isinstance(base.get("runtime_attention"), dict) else None
+        if runtime_attention and runtime_attention.get("suspected"):
+            task = base["active_task"]
+            next_step = _step(
+                "framework",
+                "recover_stalled",
+                "framework",
+                message=str(runtime_attention.get("message") or "Runtime appears stalled; recover the current task."),
+                project=str(project_dir),
+                task_id=str(task.get("id") or "").strip(),
+                attention_kind=str(runtime_attention.get("kind") or "").strip() or None,
+            ).to_dict()
+            must_continue = True
+            control_status = "in_progress"
+        else:
+            next_step = None
+            must_continue = False
+            control_status = "running"
+    elif final_task_status == "blocked" and all_actionable_verified:
         repair_task_id = str(final_runtime_state.get("repair_task_id") or "").strip()
         repair_task = task_by_id.get(repair_task_id) if repair_task_id else None
         repair_candidates = [

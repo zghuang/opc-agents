@@ -77,6 +77,8 @@ def _classify_runtime_error(text: str) -> str:
         return "auth_error"
     if re.search(r"network|connection|timeout|timed out|econnrefused|etimedout|enotfound|socket", lowered):
         return "network_error"
+    if "stalled_runtime" in lowered or "runtime liveness stalled" in lowered:
+        return "stalled_runtime"
     return "task_failed"
 
 

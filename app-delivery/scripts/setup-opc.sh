@@ -202,6 +202,7 @@ chmod +x "$INSTALL_ROOT/scripts"/*.sh "$INSTALL_ROOT/scripts"/*.py 2>/dev/null |
 cat > "$BIN_DIR/app-delivery" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+export APP_DELIVERY_ENFORCE_OPC_PROJECT_ROOT=1
 cd "$INSTALL_ROOT"
 exec "$PYTHON_BIN" -m delivery "\$@"
 EOF
@@ -221,6 +222,7 @@ EOF
 cat > "$BIN_DIR/app-delivery-preflight.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+export APP_DELIVERY_ENFORCE_OPC_PROJECT_ROOT=1
 exec "$INSTALL_ROOT/scripts/app-delivery-preflight.sh" --opc-home "$OPC_HOME" --framework-root "$INSTALL_ROOT" "\$@"
 EOF
 

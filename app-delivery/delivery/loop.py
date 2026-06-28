@@ -26,6 +26,7 @@ from .state import (
 )
 from .task import (
     FINAL_VERIFY_TASK_ID,
+    PREFINAL_AUDIT_TASK_ID,
     SCAFFOLD_TASK_ID,
     SCAFFOLD_OUTPUT_PATHS,
     SHARED_FOUNDATION_TASK_ID,
@@ -36,13 +37,16 @@ from .task import (
     mark_task,
     next_generated_task_id,
     pick_next_task,
+    reset_task,
     save_tasks,
 )
-from .loop_task_prompt import build_fix_prompt, build_scope_fix_prompt, build_task_prompt
+from .test_env import warm_shared_test_environment
+from .loop_task_prompt import build_fix_prompt, build_scope_fix_prompt, build_stalled_recovery_prompt, build_task_prompt
 from .verify import infer_final_repair_candidates, is_path_test_spec, run_full_suite, run_task_tests, test_results_to_summary, write_final_repair_report
 
 
 MAX_TEST_FIX_ATTEMPTS = 3
+MAX_STALLED_RUNTIME_RECOVERIES = 2
 FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 
 
@@ -256,6 +260,48 @@ def _ensure_final_repair_task(
     return updated, repair_task_id
 
 
+def _invalidate_prefinal_audit_after_repair(tasks: list[Task], repair_task_id: str | None) -> list[Task]:
+    if not repair_task_id:
+        return tasks
+    audit = next((task for task in tasks if task.id == PREFINAL_AUDIT_TASK_ID), None)
+    if audit is None:
+        return tasks
+    dependencies = [
+        task.id
+        for task in tasks
+        if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
+    ]
+    if repair_task_id not in dependencies:
+        dependencies.append(repair_task_id)
+    reset_required = audit.status == "verified" or repair_task_id not in audit.dependencies
+    if not reset_required:
+        return tasks
+    updated: list[Task] = []
+    for task in tasks:
+        if task.id != PREFINAL_AUDIT_TASK_ID:
+            updated.append(task)
+            continue
+        data = task.to_dict()
+        data.update(
+            {
+                "status": "pending",
+                "dependencies": dependencies,
+                "git_commit": None,
+                "status_session_id": None,
+                "started_at": None,
+                "completed_at": None,
+                "review_status": None,
+                "review_artifact": None,
+                "reviewed_at": None,
+                "verified_at": None,
+                "blocked_reason": "system audit must rerun after final verification repair",
+                "attempts": 0,
+            }
+        )
+        updated.append(Task.from_dict(data))
+    return updated
+
+
 def _preserve_task_session(project_root: Path | str, session: RuntimeSession) -> None:
     session.last_heartbeat = utc_now_iso()
     save_current_session(project_root, session)
@@ -457,6 +503,45 @@ class DeliveryLoop:
         execute_in_session(self.project_root, session, prompt)
         self._sync_active_task_session_id(task_id, session)
 
+    def _prepare_stalled_runtime_recovery(self, task: Task, session: RuntimeSession, exc: RuntimeErrorResponse) -> tuple[bool, str]:
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
+        recovery_count = int(runtime_state.get("stalled_recovery_count") or 0) + 1
+        if recovery_count > MAX_STALLED_RUNTIME_RECOVERIES:
+            return self._block_task_for_runtime_failure(task.id, session, exc)
+        resolved_session_id = str(exc.session_id or session.id or task.status_session_id or "").strip()
+        runtime_attention = {
+            "kind": "stalled_runtime",
+            "message": ((exc.output or str(exc)).strip()[:1000] or "runtime stalled without useful progress"),
+            "session_id": resolved_session_id or None,
+        }
+        recovery_prompt = build_stalled_recovery_prompt(
+            self.project_root,
+            task,
+            runtime_state=runtime_state,
+            runtime_attention=runtime_attention,
+        )
+        tasks = reset_task(all_tasks(self.project_root), task.id, blocked_reason="stalled runtime recovery in progress")
+        save_tasks(self.project_root, tasks)
+        session.id = resolved_session_id
+        session.current_task_id = task.id
+        session.last_heartbeat = utc_now_iso()
+        save_current_session(self.project_root, session)
+        save_task_runtime_state(
+            self.project_root,
+            task.id,
+            {
+                "status": "interrupted",
+                "completed_at": None,
+                "exit_code": None,
+                "session_id": resolved_session_id or None,
+                "recovery_prompt": recovery_prompt,
+                "recovery_reason": "stalled_runtime",
+                "recovery_requested_at": utc_now_iso(),
+                "stalled_recovery_count": recovery_count,
+            },
+        )
+        return False, "stalled_recovery"
+
     def run_builtin_scaffold(self) -> dict[str, Any]:
         tasks = all_tasks(self.project_root)
         scaffold_task = next((task for task in tasks if task.id == SCAFFOLD_TASK_ID), None)
@@ -510,6 +595,26 @@ class DeliveryLoop:
         tasks = mark_task(tasks, task.id, "active", status_session_id=session.id, git_commit=git_head_sha(self.project_root), blocked_reason=None)
         save_tasks(self.project_root, tasks)
         try:
+            if task.id == SHARED_FOUNDATION_TASK_ID:
+                shared_env = warm_shared_test_environment(self.project_root, reason="shared foundation")
+                if not shared_env.ready:
+                    tasks = all_tasks(self.project_root)
+                    exception_report = _write_exception_report(self.project_root, task, shared_env.summary)
+                    tasks = mark_task(
+                        tasks,
+                        task.id,
+                        "exception",
+                        status_session_id=task.status_session_id or str(session.id or "").strip() or None,
+                        completed_at=None,
+                        verified_at=None,
+                        blocked_reason=shared_env.summary,
+                        review_artifact=exception_report,
+                        reviewed_at=utc_now_iso(),
+                        attempts=max(int(task.attempts or 0), 1),
+                    )
+                    save_tasks(self.project_root, tasks)
+                    _release_session_after_exception(self.project_root, session)
+                    return False, "exception"
             runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
             baseline_changed_paths_value = runtime_state.get("initial_changed_paths")
             if isinstance(baseline_changed_paths_value, list):
@@ -529,6 +634,8 @@ class DeliveryLoop:
                 try:
                     self._execute_session_prompt(task.id, session, recovery_prompt)
                 except RuntimeErrorResponse as exc:
+                    if exc.kind == "stalled_runtime":
+                        return self._prepare_stalled_runtime_recovery(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
                 save_task_runtime_state(
                     self.project_root,
@@ -545,6 +652,8 @@ class DeliveryLoop:
                 try:
                     self._execute_session_prompt(task.id, session, prompt)
                 except RuntimeErrorResponse as exc:
+                    if exc.kind == "stalled_runtime":
+                        return self._prepare_stalled_runtime_recovery(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
             elif runtime_completed:
                 clear_task_runtime_failure(self.project_root, task.id)
@@ -606,6 +715,8 @@ class DeliveryLoop:
                 try:
                     self._execute_session_prompt(current.id, session, fix_prompt)
                 except RuntimeErrorResponse as exc:
+                    if exc.kind == "stalled_runtime":
+                        return self._prepare_stalled_runtime_recovery(current, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
             tasks = all_tasks(self.project_root)
             patch_relative_path = park_task_exception_changes(self.project_root, task)
@@ -684,6 +795,22 @@ class DeliveryLoop:
     def final_verify(self, *, suite_mode: str = "all") -> dict[str, Any]:
         if suite_mode not in {"all", "non-verified"}:
             raise DeliveryError(code="verify_mode_invalid", message=f"unsupported verify mode: {suite_mode}", exit_code=2)
+        tasks = all_tasks(self.project_root)
+        incomplete_non_final_feature_ids = [
+            task.id
+            for task in tasks
+            if task.id != FINAL_VERIFY_TASK_ID and task.task_kind != "repair" and task.status not in {"verified", "cancelled"}
+        ]
+        if incomplete_non_final_feature_ids:
+            return {
+                "passed": False,
+                "status": "deferred",
+                "summary": "final verification deferred until all non-final feature tasks are verified",
+                "repair_candidates": [],
+                "repair_task_id": None,
+                "repair_report": None,
+                "deferred_task_ids": incomplete_non_final_feature_ids,
+            }
         results = run_full_suite(self.project_root, mode=suite_mode)
         summary = test_results_to_summary(results)
         gates_payload = refresh_gates(self.project_root)
@@ -703,7 +830,6 @@ class DeliveryLoop:
                     break
         ready_for_final_review = all(result.passed for result in results) and requirement_coverage["all_covered"] and not missing_test_types and not non_verified_gates
         final_pass = ready_for_final_review and str(final_review_status or "").strip().casefold() == "pass"
-        tasks = all_tasks(self.project_root)
         repair_candidates = _dedupe_task_ids(
             [
                 task_id
@@ -728,6 +854,7 @@ class DeliveryLoop:
                 missing_test_types=missing_test_types,
                 non_verified_gates=non_verified_gates,
             )
+            tasks = _invalidate_prefinal_audit_after_repair(tasks, repair_task_id)
         repair_report_artifact = write_final_repair_report(
             self.project_root,
             results=results,
@@ -882,9 +1009,26 @@ class DeliveryLoop:
                 continue
             if task.id == FINAL_VERIFY_TASK_ID:
                 return self.final_verify()
+            if task.task_kind == "repair" and task.id.startswith("T"):
+                non_repair_incomplete = [
+                    row.id
+                    for row in tasks
+                    if row.id not in {FINAL_VERIFY_TASK_ID, task.id}
+                    and row.task_kind != "repair"
+                    and row.status not in {"verified", "cancelled"}
+                ]
+                if non_repair_incomplete:
+                    return {
+                        "status": "blocked",
+                        "task_id": task.id,
+                        "reason": "repair task cannot run before all non-final feature tasks are settled",
+                        "blocked_task_ids": non_repair_incomplete,
+                    }
             success, state = self._execute_task(task)
             if not success:
                 if state == "exception":
+                    continue
+                if state == "stalled_recovery":
                     continue
                 if state == "review_pending":
                     return {"status": "review_pending", "task_id": task.id, "reason": "external review required"}

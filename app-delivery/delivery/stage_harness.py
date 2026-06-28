@@ -80,7 +80,7 @@ def _runtime_context_baseline(runtime: str) -> str:
             "- Prefer the smallest maintainable change that fully solves the task.",
             "- Do not turn a straightforward fix into unnecessary abstraction or indirection.",
             "- Extract shared code only when the current task or clear duplication justifies it.",
-            "- If the task genuinely needs wider shared or cross-feature edits, stop and report a contract gap instead of widening scope silently.",
+            "- Prefer task-local ownership, but if completing the current requirement or fixing regressions needs adjacent shared/support-file edits, make the smallest necessary change and validate it in the current task instead of stopping on scope alone.",
             "- When a task depends on an unfamiliar or recently released library/framework, do not guess APIs from memory. First confirm usage from the official docs, GitHub repository, or the installed package source before coding against it.",
             "- Keep controlled records, approvals, audit trails, and permission boundaries intact.",
             "- Treat AI outputs as assistive, never authoritative.",
@@ -88,6 +88,8 @@ def _runtime_context_baseline(runtime: str) -> str:
             "### Validation Rules",
             "- Do not delete or weaken tests to make the task pass.",
             "- Run the task-declared validation and required review/QA steps before considering the task complete.",
+            "- Prefer reusing project-shared test services and local app processes; do not rebuild app Docker images or perform destructive environment resets unless explicitly required.",
+            "- Before treating a browser/e2e or integration failure as a code bug, first confirm the required services and health probes are actually ready.",
             "- Do not run git history-changing commands; the framework owns commits.",
         ]
     )

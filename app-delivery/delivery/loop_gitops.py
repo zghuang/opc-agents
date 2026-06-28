@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .runtime_config import load_project_runtime
 from .state import load_test_results
-from .task import FINAL_VERIFY_TASK_ID, SCAFFOLD_OUTPUT_PATHS, Task, reset_task
+from .task import FINAL_VERIFY_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, SCAFFOLD_OUTPUT_PATHS, Task, reset_task
 from .verify import is_path_test_spec
 
 
@@ -386,6 +386,18 @@ def _implicit_feature_support_paths(paths: list[str], tests: list[str]) -> list[
 
 
 def task_commit_paths(task: Task, *, extra_paths: list[str] | None = None) -> list[str]:
+    if task.id == PREFINAL_AUDIT_TASK_ID:
+        paths = [*PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_REPORT_PATH]
+        if extra_paths:
+            paths.extend(path for path in extra_paths if _normalize_scope_path(path))
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for path in paths:
+            normalized = _normalize_scope_path(path)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                ordered.append(normalized)
+        return ordered
     paths = [path for path in task.output_paths if _normalize_scope_path(path)]
     paths.extend(path for path in task.output_tests if is_path_test_spec(path))
     if task.id == "T000":

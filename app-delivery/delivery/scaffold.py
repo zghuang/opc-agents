@@ -222,10 +222,30 @@ def _ensure_output_test_files(project_root: Path, payload: dict[str, Any]) -> No
             if target.exists():
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                "def test_placeholder():\n    assert False, 'placeholder test not implemented yet'\n",
-                encoding="utf-8",
-            )
+            target.write_text(_placeholder_test_content(relative), encoding="utf-8")
+
+
+def _placeholder_test_content(relative: Path) -> str:
+    normalized = Path(str(relative))
+    suffix = normalized.suffix.lower()
+    parts = {part.lower() for part in normalized.parts}
+    if suffix in {".ts", ".tsx", ".js", ".jsx"} and "frontend" in parts and "e2e" in parts:
+        return (
+            "import { test } from '@playwright/test'\n\n"
+            "test('placeholder', async () => {\n"
+            "  throw new Error('placeholder test not implemented yet')\n"
+            "})\n"
+        )
+    if suffix in {".ts", ".tsx", ".js", ".jsx"}:
+        return (
+            "import { describe, it } from 'vitest'\n\n"
+            "describe('placeholder', () => {\n"
+            "  it('not implemented', () => {\n"
+            "    throw new Error('placeholder test not implemented yet')\n"
+            "  })\n"
+            "})\n"
+        )
+    return "def test_placeholder():\n    assert False, 'placeholder test not implemented yet'\n"
 
 
 def scaffold_project(project_root: Path | str, *, template_root: Path | None = None, mock_server_root: Path | None = None, runtime: str | None = None) -> Path:

@@ -10,6 +10,28 @@ from .errors import DeliveryError
 SUPPORTED_RUNTIMES = {"claude", "opencode"}
 
 
+def _truthy_env(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _enforce_opc_project_root() -> bool:
+    return _truthy_env(os.environ.get("APP_DELIVERY_ENFORCE_OPC_PROJECT_ROOT"))
+
+
+def _assert_project_under_opc_projects(project_root: Path) -> None:
+    allowed_root = (opc_home() / "projects").resolve()
+    try:
+        project_root.relative_to(allowed_root)
+    except ValueError as exc:
+        raise DeliveryError(
+            code="project_root_outside_opc_projects",
+            message=f"project must live under {allowed_root}: {project_root}",
+            exit_code=2,
+            details={"project_root": str(project_root), "allowed_root": str(allowed_root)},
+            suggested_action="Create or run the project from OPC_HOME/projects (for example via new-project.sh) instead of pointing app-delivery at an arbitrary workspace path.",
+        ) from exc
+
+
 def opc_home() -> Path:
     return Path(os.environ.get("OPC_HOME", str(Path.home() / "opc"))).expanduser().resolve()
 
@@ -18,12 +40,16 @@ def resolve_project_root(project_root: Path | str) -> Path:
     raw_value = str(project_root or "").strip()
     path = Path(raw_value).expanduser()
     if path.is_absolute():
-        return path.resolve()
+        resolved = path.resolve()
     # Treat a single bare project name as OPC_HOME/projects/<name> so CLI calls
     # are stable regardless of the current working directory.
-    if raw_value and not raw_value.startswith(".") and len(path.parts) == 1:
-        return (opc_home() / "projects" / path.name).resolve()
-    return path.resolve()
+    elif raw_value and not raw_value.startswith(".") and len(path.parts) == 1:
+        resolved = (opc_home() / "projects" / path.name).resolve()
+    else:
+        resolved = path.resolve()
+    if _enforce_opc_project_root():
+        _assert_project_under_opc_projects(resolved)
+    return resolved
 
 
 def active_runtime_file() -> Path:

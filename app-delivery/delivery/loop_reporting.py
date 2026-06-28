@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .gates import refresh_gates
 from .loop_gitops import repair_invalid_verified_tasks
+from .runtime_liveness import running_runtime_task_payload, runtime_attention_payload
 from .runtime_config import resolve_project_root
 from .session import current_session
 from .state import latest_task_log_event, load_active_task_records, load_stale_active_task_records, load_task_runtime_state, load_test_results, normalize_task_runtime_state, process_alive, prune_stale_active_task_records, read_lock_metadata, save_task_runtime_state, utc_now_iso
@@ -19,6 +21,57 @@ RUNTIME_STAGNATION_THRESHOLD_SECONDS = 600
 RUNTIME_READ_ONLY_STREAK_THRESHOLD = 20
 GATE_REPAIR_TASK_PREFIX = "Validation Gate Repair Bundle"
 FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
+CODE_LINE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".css",
+    ".cs",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".mjs",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sass",
+    ".scss",
+    ".sh",
+    ".sql",
+    ".svelte",
+    ".swift",
+    ".ts",
+    ".tsx",
+    ".vue",
+}
+CODE_LINE_FILENAMES = {"Dockerfile", "Makefile"}
+CODE_LINE_EXCLUDED_PARTS = {
+    ".app-delivery-runtime",
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".next",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".turbo",
+    ".venv",
+    ".vite",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "docs",
+    "node_modules",
+    "playwright-report",
+    "target",
+    "test-results",
+    "venv",
+}
 
 
 def _parse_iso_datetime(value: Any) -> dt.datetime | None:
@@ -495,6 +548,53 @@ def _project_token_summary(project_root: Path) -> dict[str, Any]:
     }
 
 
+def _count_nonblank_lines(path: Path) -> int:
+    try:
+        return sum(1 for line in path.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
+def _project_code_line_summary(project_root: Path) -> dict[str, Any]:
+    totals = {
+        "total": 0,
+        "backend": 0,
+        "frontend": 0,
+        "other": 0,
+        "files": 0,
+        "backend_files": 0,
+        "frontend_files": 0,
+        "other_files": 0,
+        "basis": "nonblank lines in code files, excluding dependencies, build outputs, runtime state, and docs",
+    }
+    for current_root, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [name for name in dirnames if name not in CODE_LINE_EXCLUDED_PARTS]
+        current_dir = Path(current_root)
+        for filename in filenames:
+            path = current_dir / filename
+            if path.is_symlink():
+                continue
+            if path.suffix not in CODE_LINE_EXTENSIONS and path.name not in CODE_LINE_FILENAMES:
+                continue
+            try:
+                relative = path.relative_to(project_root)
+            except ValueError:
+                continue
+            first_part = relative.parts[0] if relative.parts else ""
+            if first_part == "backend":
+                bucket = "backend"
+            elif first_part == "frontend":
+                bucket = "frontend"
+            else:
+                bucket = "other"
+            line_count = _count_nonblank_lines(path)
+            totals["total"] += line_count
+            totals[bucket] += line_count
+            totals["files"] += 1
+            totals[f"{bucket}_files"] += 1
+    return totals
+
+
 def _backfill_missing_status_session_ids(project_root: Path, tasks: list[Any]) -> list[Any]:
     changed = False
     updated: list[Any] = []
@@ -656,7 +756,7 @@ def _active_task_payload(project_root: Path, tasks: list[Any]) -> dict[str, Any]
     if live_active_tasks:
         task = live_active_tasks[0]
         if not execution_live:
-            return None
+            return running_runtime_task_payload(project_root, tasks)
         payload = task.to_dict()
         payload["phase"] = "implementation"
         active = current_session(project_root)
@@ -666,9 +766,9 @@ def _active_task_payload(project_root: Path, tasks: list[Any]) -> dict[str, Any]
         return payload
     active = current_session(project_root)
     if active is None or not active.current_task_id:
-        return None
+        return running_runtime_task_payload(project_root, tasks)
     if not execution_live:
-        return None
+        return running_runtime_task_payload(project_root, tasks)
     task = next((row for row in tasks if row.id == active.current_task_id), None)
     if task is None:
         return {
@@ -679,7 +779,7 @@ def _active_task_payload(project_root: Path, tasks: list[Any]) -> dict[str, Any]
             "updated_at": active.last_heartbeat,
         }
     if task.status != "active":
-        return None
+        return running_runtime_task_payload(project_root, tasks)
     payload = task.to_dict()
     payload["session_id"] = active.id
     payload["updated_at"] = active.last_heartbeat
@@ -693,25 +793,22 @@ def render_project_summary(project_root: Path | str, payload: dict[str, Any]) ->
 
     summary_md_path = project_dir / "docs" / "project-summary.md"
     project_name = project_dir.name
-    counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
-    requirements = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else {}
-    tests = payload.get("tests") if isinstance(payload.get("tests"), dict) else {}
-    next_task = payload.get("next_task") if isinstance(payload.get("next_task"), dict) else None
-    active = payload.get("active_session") if isinstance(payload.get("active_session"), dict) else None
-    active_task = payload.get("active_task") if isinstance(payload.get("active_task"), dict) else None
-    activity = payload.get("recent_activity") if isinstance(payload.get("recent_activity"), dict) else None
-    stale_active_tasks = payload.get("stale_active_tasks") if isinstance(payload.get("stale_active_tasks"), list) else []
-    invalid_verified = payload.get("invalid_verified_tasks") if isinstance(payload.get("invalid_verified_tasks"), dict) else {}
     planning = payload.get("planning") if isinstance(payload.get("planning"), dict) else {}
     tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
     duration = payload.get("duration") if isinstance(payload.get("duration"), dict) else {}
     verified_metrics = payload.get("verified_task_metrics") if isinstance(payload.get("verified_task_metrics"), dict) else {}
+    code_lines = payload.get("code_lines") if isinstance(payload.get("code_lines"), dict) else {}
     lines = [
         f"# Project Summary - {project_name}",
         "",
         "> Generated from the canonical JSON ledgers. This summary is observational only; final delivery is proven by the task ledger, review artifacts, and verification evidence.",
         "",
         f"- Generated at: {payload.get('generated_at', 'unknown')}",
+        f"- Effective Code Lines: {code_lines.get('total', 0)}",
+        f"- Backend Code Lines: {code_lines.get('backend', 0)}",
+        f"- Frontend Code Lines: {code_lines.get('frontend', 0)}",
+        f"- Other Code Lines: {code_lines.get('other', 0)}",
+        f"- Code Files Counted: {code_lines.get('files', 0)}",
         f"- Duration: {duration.get('duration_formatted', 'unavailable')}",
         f"- Planning lead time: {planning.get('planning_lead_formatted', 'unavailable')}",
         f"- Billable tokens: {tokens.get('execution_total_tokens', 'unavailable')}",
@@ -749,94 +846,7 @@ def render_project_summary(project_root: Path | str, payload: dict[str, Any]) ->
         f"- Summed verified task durations: {verified_metrics.get('task_duration_minutes_sum', 'unavailable')}",
         f"- Verified task execution tokens: {verified_metrics.get('task_total_tokens_sum', 'unavailable')}",
         "",
-        "## Planning Lead",
-        "",
-        f"- Planning lead time: {planning.get('planning_lead_formatted', 'unavailable')}",
-        f"- Started at: {planning.get('started_at', 'unavailable')}",
-        f"- Completed at: {planning.get('completed_at', 'unavailable')}",
-        "",
-        "## Delivery Status",
-        "",
-        "| Metric | Value |",
-        "| --- | --- |",
     ])
-    if counts:
-        for key, value in counts.items():
-            lines.append(f"| {key} | {value} |")
-    else:
-        lines.append("| none | - |")
-
-    lines.extend(["", "## Requirements", "", "| Metric | Value |", "| --- | --- |"])
-    lines.append(f"| total | {requirements.get('total', 0)} |")
-    lines.append(f"| planned | {requirements.get('planned', 0)} |")
-    unplanned = requirements.get("unplanned") if isinstance(requirements.get("unplanned"), list) else []
-    lines.append(f"| unplanned | {', '.join(unplanned) if unplanned else 'none'} |")
-
-    lines.extend(["", "## Next Task", ""])
-    if next_task:
-        lines.extend([
-            f"- ID: {next_task.get('id')}",
-            f"- Title: {next_task.get('title')}",
-            f"- Status: {next_task.get('status')}",
-        ])
-    else:
-        lines.append("- none")
-
-    lines.extend(["", "## Tests", "", "| Metric | Value |", "| --- | --- |"])
-    for key in ["last_run", "passed", "total", "passed_count", "failed_count"]:
-        lines.append(f"| {key} | {tests.get(key)} |")
-
-    lines.extend(["", "## Active Session", ""])
-    if active:
-        lines.extend([
-            f"- ID: {active.get('id')}",
-            f"- Runtime: {active.get('runtime')}",
-            f"- Task count: {active.get('task_count')}",
-            f"- Created at: {active.get('created_at')}",
-            f"- Current task ID: {active.get('current_task_id')}",
-            f"- Last heartbeat: {active.get('last_heartbeat')}",
-        ])
-    else:
-        lines.append("- none")
-
-    lines.extend(["", "## Active Task", ""])
-    if active_task:
-        lines.extend([
-            f"- ID: {active_task.get('id')}",
-            f"- Title: {active_task.get('title')}",
-            f"- Status: {active_task.get('status')}",
-            f"- Phase: {active_task.get('phase')}",
-            f"- Updated at: {active_task.get('updated_at')}",
-        ])
-    else:
-        lines.append("- none")
-
-    lines.extend(["", "## Stale Runtime Records", ""])
-    if stale_active_tasks:
-        for row in stale_active_tasks[:10]:
-            lines.append(
-                f"- {row.get('task_id')}: pid={row.get('pid')} updated_at={row.get('updated_at')} log={row.get('log_file')}"
-            )
-    else:
-        lines.append("- none")
-
-    lines.extend(["", "## Invalid Verified Tasks", ""])
-    if invalid_verified:
-        for task_id, reason in invalid_verified.items():
-            lines.append(f"- {task_id}: {reason}")
-    else:
-        lines.append("- none")
-
-    lines.extend(["", "## Recent Activity", ""])
-    if activity:
-        lines.extend([
-            f"- Timestamp: {activity.get('ts')}",
-            f"- Level: {activity.get('level')}",
-            f"- Message: {activity.get('message')}",
-        ])
-    else:
-        lines.append("- none")
-
     lines.extend(["", "## Task Metrics", "", "| Task | Duration | Tokens | Session |", "| --- | --- | --- | --- |"])
     for row in payload.get("task_metrics", []) if isinstance(payload.get("task_metrics"), list) else []:
         if not isinstance(row, dict):
@@ -893,7 +903,12 @@ def status(project_root: Path | str) -> dict[str, Any]:
     for task in display_tasks:
         by_status[task.status] = by_status.get(task.status, 0) + 1
     next_task = pick_next_task(display_tasks)
-    actionable = [task for task in display_tasks if task.id != FINAL_VERIFY_TASK_ID and task.status != "cancelled"]
+    actionable = [
+        task
+        for task in display_tasks
+        if task.id != FINAL_VERIFY_TASK_ID and task.status != "cancelled" and getattr(task, "task_kind", "feature") != "repair"
+    ]
+    all_actionable_verified = bool(actionable) and all(task.status == "verified" for task in actionable)
     final_task = next((task for task in display_tasks if task.id == FINAL_VERIFY_TASK_ID), None)
     review_pending_task = next((task for task in display_tasks if task.status == "review_pending"), None)
     active_payload = _active_task_payload(project_dir, display_tasks)
@@ -902,7 +917,13 @@ def status(project_root: Path | str) -> dict[str, Any]:
         runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_dir, str(active_payload.get("id") or "")))
         if runtime_state:
             active_payload["runtime_state"] = runtime_state
-            runtime_attention = _runtime_attention_payload(runtime_state)
+            active_task = next((task for task in display_tasks if task.id == str(active_payload.get("id") or "")), None)
+            runtime_attention = runtime_attention_payload(
+                project_dir,
+                active_task,
+                runtime_state,
+                active_record_present=bool(load_active_task_records(project_dir)),
+            ) or _runtime_attention_payload(runtime_state)
             if runtime_attention is not None:
                 active_payload["runtime_attention"] = runtime_attention
     next_payload = next_task.to_dict() if next_task else None
@@ -926,12 +947,17 @@ def status(project_root: Path | str) -> dict[str, Any]:
         repair_task = next((task for task in display_tasks if task.id == repair_task_id), None) if repair_task_id else None
         repair_task_status = repair_task.status if repair_task is not None else None
         final_verify_status = str(final_runtime_state.get("final_verify_status") or "").strip()
-        if final_task is not None and final_task.status == "blocked" and repair_candidates and final_verify_status in {"", "blocked"}:
+        if not all_actionable_verified and final_task is not None and final_task.status == "blocked":
+            final_verify_status = "deferred"
+        elif final_task is not None and final_task.status == "blocked" and repair_candidates and final_verify_status in {"", "blocked"}:
             final_verify_status = "repair_required"
+        blocked_reason = getattr(final_task, "blocked_reason", None) if final_task is not None else None
+        if final_verify_status == "deferred":
+            blocked_reason = "final verification state is deferred until all non-final tasks are verified"
         final_verify_payload = {
             "task_status": final_task.status if final_task is not None else None,
             "status": final_verify_status or (final_task.status if final_task is not None else None),
-            "blocked_reason": getattr(final_task, "blocked_reason", None) if final_task is not None else None,
+            "blocked_reason": blocked_reason,
             "repair_candidates": repair_candidates,
             "repair_task_id": repair_task_id,
             "repair_task_status": repair_task_status,
@@ -942,7 +968,7 @@ def status(project_root: Path | str) -> dict[str, Any]:
                 if isinstance(item, (list, tuple)) and item
             ],
             "gate_statuses": final_runtime_state.get("final_verify_gate_statuses", []),
-            "will_continue": bool(repair_candidates) and repair_task_status != "exception",
+            "will_continue": bool(repair_candidates) and repair_task_status != "exception" and final_verify_status != "deferred",
         }
     return {
         "project": str(project_dir),
@@ -953,7 +979,7 @@ def status(project_root: Path | str) -> dict[str, Any]:
         "runtime_attention": runtime_attention,
         "stale_active_tasks": load_stale_active_task_records(project_dir),
         "paused": (project_dir / PAUSE_FILE).exists(),
-        "final_verify_ready": bool(actionable) and all(task.status == "verified" for task in actionable) and final_task is not None and final_task.status == "pending",
+        "final_verify_ready": all_actionable_verified and final_task is not None and final_task.status == "pending",
         "final_verify": final_verify_payload,
         "invalid_verified_tasks": invalid_verified,
         "requirements_source_archived": _requirements_source_archived(project_dir),
@@ -1041,6 +1067,7 @@ def project_summary(project_root: Path | str) -> dict[str, Any]:
         },
         "planning": _planning_metrics(project_dir),
         "tokens": _project_token_summary(project_dir),
+        "code_lines": _project_code_line_summary(project_dir),
         "task_metrics": task_metrics,
         "verified_task_metrics": {
             "verified_tasks": len(verified_rows),

@@ -7,8 +7,10 @@ import sys
 from pathlib import Path
 
 from delivery.state import load_active_task_records, save_work_items
+from delivery import test_env as test_env_module
 from delivery.verify import _command_for_test_spec
 from delivery.verify import _parse_pytest_output, detect_js_package_manager, infer_test_types, is_command_test_spec, is_placeholder_test_file, run_full_suite, run_task_tests, weak_command_reason, weak_test_file_reason
+from delivery.test_env import ensure_task_test_environment, warm_shared_test_environment
 
 
 def test_weak_command_reason_flags_echo() -> None:
@@ -297,10 +299,143 @@ def test_run_full_suite_adds_frontend_quality_gate_commands(tmp_path: Path) -> N
     assert any(task["id"] == "T-FINAL:frontend-browser-qa" for task in seen_specs)
     quality_gate = next(task for task in seen_specs if task["id"] == "T-FINAL:frontend-quality-gates")
     assert quality_gate["output_tests"] == ["npm run test", "npm run typecheck", "npm run lint", "npm run build"]
+    assert quality_gate["requirements"] == []
     browser_gate = next(task for task in seen_specs if task["id"] == "T-FINAL:frontend-browser-qa")
     assert browser_gate["output_tests"] == ["npm run e2e"]
+    assert browser_gate["requirements"] == []
     assert any(result.task_id == "T-FINAL:frontend-quality-gates" for result in results)
     assert any(result.task_id == "T-FINAL:frontend-browser-qa" for result in results)
     final_report = tmp_path / "docs" / "reviews" / "test-report-T-FINAL.md"
     assert final_report.exists()
     assert "report_type: test" in final_report.read_text(encoding="utf-8")
+
+
+def test_command_for_frontend_e2e_spec_auto_wires_backend_when_template_backend_exists(tmp_path: Path) -> None:
+    (tmp_path / "frontend").mkdir(parents=True)
+    (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "backend" / "src").mkdir(parents=True)
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "backend" / "src" / "main.py").write_text("app = object()\n", encoding="utf-8")
+
+    command = _command_for_test_spec(tmp_path, "frontend/e2e/app-shell.spec.ts")
+
+    assert "E2E_BACKEND_CMD=" in command[2]
+    assert "VITE_API_PROXY_TARGET=http://127.0.0.1:8000" in command[2]
+    assert "uvicorn src.main:app --host 127.0.0.1 --port 8000" in command[2]
+
+
+def test_command_for_npm_e2e_runs_in_frontend_with_backend_env_when_available(tmp_path: Path) -> None:
+    (tmp_path / "frontend").mkdir(parents=True)
+    (tmp_path / "frontend" / "package.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "backend" / "src").mkdir(parents=True)
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "backend" / "src" / "main.py").write_text("app = object()\n", encoding="utf-8")
+
+    command = _command_for_test_spec(tmp_path, "npm run e2e")
+
+    assert command[0:2] == ["/bin/zsh", "-lc"]
+    assert f"cd {tmp_path / 'frontend'}" in command[2]
+    assert "E2E_BACKEND_CMD=" in command[2]
+    assert command[2].endswith("npm run e2e")
+
+
+def test_run_full_suite_frontend_quality_gates_have_no_requirement_binding(tmp_path: Path) -> None:
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {
+                    "test": "vitest run",
+                    "typecheck": "tsc --noEmit",
+                    "lint": "eslint src/",
+                    "build": "vite build",
+                    "e2e": "playwright test",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T-FINAL", "title": "最终验证", "status": "pending", "requirements": ["NFR-001", "NFR-003", "NFR-004"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+
+    from delivery import verify as verify_module
+
+    seen_specs: list[dict[str, object]] = []
+
+    def fake_run_task_tests(project_root, task, *, attempt=1):
+        seen_specs.append(task)
+        return verify_module.TestResult(
+            task_id=str(task.get("id") or ""),
+            timestamp="2026-06-24T00:00:00Z",
+            test_files=[str(value) for value in task.get("output_tests", [])],
+            test_types=verify_module.infer_test_types([str(value) for value in task.get("output_tests", [])]),
+            requirement_ids=[str(value) for value in task.get("requirements", [])],
+            passed=True,
+            passed_count=len(task.get("output_tests", [])),
+            failed_count=0,
+            failures=[],
+            attempt=attempt,
+        )
+
+    original_run_task_tests = verify_module.run_task_tests
+    verify_module.run_task_tests = fake_run_task_tests
+    try:
+        run_full_suite(tmp_path, mode="all")
+    finally:
+        verify_module.run_task_tests = original_run_task_tests
+
+    quality_gate = next(task for task in seen_specs if task["id"] == "T-FINAL:frontend-quality-gates")
+    browser_gate = next(task for task in seen_specs if task["id"] == "T-FINAL:frontend-browser-qa")
+    assert quality_gate["requirements"] == []
+    assert browser_gate["requirements"] == []
+
+
+def test_warm_shared_test_environment_is_noop_when_no_shared_services_declared(tmp_path: Path) -> None:
+    result = warm_shared_test_environment(tmp_path, reason="unit-test")
+
+    assert result.ready is True
+    assert result.profile == "shared_infra"
+    assert result.actions_run == []
+
+
+def test_ensure_task_test_environment_skips_extra_setup_for_non_browser_specs(tmp_path: Path) -> None:
+    result = ensure_task_test_environment(
+        tmp_path,
+        {"id": "T002", "output_tests": ["backend/tests/test_feature.py"]},
+        "backend/tests/test_feature.py",
+    )
+
+    assert result.ready is True
+    assert result.profile == "none"
+
+
+def test_shared_service_names_are_derived_from_compose_and_exclude_app_local_services(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("APP_DELIVERY_SHARED_SERVICES", raising=False)
+    monkeypatch.setattr(
+        test_env_module,
+        "_compose_service_names",
+        lambda project_root: ["postgres", "redis", "backend", "frontend", "mocks"],
+    )
+
+    assert test_env_module._shared_service_names(tmp_path) == ["postgres", "redis"]
+
+
+def test_shared_service_override_respects_declared_compose_services(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APP_DELIVERY_SHARED_SERVICES", "redis,postgres,unknown")
+    monkeypatch.setattr(
+        test_env_module,
+        "_compose_service_names",
+        lambda project_root: ["postgres", "redis", "backend"],
+    )
+
+    assert test_env_module._shared_service_names(tmp_path) == ["postgres", "redis"]

@@ -61,6 +61,42 @@ def test_scaffold_skips_command_style_output_tests(tmp_path: Path) -> None:
     assert (project_root / "tests" / "unit" / "test_demo.py").exists()
 
 
+def test_scaffold_creates_playwright_placeholder_for_frontend_e2e_spec(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    project_root = tmp_path / "project"
+    template_root.mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True, exist_ok=True)
+    (project_root / "docs" / "work-items.json").write_text(
+        '{"schema_version":"2","project":"demo","generated_at":"2026-06-24T00:00:00Z","last_updated_commit":"","items":[{"id":"T001","title":"Test","status":"pending","requirements":[],"acceptance_scenarios":[],"dependencies":[],"output_tests":["frontend/e2e/app-shell.spec.ts"],"output_paths":[]}]}',
+        encoding="utf-8",
+    )
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    content = (project_root / "frontend" / "e2e" / "app-shell.spec.ts").read_text(encoding="utf-8")
+    assert "@playwright/test" in content
+    assert "placeholder test not implemented yet" in content
+    assert "def test_placeholder" not in content
+
+
+def test_scaffold_creates_vitest_placeholder_for_frontend_unit_spec(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    project_root = tmp_path / "project"
+    template_root.mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True, exist_ok=True)
+    (project_root / "docs" / "work-items.json").write_text(
+        '{"schema_version":"2","project":"demo","generated_at":"2026-06-24T00:00:00Z","last_updated_commit":"","items":[{"id":"T001","title":"Test","status":"pending","requirements":[],"acceptance_scenarios":[],"dependencies":[],"output_tests":["frontend/src/App.test.tsx"],"output_paths":[]}]}',
+        encoding="utf-8",
+    )
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    content = (project_root / "frontend" / "src" / "App.test.tsx").read_text(encoding="utf-8")
+    assert "from 'vitest'" in content
+    assert "placeholder test not implemented yet" in content
+    assert "def test_placeholder" not in content
+
+
 def test_sync_runtime_support_refreshes_existing_opencode_files(tmp_path: Path) -> None:
     template_root = tmp_path / "template"
     (template_root / ".opencode").mkdir(parents=True)

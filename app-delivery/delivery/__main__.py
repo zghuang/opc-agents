@@ -338,6 +338,21 @@ def _run_verify_once(
     locked: bool = False,
 ) -> dict[str, Any]:
     resolved = resolve_project_root(project_root)
+    if mode == "all":
+        tasks = all_tasks(resolved)
+        incomplete_task_ids = [
+            task.id
+            for task in tasks
+            if task.id != "T-FINAL" and task.task_kind != "repair" and task.status not in {"verified", "cancelled"}
+        ]
+        if incomplete_task_ids:
+            raise DeliveryError(
+                code="verify_project_incomplete",
+                message="full verify is only allowed after all non-final tasks are verified",
+                exit_code=2,
+                details={"project": str(resolved), "incomplete_task_ids": incomplete_task_ids},
+                suggested_action="Continue normal delivery or use `app-delivery verify --mode non-verified` for diagnostic coverage without mutating final verification state.",
+            )
     with _project_execution_guard(resolved, already_locked=locked):
         return DeliveryLoop(resolved, runtime=resolve_runtime(runtime, project_root=resolved)).final_verify(suite_mode=mode)
 
@@ -437,6 +452,22 @@ def _execute_framework_control_step(step: dict[str, Any], args: argparse.Namespa
         )
     if action == "run_final_verify":
         return _run_verify_once(project_root, runtime=getattr(args, "runtime", None), mode="all")
+    if action == "recover_stalled":
+        task_id = str(step.get("task_id") or "").strip()
+        if not task_id:
+            raise DeliveryError(
+                code="control_recover_stalled_task_missing",
+                message="stalled recovery step is missing task_id",
+                exit_code=2,
+                details={"step": step},
+            )
+        return _run_stalled_recovery_once(
+            project_root,
+            task_id=task_id,
+            runtime=getattr(args, "runtime", None),
+            runtime_attention={key: value for key, value in step.items() if key.startswith("attention_") or key in {"message"}},
+            spawn_watchdog_after=False,
+        )
     raise DeliveryError(
         code="control_step_unsupported",
         message=f"unsupported framework control action: {action}",

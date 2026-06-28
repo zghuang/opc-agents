@@ -17,6 +17,7 @@ from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt
 from delivery.stage_harness import stage_import_command, stage_input_path
 from delivery.state import load_gates, load_session_state, load_task_runtime_state, save_architecture_meta, save_session_state, save_task_runtime_state, save_test_plan, save_work_items
+from delivery.task import PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_OUTPUT_TESTS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID, Task
 
 
 cli = import_module("delivery.__main__")
@@ -54,9 +55,41 @@ def test_build_task_prompt_explains_project_relative_test_paths(tmp_path: Path) 
 
     prompt = build_task_prompt(tmp_path, task)
 
-    assert "The harness normalizes common backend/frontend path prefixes" in prompt
+    assert "minimum validation floor" in prompt
+    assert "Passing tests are necessary but not sufficient" in prompt
+    assert "Prefer the declared output paths and output tests" in prompt
     assert "cd backend && uv run pytest" in prompt
     assert "frontend/package.json" in prompt
+
+
+def test_build_prefinal_audit_prompt_is_self_contained(tmp_path: Path) -> None:
+    from delivery.loop_task_prompt import build_task_prompt
+
+    task = Task(
+        id=PREFINAL_AUDIT_TASK_ID,
+        title="Pre-final full-system audit",
+        status="pending",
+        requirements=[],
+        acceptance_scenarios=[],
+        dependencies=["T002"],
+        output_tests=list(PREFINAL_AUDIT_OUTPUT_TESTS),
+        output_paths=list(PREFINAL_AUDIT_OUTPUT_PATHS),
+        task_kind="audit",
+    )
+
+    prompt = build_task_prompt(tmp_path, task)
+
+    assert "new runtime session" in prompt
+    assert "do not rely on hidden conversation history" in prompt
+    assert PREFINAL_AUDIT_REPORT_PATH in prompt
+    assert "## Requirement Gap Matrix" in prompt
+    assert "scaffolding, stubs, shared wiring, or placeholders" in prompt
+    assert "Use other project docs" in prompt
+    assert "do not assume Python, React" in prompt
+    assert "The framework will run exhaustive final verification" in prompt
+    assert "T-FINAL" not in prompt
+    assert "Run browser/end-to-end checks only" in prompt
+    assert "Do not modify the app-delivery framework repository" not in prompt
 
 
 def test_stage_input_path_uses_runtime_stage_inputs_dir(tmp_path: Path) -> None:
@@ -70,6 +103,27 @@ def test_resolve_project_root_uses_opc_projects_for_bare_name(monkeypatch: pytes
     path = resolve_project_root("scms-01")
 
     assert path == tmp_path / "projects" / "scms-01"
+
+
+def test_resolve_project_root_rejects_absolute_path_outside_opc_projects_when_strict(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPC_HOME", str(tmp_path))
+    monkeypatch.setenv("APP_DELIVERY_ENFORCE_OPC_PROJECT_ROOT", "1")
+
+    with pytest.raises(DeliveryError) as exc_info:
+        resolve_project_root("/Users/hzg/apps/agents/m-opc")
+
+    assert exc_info.value.code == "project_root_outside_opc_projects"
+
+
+def test_resolve_project_root_allows_absolute_path_inside_opc_projects_when_strict(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPC_HOME", str(tmp_path))
+    monkeypatch.setenv("APP_DELIVERY_ENFORCE_OPC_PROJECT_ROOT", "1")
+    project_root = tmp_path / "projects" / "ai-platform"
+    project_root.mkdir(parents=True)
+
+    path = resolve_project_root(str(project_root))
+
+    assert path == project_root.resolve()
 
 
 def test_stage_import_command_uses_cli_alias_for_context_sync(tmp_path: Path) -> None:
@@ -87,7 +141,7 @@ def test_stage_import_command_uses_cli_alias_for_decompose(tmp_path: Path) -> No
 def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
-    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}, {"id": "REQ-002", "title": "Two", "summary": "Two"}], "acceptance_scenarios": []}), encoding="utf-8")
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     input_path = tmp_path / "decompose.json"
     input_path.write_text(
@@ -112,7 +166,7 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
                     {
                         "title": "Feature",
                         "task_kind": "feature",
-                        "requirements": ["REQ-001"],
+                        "requirements": ["REQ-001", "REQ-002"],
                         "acceptance_scenarios": [],
                         "dependencies": [],
                         "output_tests": ["tests/test_feature.py"],
@@ -129,6 +183,13 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
     assert result == 0
     payload = json.loads((docs_dir / "work-items.json").read_text(encoding="utf-8"))
     assert any(item["title"] == "Feature" for item in payload["items"])
+    by_id = {item["id"]: item for item in payload["items"]}
+    assert PREFINAL_AUDIT_TASK_ID in by_id
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["task_kind"] == "audit"
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["status"] == "pending"
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["output_paths"][-1] == PREFINAL_AUDIT_REPORT_PATH
+    assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == [PREFINAL_AUDIT_TASK_ID]
     persisted = json.loads((tmp_path / ".app-delivery-runtime" / "stage-inputs" / "task-decompose.json").read_text(encoding="utf-8"))
     assert isinstance(persisted, dict)
     assert persisted["items"][0]["title"] == "Feature"
@@ -278,7 +339,7 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
                     "id": "T002",
                     "title": "Feature",
                     "status": "review_pending",
-                    "requirements": ["REQ-001"],
+                    "requirements": ["REQ-001", "REQ-002"],
                     "acceptance_scenarios": [],
                     "dependencies": ["T000"],
                     "output_tests": ["backend/tests/test_feature.py"],
@@ -291,7 +352,19 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
         },
     )
     input_path = tmp_path / "code-review.json"
-    input_path.write_text(json.dumps({"status": "pass", "summary": "Looks good.", "findings": []}), encoding="utf-8")
+    input_path.write_text(
+        json.dumps(
+            {
+                "status": "pass",
+                "summary": "Looks good.",
+                "findings": [],
+                "requirement_assessment": [
+                    {"id": "REQ-001", "status": "pass", "notes": "The declared feature behavior is complete."}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
 
@@ -337,8 +410,108 @@ def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path) -> None:
     assert payload["items"][0]["status"] == "verified"
     assert payload["items"][0]["review_status"] == "pass"
     assert payload["items"][0]["review_artifact"] == "docs/reviews/final-review.md"
-    runtime_state = load_task_runtime_state(tmp_path, "T-FINAL")
-    assert runtime_state["final_verify_status"] == "pass"
+
+
+def test_final_repair_invalidates_verified_prefinal_audit() -> None:
+    loop_module = import_module("delivery.loop")
+    tasks = [
+        Task.from_dict({"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []}),
+        Task.from_dict({"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"]}),
+        Task.from_dict({"id": "T003", "title": "Final Verification Repair Bundle", "status": "pending", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000", "T002", PREFINAL_AUDIT_TASK_ID], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"]}),
+        Task.from_dict({"id": PREFINAL_AUDIT_TASK_ID, "title": "Pre-final full-system audit", "status": "verified", "task_kind": "audit", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": list(PREFINAL_AUDIT_OUTPUT_TESTS), "output_paths": list(PREFINAL_AUDIT_OUTPUT_PATHS), "git_commit": "abc", "review_status": "pass"}),
+        Task.from_dict({"id": FINAL_VERIFY_TASK_ID, "title": "最终验证", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": [PREFINAL_AUDIT_TASK_ID], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]}),
+    ]
+
+    updated = loop_module._invalidate_prefinal_audit_after_repair(tasks, "T003")
+    audit = next(task for task in updated if task.id == PREFINAL_AUDIT_TASK_ID)
+
+    assert audit.status == "pending"
+    assert "T003" in audit.dependencies
+    assert audit.git_commit is None
+    assert audit.review_status is None
+    assert audit.blocked_reason == "system audit must rerun after final verification repair"
+
+
+def test_cmd_verify_rejects_full_verify_when_non_final_tasks_are_incomplete(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T001",
+                    "title": "Shared infra",
+                    "status": "active",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T000"],
+                    "output_tests": ["backend/src/tests/test_health.py"],
+                    "output_paths": ["backend/src/core/"],
+                },
+                {
+                    "id": "T-FINAL",
+                    "title": "最终验证",
+                    "status": "pending",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T001"],
+                    "output_tests": [],
+                    "output_paths": [],
+                },
+            ],
+        },
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_verify(argparse.Namespace(project=str(tmp_path), runtime=None, mode="all", _locked=False))
+
+    assert exc_info.value.code == "verify_project_incomplete"
+
+
+def test_cmd_verify_non_verified_mode_allows_diagnostic_run_on_incomplete_project(tmp_path: Path, monkeypatch) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T001",
+                    "title": "Shared infra",
+                    "status": "active",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T000"],
+                    "output_tests": ["backend/src/tests/test_health.py"],
+                    "output_paths": ["backend/src/core/"],
+                },
+                {
+                    "id": "T-FINAL",
+                    "title": "最终验证",
+                    "status": "pending",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T001"],
+                    "output_tests": [],
+                    "output_paths": [],
+                },
+            ],
+        },
+    )
+
+    monkeypatch.setattr(
+        "delivery.__main__.DeliveryLoop.final_verify",
+        lambda self, suite_mode="all": {"passed": False, "status": "blocked", "suite_mode": suite_mode},
+    )
+
+    result = cli.cmd_verify(argparse.Namespace(project=str(tmp_path), runtime=None, mode="non-verified", _locked=False))
+
+    assert result == 1
 
 
 def test_cmd_start_requires_external_spec_review_from_requirements(tmp_path: Path) -> None:
@@ -403,6 +576,13 @@ def test_cmd_status_bare_project_name_uses_opc_projects_root(monkeypatch: pytest
 def test_cmd_status_writes_project_summary_and_backfills_missing_task_session_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
+    backend_dir = tmp_path / "backend" / "src" / "feature"
+    backend_dir.mkdir(parents=True, exist_ok=True)
+    backend_dir.joinpath("service.py").write_text("def feature():\n    return True\n\n", encoding="utf-8")
+    frontend_dir = tmp_path / "frontend" / "src"
+    frontend_dir.mkdir(parents=True, exist_ok=True)
+    frontend_dir.joinpath("App.tsx").write_text("export function App() {\n  return null\n}\n", encoding="utf-8")
+    tmp_path.joinpath("docs", "ignored.py").write_text("print('not counted')\n", encoding="utf-8")
     save_work_items(
         tmp_path,
         {
@@ -432,8 +612,24 @@ def test_cmd_status_writes_project_summary_and_backfills_missing_task_session_id
     assert payload["project"] == str(tmp_path)
     work_items = json.loads((docs_dir / "work-items.json").read_text(encoding="utf-8"))
     assert work_items["items"][0]["status_session_id"] == "ses-runtime-1"
-    assert (docs_dir / "project-summary.json").exists()
-    assert (docs_dir / "project-summary.md").exists()
+    summary_json = json.loads((docs_dir / "project-summary.json").read_text(encoding="utf-8"))
+    assert summary_json["code_lines"]["total"] == 5
+    assert summary_json["code_lines"]["backend"] == 2
+    assert summary_json["code_lines"]["frontend"] == 3
+    summary_md = (docs_dir / "project-summary.md").read_text(encoding="utf-8")
+    assert "- Effective Code Lines: 5" in summary_md
+    assert "- Backend Code Lines: 2" in summary_md
+    assert "- Frontend Code Lines: 3" in summary_md
+    assert "## Planning Lead" not in summary_md
+    assert "## Delivery Status" not in summary_md
+    assert "## Requirements" not in summary_md
+    assert "## Next Task" not in summary_md
+    assert "## Tests" not in summary_md
+    assert "## Active Session" not in summary_md
+    assert "## Active Task" not in summary_md
+    assert "## Stale Runtime Records" not in summary_md
+    assert "## Invalid Verified Tasks" not in summary_md
+    assert "## Recent Activity" not in summary_md
 
 
 def test_cmd_status_tolerates_project_summary_refresh_failure(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1834,7 +2030,8 @@ def test_status_does_not_report_final_ready_when_final_task_is_blocked(tmp_path:
     assert payload["next_task"] is None
 
 
-def test_status_surfaces_repair_required_final_verify_context(tmp_path: Path) -> None:
+def test_status_surfaces_repair_required_final_verify_context(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
     save_work_items(
         tmp_path,
         {
@@ -1845,6 +2042,7 @@ def test_status_surfaces_repair_required_final_verify_context(tmp_path: Path) ->
             "items": [
                 {"id": "T000", "title": "脚手架", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
                 {"id": "T002", "title": "功能", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/feature/impl.py"]},
+                {"id": "T003", "title": "Final Verification Repair Bundle (T002)", "status": "pending", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": ["frontend/e2e/auth.spec.ts"], "output_paths": ["frontend/src/auth/"], "blocked_reason": "synthesized repair bundle for final verification failures"},
                 {"id": "T-FINAL", "title": "最终验证", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": [], "output_paths": [], "blocked_reason": "final verification found repairable issues; framework will continue with repair tasks"},
             ],
         },
@@ -1869,7 +2067,91 @@ def test_status_surfaces_repair_required_final_verify_context(tmp_path: Path) ->
     assert payload["final_verify"]["will_continue"] is True
     assert payload["final_verify"]["repair_candidates"] == ["T002"]
     assert payload["final_verify"]["repair_task_id"] == "T003"
-    assert payload["final_verify"]["repair_task_status"] is None
+    assert payload["final_verify"]["repair_task_status"] == "pending"
+
+
+def test_status_defers_final_verify_repair_context_until_non_final_tasks_are_complete(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "脚手架", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "功能", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/feature/impl.py"]},
+                {"id": "T003", "title": "Another feature", "status": "active", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": ["backend/src/tests/test_more.py"], "output_paths": ["backend/src/more/"]},
+                {"id": "T-FINAL", "title": "最终验证", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002", "T003"], "output_tests": [], "output_paths": [], "blocked_reason": "final verification found repairable issues; framework will continue with repair tasks"},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T-FINAL",
+        {
+            "task_id": "T-FINAL",
+            "final_verify_status": "repair_required",
+            "repair_candidates": ["T002"],
+            "repair_task_id": "T010",
+            "repair_report_artifact": "docs/reviews/final-repair-report.md",
+        },
+    )
+
+    payload = loop_status(tmp_path)
+
+    assert payload["final_verify"]["status"] == "deferred"
+    assert payload["final_verify"]["will_continue"] is False
+    assert "deferred until all non-final tasks are verified" in str(payload["final_verify"]["blocked_reason"])
+
+
+def test_routed_status_ignores_stale_final_blocker_until_regular_tasks_finish(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.control_plane._planning_blocker_code", lambda project_root: None)
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements-source.md").write_text("# Raw requirements\n", encoding="utf-8")
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}, {"id": "REQ-002", "title": "Two", "summary": "Two"}], "acceptance_scenarios": []}), encoding="utf-8")
+    (docs_dir / "architecture.md").write_text("architecture\n", encoding="utf-8")
+    (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
+    save_architecture_meta(tmp_path, {"schema_version": "1", "ui_required": False})
+    tmp_path.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
+    tmp_path.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
+    save_test_plan(tmp_path, {"schema_version": "1", "coverage": []})
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": tmp_path.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "脚手架", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "Feature A", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/feature_a/"]},
+                {"id": "T003", "title": "Feature B", "status": "pending", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": ["backend/src/tests/test_feature_b.py"], "output_paths": ["backend/src/feature_b/"]},
+                {"id": "T-FINAL", "title": "最终验证", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002", "T003"], "output_tests": [], "output_paths": [], "blocked_reason": "final verification found repairable issues; framework will continue with repair tasks"},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T-FINAL",
+        {
+            "task_id": "T-FINAL",
+            "final_verify_status": "repair_required",
+            "repair_candidates": ["T002"],
+            "repair_task_id": "T010",
+            "repair_report_artifact": "docs/reviews/final-repair-report.md",
+        },
+    )
+
+    payload = cli.routed_status(tmp_path)
+
+    assert payload["control_status"] == "in_progress"
+    assert payload["must_continue"] is True
+    assert payload["next_step"]["action"] == "run_resume"
+    assert payload["next_step"]["task_id"] == "T003"
 
 
 def test_cmd_control_auto_stops_when_final_task_is_blocked(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

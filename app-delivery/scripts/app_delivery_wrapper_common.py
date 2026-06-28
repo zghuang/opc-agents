@@ -17,6 +17,7 @@ FRAMEWORK_ROOT = Path(__file__).resolve().parents[1]
 if str(FRAMEWORK_ROOT) not in sys.path:
     sys.path.insert(0, str(FRAMEWORK_ROOT))
 
+from delivery.runtime_liveness import wrapper_should_interrupt
 from delivery.token_usage import append_token_usage_record, extract_opencode_usage
 
 
@@ -334,6 +335,7 @@ def run_observed_process(
 
     termination_lock = threading.Lock()
     termination_requested = {"value": False}
+    liveness_stop = {"value": False, "kind": "", "message": ""}
 
     def terminate_runtime_process_group() -> None:
         with termination_lock:
@@ -396,6 +398,34 @@ def run_observed_process(
                 session_id=session_id,
                 elapsed_seconds=elapsed_seconds,
             )
+            if effective_task_id and not liveness_stop["value"]:
+                decision = wrapper_should_interrupt(
+                    project_root,
+                    effective_task_id,
+                    _activity_snapshot(),
+                    started_monotonic=float(activity["started_at"]),
+                    now_monotonic=time.monotonic(),
+                )
+                if decision.suspected:
+                    liveness_stop.update({"value": True, "kind": decision.kind, "message": decision.message})
+                    message = f"stalled_runtime: {decision.message}"
+                    print(f"[app-delivery] {message}", file=sys.stderr, flush=True)
+                    if runtime_state_path is not None:
+                        write_task_runtime_state(
+                            runtime_state_path,
+                            {"status": "stalled", "failure_kind": "stalled_runtime", "failure_message": message, **_activity_snapshot()},
+                        )
+                    append_task_log_event(
+                        project_root,
+                        runtime=runtime,
+                        level="ERROR",
+                        message=f"Stalled {phase} {effective_task_id}",
+                        task_id=effective_task_id,
+                        task_title=task_title,
+                        session_id=observed_session_id or session_id,
+                        extra={"phase": phase, "failure_kind": "stalled_runtime", "liveness_kind": decision.kind},
+                    )
+                    terminate_runtime_process_group()
 
     def parent_watch_worker() -> None:
         while not parent_watch_stop.wait(PARENT_WATCH_INTERVAL_SECONDS):
@@ -470,7 +500,7 @@ def run_observed_process(
                 log_has_newline = line.endswith("\n")
         return_code = process.wait()
         if record_path is not None:
-            status = "completed" if return_code == 0 else "failed"
+            status = "completed" if return_code == 0 else ("stalled" if liveness_stop["value"] else "failed")
             write_active_task_record(record_path, {"status": status, "exit_code": return_code, "runtime_pid": process.pid, **_activity_snapshot()})
             if runtime_state_path is not None:
                 write_task_runtime_state(
@@ -481,6 +511,8 @@ def run_observed_process(
                         "exit_code": return_code,
                         "runtime_pid": process.pid,
                         "session_id": observed_session_id or None,
+                        "failure_kind": "stalled_runtime" if liveness_stop["value"] else None,
+                        "failure_message": liveness_stop["message"] if liveness_stop["value"] else None,
                         **_activity_snapshot(),
                     },
                 )

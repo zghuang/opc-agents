@@ -15,6 +15,7 @@ Procedure:
 	- tasks may cross backend, frontend, mock-server, shared code, and tests
 	- avoid layer-only tasks
 	- every requirement must be covered by at least one task
+	- user-visible frontend scenarios should usually ship with browser evidence in the owning feature task unless a named validation task explicitly owns that same journey
 	- dependencies should form a usable DAG, not an arbitrary serial list
 	- T000, optional T001, and T-FINAL are inserted by the framework
 3. Load the stage contract from [references/stage-contract.md](./references/stage-contract.md), replace placeholders with the actual project inputs, and produce a JSON object.

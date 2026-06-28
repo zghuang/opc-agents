@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from .requirements_context import format_acceptance_context, format_requirement_context
+from .runtime_config import load_project_metadata
 from .state import load_gates, load_test_results, project_paths
-from .task import Task, lint_task_contract
+from .task import PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, Task, lint_task_contract
 
 
 def _prompt_dir(project_root: Path | str) -> Path:
@@ -81,7 +83,47 @@ def _relevant_gate_rows(project_root: Path | str, task: Task) -> list[dict[str, 
     return relevant
 
 
+def _has_browser_style_test(task: Task) -> bool:
+    for spec in task.output_tests:
+        lowered = str(spec).strip().lower()
+        if lowered.startswith("frontend/e2e/"):
+            return True
+        if "playwright" in lowered or "/e2e/" in lowered or "npm run e2e" in lowered:
+            return True
+    return False
+
+
+def _relevant_dependency_hints(project_root: Path | str, task: Task) -> list[dict[str, str]]:
+    metadata = load_project_metadata(project_root)
+    raw_hints = metadata.get("dependency_hints") if isinstance(metadata.get("dependency_hints"), list) else []
+    ecosystems = {"project"}
+    if any(path.startswith("backend/") for path in task.output_paths):
+        ecosystems.add("backend")
+    if any(path.startswith("frontend/") for path in task.output_paths):
+        ecosystems.add("frontend")
+    result: list[dict[str, str]] = []
+    for row in raw_hints:
+        if not isinstance(row, dict):
+            continue
+        ecosystem = str(row.get("ecosystem") or "project").strip().lower() or "project"
+        if ecosystem not in ecosystems:
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        result.append(
+            {
+                "ecosystem": ecosystem,
+                "name": name,
+                "reason": str(row.get("reason") or "").strip(),
+            }
+        )
+    return result
+
+
 def build_task_prompt(project_root: Path | str, task: Task) -> str:
+    if task.id == PREFINAL_AUDIT_TASK_ID:
+        return build_prefinal_audit_prompt(project_root, task)
     project_dir = Path(project_root).expanduser().resolve()
     test_results = load_test_results(project_dir)
     failed_summary = []
@@ -106,6 +148,10 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         lines.append("")
         lines.append("Acceptance scenario details:")
         lines.extend(format_acceptance_context(project_root, task.acceptance_scenarios) or ["- none"])
+        lines.append("")
+    dependency_hints = _relevant_dependency_hints(project_root, task)
+    if dependency_hints:
+        lines.append("Project metadata declares technology constraints relevant to this task. If the requirement explicitly mandates a package, component library, or framework family, use it instead of silently leaving declared dependencies unused.")
         lines.append("")
     if task.output_paths:
         lines.append(f"Paths: {', '.join(task.output_paths)}")
@@ -150,9 +196,16 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         lines.append("")
     has_backend_specs = any(spec.startswith("backend/") for spec in task.output_tests)
     has_frontend_specs = any(spec.startswith("frontend/") for spec in task.output_tests)
+    has_frontend_paths = any(path.startswith("frontend/") for path in task.output_paths)
+    has_browser_specs = _has_browser_style_test(task)
     lines.append("Follow the runtime baseline in AGENTS.md / CLAUDE.md. For this task:")
-    lines.append("- Stay inside the declared output paths and output tests. If the task genuinely needs broader shared edits, report the contract gap instead of silently widening scope.")
-    lines.append("- Use the declared output_tests as the validation source of truth. The harness normalizes common backend/frontend path prefixes and owns commits, so avoid history-changing git commands and ad hoc validation paths.")
+    lines.append("- Prefer the declared output paths and output tests, but if completing the requirement or fixing regressions in the current task needs adjacent support-file edits, make them in this task and validate them here instead of stopping early on scope alone.")
+    lines.append("- Treat the declared output_tests as the minimum validation floor, not as proof by themselves that the requirement is done. Passing tests are necessary but not sufficient when the requirement or acceptance details describe stronger behavior.")
+    lines.append("- If the declared requirement or acceptance behavior is still not demonstrated inside this task's scope, add or strengthen task-local tests before stopping, then run the updated tests in the same task.")
+    if has_frontend_paths and task.acceptance_scenarios:
+        lines.append("- This task owns frontend-facing acceptance behavior. Include browser/e2e coverage for the user-visible flow in this task unless a declared downstream validation task explicitly owns that exact browser journey.")
+        if not has_browser_specs:
+            lines.append("- No browser/e2e test is currently declared for this frontend acceptance slice. Add one now unless the downstream validation owner is explicit in the task graph.")
     lines.append("- Complete only the current task. Do not start the next task, pre-implement future work, or widen scope after this task's declared tests pass.")
     if has_backend_specs:
         lines.append("- Backend validation: prefer package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`, using the repository environment rather than bare system python.")
@@ -163,6 +216,80 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         lines.append("- When a requirement mandates a technology family rather than a literal package name, resolve the exact package entry deliberately instead of dumping all possible dependencies into the manifest.")
     lines.append("- If previously passing tests outside this task's declared scope regress after your changes, determine whether the regression is caused by your implementation, stale tests, or both, then apply the minimal correct fix.")
     lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
+    prompt = "\n".join(lines)
+    write_task_prompt(project_root, task, prompt)
+    return prompt
+
+
+def build_prefinal_audit_prompt(project_root: Path | str, task: Task) -> str:
+    project_dir = Path(project_root).expanduser().resolve()
+    lines = [
+        f"## Task {task.id}: {task.title}",
+        "",
+        f"Project path: {project_dir}",
+        "",
+        "You are running a final pre-release system audit for the current repository state.",
+        "This is a new runtime session: do not rely on hidden conversation history. Base conclusions on the files and evidence present in this project directory.",
+        "",
+        "Mission:",
+        "- Read the original requirements, the normalized requirements, any requirement clarification or conflict-resolution decisions, and the current system source code.",
+        "- Compare implemented behavior against those requirement sources. Use other project docs, ledgers, reviews, and test evidence only as supporting evidence, not as replacements for the requirement sources.",
+        "- Fix release-relevant gaps, incorrect implementations, broken flows, or missing validation evidence that can be responsibly fixed inside this task.",
+        f"- Write a detailed audit report to `{PREFINAL_AUDIT_REPORT_PATH}`.",
+        "",
+        "Authoritative inputs to inspect:",
+        "- docs/requirements-source.md",
+        "- docs/requirements.json",
+        "- docs/clarification-needed.md, docs/clarification-answers.md, or equivalent clarification files, if present",
+        "- docs/adr/, docs/adrs/, or equivalent decision/conflict-resolution records, if they clarify or supersede requirements",
+        "",
+        "Supporting evidence to consult as needed:",
+        "- docs/work-items.json, docs/test-plan.json, docs/gates.json, and docs/reviews/",
+        "- architecture, UI, module, or design documents only when they help interpret requirements or explain implementation intent",
+        "",
+        "Code surfaces to inspect:",
+        "- Inspect the full application source tree for this project, including production code, tests, fixtures/mocks, integration adapters, UI code if present, configuration, manifests, and app-owned scripts.",
+        "- Adapt to the repository's actual stack and layout; do not assume Python, React, backend/frontend folders, or mock-server folders exist.",
+        "- Ignore dependency/vendor/build/runtime noise unless it is directly relevant to a requirement or failing behavior.",
+        "",
+        "Audit rules:",
+        "- Do not trust task status, green tests, route existence, or intermediate review summaries as proof of full requirement satisfaction; use them as evidence only.",
+        "- Do not mark a requirement as satisfied merely because scaffolding, stubs, shared wiring, or placeholders exist. Require evidence of the actual owned behavior.",
+        "- Distinguish complete behavior from partial support, deferred behavior, missing behavior, and incorrect behavior.",
+        "- If a user-visible flow is claimed complete, inspect the real user-facing behavior and appropriate end-to-end evidence for this stack.",
+        "- If an integration, workflow, background job, data pipeline, or agent capability is claimed complete, inspect the real code path, contracts, fallback behavior, evidence model, and tests.",
+        "- If you find a gap that can be fixed without inventing new product scope, fix it and add or strengthen relevant validation.",
+        "- If a gap requires major product reinterpretation or external clarification, document it as a blocker instead of hiding it behind a partial fix.",
+        "",
+        "Scope authority:",
+        "- This task has project-wide scope for release-correctness fixes inside the target application project.",
+        "- Do not rewrite unrelated code for style, architecture preference, or polish unless it is necessary to close a concrete release gap.",
+        "",
+        "Validation rules:",
+        "- Do not run the full release suite here. The framework will run exhaustive final verification after this audit task is reviewed.",
+        "- For fixes made in this task, run focused repository-native validations that are strong enough to prove the fix did not break the touched area.",
+        "- Prefer targeted unit, component, contract, or integration tests near the changed code. If a failing test is itself stale or incorrect, repair the test and explain why in the report.",
+        "- Run browser/end-to-end checks only when the audit fix changes a user-facing flow or when no lighter validation can credibly prove the behavior.",
+        "- Record every validation command and result in the audit report. If a broader validation is deferred to final verification, say so explicitly.",
+        "",
+        f"Required report: `{PREFINAL_AUDIT_REPORT_PATH}`",
+        "The report must contain these markdown sections exactly:",
+        "- # System Audit",
+        "- ## Audit Scope",
+        "- ## Executive Verdict",
+        "- ## Fixed Issues",
+        "- ## Remaining Gaps / Blockers",
+        "- ## Requirement Gap Matrix",
+        "- ## Validation Summary",
+        "- ## Changed Files",
+        "- ## Final Recommendation",
+        "",
+        "Completion rules:",
+        f"- `{PREFINAL_AUDIT_REPORT_PATH}` must exist and be fully populated before stopping.",
+        "- If you changed code, tests, config, or mocks, include those files and validation evidence in the report.",
+        "- Stop only when all responsibly fixable release gaps are fixed and reported, or when remaining blockers are explicitly documented.",
+        "- When this task is complete, blocked, or ready for review, stop and let the framework route the next step.",
+    ]
     prompt = "\n".join(lines)
     write_task_prompt(project_root, task, prompt)
     return prompt

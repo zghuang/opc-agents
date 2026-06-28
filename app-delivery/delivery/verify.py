@@ -20,6 +20,7 @@ from .state import (
     utc_now_iso,
     write_active_task_record,
 )
+from .test_env import ensure_task_test_environment, frontend_e2e_env_prefix
 from .task import FINAL_VERIFY_TASK_ID, SHARED_FOUNDATION_TASK_ID, SCAFFOLD_TASK_ID, all_tasks
 
 
@@ -430,17 +431,17 @@ def _frontend_quality_gate_tasks(project_root: Path) -> list[dict[str, Any]]:
         return []
     tasks: list[dict[str, Any]] = []
     gate_specs = [
-        ("frontend-quality-gates", "NFR-001", ["test", "typecheck", "lint", "build"]),
-        ("frontend-browser-qa", ["NFR-003", "NFR-004"], ["e2e"]),
+        ("frontend-quality-gates", [], ["test", "typecheck", "lint", "build"]),
+        ("frontend-browser-qa", [], ["e2e"]),
     ]
     for suffix, requirement_ids, script_names in gate_specs:
         commands = [f"npm run {name}" for name in script_names if str(scripts.get(name) or "").strip()]
         if not commands:
             continue
         if isinstance(requirement_ids, str):
-            normalized_requirement_ids = [requirement_ids]
+            normalized_requirement_ids = [requirement_ids] if requirement_ids else []
         else:
-            normalized_requirement_ids = list(requirement_ids)
+            normalized_requirement_ids = [str(value).strip() for value in requirement_ids if str(value).strip()]
         tasks.append(
             {
                 "id": f"{FINAL_VERIFY_TASK_ID}:{suffix}",
@@ -594,8 +595,11 @@ def _rewrite_command_test_spec(project_root: Path, spec: str) -> str:
     lowered = normalized.casefold()
     backend_root = project_root / "backend"
     frontend_root = project_root / "frontend"
+    e2e_env = frontend_e2e_env_prefix(project_root)
     if lowered.startswith("npm run "):
         if (frontend_root / "package.json").exists():
+            if lowered.startswith("npm run e2e"):
+                return f"cd {shlex.quote(str(frontend_root))} && {e2e_env}{normalized}"
             return f"cd {shlex.quote(str(frontend_root))} && {normalized}"
         return normalized
     if lowered.startswith(("pytest ", "python -m pytest", "python3 -m pytest", "uv run pytest", "uv run python -m pytest", "uv run python3 -m pytest")):
@@ -614,6 +618,7 @@ def _command_for_test_spec(project_root: Path, spec: str) -> list[str]:
     backend_root = project_root / "backend"
     frontend_root = project_root / "frontend"
     mock_root = project_root / "mock-server"
+    e2e_env = frontend_e2e_env_prefix(project_root)
     if normalized.startswith("backend/"):
         relative = Path(normalized).relative_to("backend")
         if relative.suffix.lower() in {".py"} or relative.suffix == "":
@@ -625,12 +630,12 @@ def _command_for_test_spec(project_root: Path, spec: str) -> list[str]:
     if normalized.startswith("frontend/"):
         relative = Path(normalized).relative_to("frontend")
         if ".spec." in relative.name or "e2e" in relative.parts or "playwright" in normalized.lower():
-            return ["/bin/zsh", "-lc", f"cd {shlex.quote(str(frontend_root))} && { _js_runner_prefix(project_root, normalized, 'playwright') } test {shlex.quote(str(relative))}"]
+            return ["/bin/zsh", "-lc", f"cd {shlex.quote(str(frontend_root))} && {e2e_env}{ _js_runner_prefix(project_root, normalized, 'playwright') } test {shlex.quote(str(relative))}"]
         if relative.suffix.lower() in {".ts", ".tsx", ".js", ".jsx"}:
             return ["/bin/zsh", "-lc", f"cd {shlex.quote(str(frontend_root))} && { _js_runner_prefix(project_root, normalized, 'vitest') } run {shlex.quote(str(relative))}"]
     if path.suffix.lower() in {".ts", ".tsx", ".js", ".jsx"}:
         if ".spec." in path.name or "e2e" in path.parts or "playwright" in normalized.lower():
-            return ["/bin/zsh", "-lc", f"{_js_runner_prefix(project_root, normalized, 'playwright')} test {shlex.quote(normalized)}"]
+            return ["/bin/zsh", "-lc", f"{e2e_env}{_js_runner_prefix(project_root, normalized, 'playwright')} test {shlex.quote(normalized)}"]
         return ["/bin/zsh", "-lc", f"{_js_runner_prefix(project_root, normalized, 'vitest')} run {shlex.quote(normalized)}"]
     pytest_runner = os.environ.get("APP_DELIVERY_PYTHON") or sys.executable or "python3"
     return [pytest_runner, "-m", "pytest", normalized, "--tb=short", "-q"]
@@ -700,6 +705,18 @@ def run_task_tests(project_root: Path | str, task: dict[str, Any], *, attempt: i
     failures: list[TestFailure] = []
     overall_passed = True
     for spec in test_specs:
+        env_result = ensure_task_test_environment(project_dir, task, spec)
+        if not env_result.ready:
+            overall_passed = False
+            failed_count += 1
+            failures.append(
+                TestFailure(
+                    test=spec,
+                    message=f"test environment not ready ({env_result.profile}): {env_result.summary}",
+                    traceback=json.dumps({"actions_run": env_result.actions_run, "details": env_result.details}, ensure_ascii=False),
+                )
+            )
+            continue
         if is_command_test_spec(spec):
             reason = weak_command_reason(spec)
             if reason:

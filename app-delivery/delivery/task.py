@@ -18,7 +18,9 @@ TASK_ID_RE = re.compile(r"^T\d{3,}$")
 VALID_STATUSES = {"pending", "active", "review_pending", "done", "verified", "blocked", "exception", "cancelled"}
 SCAFFOLD_TASK_ID = "T000"
 SHARED_FOUNDATION_TASK_ID = "T001"
+PREFINAL_AUDIT_TASK_ID = "T-SYSTEM-AUDIT"
 FINAL_VERIFY_TASK_ID = "T-FINAL"
+PREFINAL_AUDIT_REPORT_PATH = "docs/reviews/system-audit.md"
 FOUNDATION_SCOPE_PREFIXES = (
     "backend/",
     "backend/pyproject.toml",
@@ -38,7 +40,6 @@ FOUNDATION_SCOPE_PREFIXES = (
     "frontend/src/styles/",
     "frontend/src/App.tsx",
     "frontend/src/App.test.tsx",
-    "frontend/e2e/app-shell.spec.ts",
 )
 SHARED_FOUNDATION_OUTPUT_PATHS = [
     "backend/pyproject.toml",
@@ -65,7 +66,18 @@ SHARED_FOUNDATION_OUTPUT_TESTS = [
     "backend/src/tests/test_health.py",
     "backend/tests/core/",
     "frontend/src/App.test.tsx",
-    "frontend/e2e/app-shell.spec.ts",
+]
+PREFINAL_AUDIT_OUTPUT_PATHS = [
+    "backend/",
+    "frontend/",
+    "mock-server/",
+    "scripts/",
+    "docker-compose.yml",
+    "README.md",
+    PREFINAL_AUDIT_REPORT_PATH,
+]
+PREFINAL_AUDIT_OUTPUT_TESTS = [
+    "bash -lc 'test -s docs/reviews/system-audit.md && grep -q \"## Requirement Gap Matrix\" docs/reviews/system-audit.md && grep -q \"## Validation Summary\" docs/reviews/system-audit.md'",
 ]
 FOUNDATION_TITLE_MARKERS = (
     "基础设施",
@@ -238,6 +250,14 @@ def _normalize_builtin_task_contract(task: "Task") -> "Task":
         data["output_paths"] = _dedupe_preserve([*SHARED_FOUNDATION_OUTPUT_PATHS, *task.output_paths])
         data["output_tests"] = _normalize_shared_foundation_output_tests(task.output_tests)
         return Task.from_dict(data)
+    if task.id == PREFINAL_AUDIT_TASK_ID:
+        data["title"] = task.title or "Pre-final full-system audit"
+        data["task_kind"] = "audit"
+        data["requirements"] = []
+        data["acceptance_scenarios"] = []
+        data["output_paths"] = _dedupe_preserve([*PREFINAL_AUDIT_OUTPUT_PATHS, *task.output_paths])
+        data["output_tests"] = _dedupe_preserve([*PREFINAL_AUDIT_OUTPUT_TESTS, *task.output_tests])
+        return Task.from_dict(data)
     return task
 
 
@@ -376,7 +396,7 @@ def index_tasks(tasks: list[Task]) -> dict[str, Task]:
 def next_generated_task_id(tasks: list[Task], *, minimum: int = 2) -> str:
     next_index = max(2, int(minimum))
     for task in tasks:
-        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FINAL_VERIFY_TASK_ID}:
+        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
         if not TASK_ID_RE.match(task.id):
             continue
@@ -517,7 +537,7 @@ def _validate_requirement_task_coverage(project_root: Path | str, tasks: list[Ta
         return
     covered: set[str] = set()
     for task in tasks:
-        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FINAL_VERIFY_TASK_ID}:
+        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
         covered.update(task.requirements)
     covered.update(req_id for req_id in requirement_ids if _is_final_verify_requirement(req_id))
@@ -637,11 +657,21 @@ def check_requirements_coverage(project_root: Path | str, requirements_payload: 
 def check_test_type_coverage(project_root: Path | str) -> list[tuple[str, str]]:
     plan = load_test_plan(project_root)
     from .state import load_test_results
+    from .verify import infer_test_types
 
     results_payload = load_test_results(project_root)
     results = results_payload.get("results") if isinstance(results_payload.get("results"), list) else []
     tasks = all_tasks(project_root)
     missing: list[tuple[str, str]] = []
+    missing_set: set[tuple[str, str]] = set()
+
+    def record_missing(reference_id: str, test_type: str) -> None:
+        normalized = (str(reference_id or "").strip(), str(test_type or "").strip())
+        if not normalized[0] or not normalized[1] or normalized in missing_set:
+            return
+        missing_set.add(normalized)
+        missing.append(normalized)
+
     for row in plan.get("coverage", []):
         if not isinstance(row, dict):
             continue
@@ -658,7 +688,7 @@ def check_test_type_coverage(project_root: Path | str) -> list[tuple[str, str]]:
                     for task in tasks
                 )
                 if not matched:
-                    missing.append((requirement_id, test_type))
+                    record_missing(requirement_id, test_type)
                 continue
             if requirement_id.startswith("NFR-"):
                 matched = any(
@@ -668,7 +698,7 @@ def check_test_type_coverage(project_root: Path | str) -> list[tuple[str, str]]:
                     for result in results
                 )
                 if not matched:
-                    missing.append((requirement_id, test_type))
+                    record_missing(requirement_id, test_type)
                 continue
             matched = any(
                 isinstance(result, dict)
@@ -678,7 +708,38 @@ def check_test_type_coverage(project_root: Path | str) -> list[tuple[str, str]]:
                 for result in results
             )
             if not matched:
-                missing.append((requirement_id, test_type))
+                record_missing(requirement_id, test_type)
+
+    for task in tasks:
+        if task.status != "verified":
+            continue
+        if not task.acceptance_scenarios:
+            continue
+        if not any(path.startswith("frontend/") for path in task.output_paths):
+            continue
+
+        has_browser_evidence = any(
+            isinstance(result, dict)
+            and bool(result.get("passed"))
+            and str(result.get("task_id") or "").strip() == task.id
+            and any(test_type in {"browser", "e2e"} for test_type in result.get("test_types", []))
+            for result in results
+        )
+        if has_browser_evidence:
+            continue
+
+        explicit_downstream_browser_owner = any(
+            candidate.task_kind == "validation"
+            and candidate.id != task.id
+            and bool(set(candidate.acceptance_scenarios).intersection(task.acceptance_scenarios))
+            and any(test_type in {"browser", "e2e"} for test_type in infer_test_types(candidate.output_tests))
+            for candidate in tasks
+        )
+        if explicit_downstream_browser_owner:
+            continue
+
+        for requirement_id in task.requirements:
+            record_missing(requirement_id, "browser")
     return missing
 
 
@@ -725,9 +786,9 @@ def decompose_tasks(
         if not isinstance(raw_item, dict):
             continue
         task_id = str(raw_item.get("id") or "").strip()
-        if task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FINAL_VERIFY_TASK_ID}:
+        if task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
-        if not TASK_ID_RE.match(task_id) or task_id in task_ids or task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID}:
+        if not TASK_ID_RE.match(task_id) or task_id in task_ids or task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, PREFINAL_AUDIT_TASK_ID}:
             task_id = f"T{next_index:03d}"
         next_index += 1
         dependencies = [str(value).strip() for value in raw_item.get("dependencies", []) if str(value).strip()]
@@ -775,11 +836,25 @@ def decompose_tasks(
     normalized_items = resolved_items
     if include_shared_foundation:
         normalized_items = _collapse_shared_foundation_tasks(normalized_items)
+    audit_dependencies = [task.id for task in normalized_items if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}]
+    normalized_items.append(
+        Task(
+            id=PREFINAL_AUDIT_TASK_ID,
+            title="Pre-final full-system audit",
+            status="pending",
+            requirements=[],
+            acceptance_scenarios=[],
+            dependencies=audit_dependencies,
+            output_tests=list(PREFINAL_AUDIT_OUTPUT_TESTS),
+            output_paths=list(PREFINAL_AUDIT_OUTPUT_PATHS),
+            task_kind="audit",
+        )
+    )
     _validate_dependency_graph(normalized_items)
     _validate_task_shape(normalized_items)
     _validate_requirement_task_coverage(project_root, normalized_items)
 
-    final_dependencies = [task.id for task in normalized_items if task.id != FINAL_VERIFY_TASK_ID]
+    final_dependencies = [PREFINAL_AUDIT_TASK_ID]
     final_requirements = sorted(req_id for req_id in load_requirement_ids(project_root) if _is_final_verify_requirement(req_id))
     normalized_items.append(
         Task(
@@ -793,6 +868,7 @@ def decompose_tasks(
             output_paths=["docs/release-evidence.md", "docs/reviews/final-review.md"],
         )
     )
+    _validate_dependency_graph(normalized_items)
     payload = load_work_items(project_root)
     payload["items"] = [task.to_dict() for task in normalized_items]
     return payload

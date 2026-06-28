@@ -897,6 +897,135 @@ def test_all_tasks_normalizes_existing_t001_contract(tmp_path: Path) -> None:
     assert "frontend/src/App.test.tsx" in tasks["T001"].output_tests
 
 
+def test_check_test_type_coverage_flags_verified_frontend_acceptance_without_browser_evidence(tmp_path: Path) -> None:
+    save_test_plan(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "coverage": [
+                {"requirement_id": "REQ-001", "test_types": ["api"]},
+            ],
+        },
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Dashboard",
+                    "status": "verified",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": ["AS-001"],
+                    "dependencies": ["T000"],
+                    "output_tests": ["frontend/src/pages/Dashboard.test.tsx"],
+                    "output_paths": ["frontend/src/pages/dashboard.tsx"],
+                    "review_status": "pass",
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "results": [
+                {
+                    "task_id": "T002",
+                    "timestamp": "2026-06-24T00:00:00Z",
+                    "test_files": ["frontend/src/pages/Dashboard.test.tsx"],
+                    "test_types": ["unit"],
+                    "requirement_ids": ["REQ-001"],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                }
+            ],
+        },
+    )
+
+    missing = check_test_type_coverage(tmp_path)
+
+    assert ("REQ-001", "browser") in missing
+
+
+def test_check_test_type_coverage_allows_explicit_downstream_browser_owner(tmp_path: Path) -> None:
+    save_test_plan(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "coverage": [
+                {"requirement_id": "REQ-001", "test_types": ["api"]},
+            ],
+        },
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Dashboard",
+                    "status": "verified",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": ["AS-001"],
+                    "dependencies": ["T000"],
+                    "output_tests": ["frontend/src/pages/Dashboard.test.tsx"],
+                    "output_paths": ["frontend/src/pages/dashboard.tsx"],
+                    "review_status": "pass",
+                },
+                {
+                    "id": "T020",
+                    "title": "Dashboard validation",
+                    "status": "pending",
+                    "task_kind": "validation",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": ["AS-001"],
+                    "dependencies": ["T002"],
+                    "output_tests": ["frontend/e2e/dashboard.spec.ts"],
+                    "output_paths": ["docs/reviews/test-report-dashboard.md"],
+                },
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "results": [
+                {
+                    "task_id": "T002",
+                    "timestamp": "2026-06-24T00:00:00Z",
+                    "test_files": ["frontend/src/pages/Dashboard.test.tsx"],
+                    "test_types": ["unit"],
+                    "requirement_ids": ["REQ-001"],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                }
+            ],
+        },
+    )
+
+    missing = check_test_type_coverage(tmp_path)
+
+    assert ("REQ-001", "browser") not in missing
+
+
 def test_decompose_tasks_merges_foundation_like_generated_task_into_t001(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
