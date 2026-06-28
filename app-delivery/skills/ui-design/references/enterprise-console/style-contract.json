@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "template_id": "enterprise-console",
+  "design_system_required_hexes": [
+    "#503291",
+    "#0F69AF",
+    "#149B5F",
+    "#FFC832",
+    "#E61E50"
+  ],
+  "design_system_required_phrases": [
+    "Use solid colors only",
+    "Choose one dominant shell color for navigation chrome"
+  ],
+  "design_system_forbidden_hexes": [
+    "#1677FF",
+    "#1677ff"
+  ],
+  "theme_required_tokens": {
+    "colorPrimary": "#503291",
+    "colorInfo": "#0F69AF",
+    "colorSuccess": "#149B5F",
+    "colorWarning": "#FFC832",
+    "colorError": "#E61E50",
+    "colorLink": "#0F69AF"
+  },
+  "theme_forbidden_token_values": {
+    "colorPrimary": [
+      "#1677ff",
+      "#1677FF"
+    ],
+    "colorInfo": [
+      "#1677ff",
+      "#1677FF"
+    ],
+    "colorLink": [
+      "#1677ff",
+      "#1677FF"
+    ],
+    "darkItemSelectedBg": [
+      "#1677ff",
+      "#1677FF"
+    ]
+  }
+}

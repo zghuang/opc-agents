@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OPC_HOME="${OPC_HOME:-$HOME/opc}"
+exec python3 "$OPC_HOME/scripts/opc-commit-guard.py" --workdir "$PWD"

@@ -1,0 +1,15 @@
+services:
+  mocks:
+    build: .
+    ports:
+      - "8888:8888"
+    environment:
+      - ENVIRONMENT=test
+    command: uvicorn main:app --host 0.0.0.0 --port 8888 --reload
+    volumes:
+      - .:/app
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8888/health', timeout=2).read()\""]
+      interval: 5s
+      timeout: 3s
+      retries: 5

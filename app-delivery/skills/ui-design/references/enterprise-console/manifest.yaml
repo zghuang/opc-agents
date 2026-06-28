@@ -1,0 +1,25 @@
+id: enterprise-console
+label: Enterprise Console
+domains:
+  - internal-system
+  - admin
+  - approval
+  - procurement
+  - workflow
+  - operations
+preferred_for:
+  - Company internal systems.
+  - Admin consoles and role-based workflow tools.
+  - Data-heavy CRUD, approval, reporting, and audit screens.
+avoid_for:
+  - Consumer landing pages.
+  - Highly visual portfolio or marketing sites.
+  - Game-like or immersive experiences.
+density: compact
+navigation: sidebar
+tone: restrained
+fallback_priority: 20
+required_screenshots:
+  - dashboard or landing workspace
+  - data table or list view
+  - form or detail page

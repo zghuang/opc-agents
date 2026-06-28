@@ -1,0 +1,56 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+# opc-runtime verify generates this route-crawl spec on demand
+e2e/_opc-*.spec.ts
+frontend/e2e/_opc-*.spec.ts
+# Saved Playwright auth/storage state (machine-local; never commit credentials)
+e2e/.auth/
+frontend/e2e/.auth/
+
+# Logs
+*.log
+
+# App-delivery local runtime
+.app-delivery-runtime/
+
+# OPC local runtime
+.opc-runtime/
+.opc-prompts/
+
+# Coverage / tooling extras
+.coverage.*
+coverage/
+.cache/
+
+# Claude Code local-only overrides
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/agent-memory-local/
+
+# OS
+.DS_Store
+Thumbs.db

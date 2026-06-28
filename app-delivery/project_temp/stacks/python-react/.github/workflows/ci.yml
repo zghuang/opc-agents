@@ -1,0 +1,52 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        options: --health-cmd "redis-cli ping" --health-interval 10s
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --dev
+        working-directory: backend
+      - run: uv run ruff check src/
+        working-directory: backend
+      - run: uv run mypy src/ --strict
+        working-directory: backend
+      - run: uv run pytest
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:test@localhost/test_db
+          SECRET_KEY: test-secret-key-for-ci-only
+          ENVIRONMENT: development
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - run: npm install
+        working-directory: frontend
+      - run: npx tsc --noEmit
+        working-directory: frontend
+      - run: npx eslint src/ --max-warnings 0
+        working-directory: frontend
+      - run: npx vitest run --coverage
+        working-directory: frontend

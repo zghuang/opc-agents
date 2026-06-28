@@ -1,0 +1,478 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+from .bootstrap import archive_requirements_source, save_project_dependency_hints
+from .errors import DeliveryError
+from .runtime_config import load_project_runtime, root_context_filename
+from .scaffold import write_project_structure_snapshot
+from .gates import sync_gates
+from .state import ensure_runtime_dirs, load_architecture_meta, project_paths, save_architecture_meta, save_test_plan, save_work_items, utc_now_iso
+from .task import Task, decompose_tasks, lint_task_contracts, parse_task_json
+
+
+STAGE_INPUT_DIRNAME = "stage-inputs"
+
+STAGE_METADATA: dict[str, dict[str, Any]] = {
+    "spec-review": {
+        "missing_code": "requirements_missing",
+        "required_skill": "spec-review",
+        "expected_outputs": ["docs/requirements.json", "docs/clarification-needed.md"],
+    },
+    "arch-design": {
+        "missing_code": "architecture_missing",
+        "required_skill": "arch-design",
+        "expected_outputs": ["docs/architecture.md", "docs/shared-components.md", "docs/architecture-meta.json"],
+    },
+    "ui-design": {
+        "missing_code": "ui_design_missing",
+        "required_skill": "ui-design",
+        "expected_outputs": ["docs/ui/template-selection.md", "docs/ui/design-system.md", "docs/ui/page-archetypes.md", "docs/ui/states.md"],
+    },
+    "project-context-sync": {
+        "missing_code": "context_missing",
+        "required_skill": "project-context-sync",
+        "expected_outputs": ["CODE_MAP.md", "docs/test-plan.json"],
+    },
+    "task-decompose": {
+        "missing_code": "work_items_missing",
+        "required_skill": "task-decompose",
+        "expected_outputs": ["docs/work-items.json", "docs/work-items.md"],
+    },
+}
+
+STAGE_CLI_COMMANDS: dict[str, str] = {
+    "spec-review": "spec-review",
+    "arch-design": "arch-design",
+    "ui-design": "ui-design",
+    "project-context-sync": "context-sync",
+    "task-decompose": "decompose",
+}
+
+MODULE_ARCHITECTURE_HEADING_RE = re.compile(r"^##+\s+(?:\d+\.\s*)?(?:Module Architecture|模块架构)\s*$", re.IGNORECASE | re.MULTILINE)
+FENCED_BLOCK_RE = re.compile(r"```(?:text|plaintext|txt)?\n(?P<body>.*?)\n```", re.DOTALL | re.IGNORECASE)
+CODE_MAP_SECTION_RE = re.compile(r"^##+\s+(?P<title>.+?)\s*$")
+
+
+def _runtime_context_baseline(runtime: str) -> str:
+    context_name = "CLAUDE.md" if runtime == "claude" else "AGENTS.md"
+    return "\n".join(
+        [
+            "## Runtime Baseline",
+            "",
+            f"Read {context_name} before each implementation or review session.",
+            "",
+            "### Session Startup Order",
+            "1. Read this file for project-level rules that always apply.",
+            "2. Use CODE_MAP.md as navigation, not as the source of behavior truth.",
+            "3. Read only the relevant source docs for the current task.",
+            "",
+            "### Source of Truth",
+            "- docs/requirements-source.md is the raw requirements record and the business source of truth.",
+            "- docs/requirements.json, docs/work-items.json, and docs/test-plan.json are framework artifacts for planning and traceability; do not treat them as the business source of truth.",
+            "- docs/architecture.md, docs/shared-components.md, docs/modules/*, docs/adr/*, and docs/ui/* (when present) are the design reference docs.",
+            "- docs/work-items.md is a readable view only; do not treat it as the canonical ledger.",
+            "",
+            "### Universal Rules",
+            "- Prefer the smallest maintainable change that fully solves the task.",
+            "- Do not turn a straightforward fix into unnecessary abstraction or indirection.",
+            "- Extract shared code only when the current task or clear duplication justifies it.",
+            "- If the task genuinely needs wider shared or cross-feature edits, stop and report a contract gap instead of widening scope silently.",
+            "- When a task depends on an unfamiliar or recently released library/framework, do not guess APIs from memory. First confirm usage from the official docs, GitHub repository, or the installed package source before coding against it.",
+            "- Keep controlled records, approvals, audit trails, and permission boundaries intact.",
+            "- Treat AI outputs as assistive, never authoritative.",
+            "",
+            "### Validation Rules",
+            "- Do not delete or weaken tests to make the task pass.",
+            "- Run the task-declared validation and required review/QA steps before considering the task complete.",
+            "- Do not run git history-changing commands; the framework owns commits.",
+        ]
+    )
+
+
+def _merge_runtime_context(runtime: str, project_specific_text: str) -> str:
+    project_text = str(project_specific_text or "").strip()
+    baseline = _runtime_context_baseline(runtime).strip()
+    if not project_text:
+        return baseline + "\n"
+    if "## Runtime Baseline" in project_text:
+        return project_text.rstrip() + "\n"
+    return project_text.rstrip() + "\n\n---\n\n" + baseline + "\n"
+
+
+def _validate_architecture_markdown(input_path: Path, architecture_md: str) -> None:
+    text = str(architecture_md or "")
+    match = MODULE_ARCHITECTURE_HEADING_RE.search(text)
+    if not match:
+        raise _shape_error(
+            "arch-design",
+            input_path,
+            "arch-design architecture_md must include a 'Module Architecture' section with the intended repository/module structure",
+        )
+    if "```" not in text[match.end():]:
+        raise _shape_error(
+            "arch-design",
+            input_path,
+            "arch-design Module Architecture section must include a fenced code block showing the repository/module tree",
+        )
+
+
+def _extract_module_architecture_tree(architecture_text: str) -> str:
+    match = MODULE_ARCHITECTURE_HEADING_RE.search(str(architecture_text or ""))
+    if not match:
+        return ""
+    section = str(architecture_text or "")[match.end() :]
+    fenced = FENCED_BLOCK_RE.search(section)
+    if not fenced:
+        return ""
+    return str(fenced.group("body") or "").strip()
+
+
+def _code_map_title(text: str, project_root: Path) -> str:
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("# "):
+            return stripped
+        break
+    return f"# CODE_MAP.md — {project_root.name}"
+
+
+def _strip_generated_code_map_sections(text: str) -> str:
+    lines = str(text or "").splitlines()
+    result: list[str] = []
+    index = 0
+    generated_titles = {"project root", "project structure", "current project structure", "planned module structure"}
+    while index < len(lines):
+        line = lines[index]
+        match = CODE_MAP_SECTION_RE.match(line.strip())
+        if match:
+            title = str(match.group("title") or "").strip().casefold()
+            if title in generated_titles:
+                index += 1
+                while index < len(lines) and not CODE_MAP_SECTION_RE.match(lines[index].strip()):
+                    index += 1
+                continue
+        result.append(line)
+        index += 1
+    body = "\n".join(result).strip()
+    if body.startswith("# "):
+        body = "\n".join(body.splitlines()[1:]).strip()
+    return body
+
+
+def _top_level_project_roots(project_root: Path) -> list[str]:
+    structure_path = project_root / "docs" / "project-structure.md"
+    if not structure_path.exists():
+        return []
+    roots: list[str] = []
+    for raw_line in structure_path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.startswith("- "):
+            continue
+        roots.append(raw_line[2:].strip())
+    return roots
+
+
+def _build_code_map_markdown(project_root: Path, authored_code_map: str) -> str:
+    title = _code_map_title(authored_code_map, project_root)
+    authored_body = _strip_generated_code_map_sections(authored_code_map)
+    architecture_path = project_root / "docs" / "architecture.md"
+    planned_tree = ""
+    if architecture_path.exists():
+        planned_tree = _extract_module_architecture_tree(architecture_path.read_text(encoding="utf-8"))
+    roots = _top_level_project_roots(project_root)
+    lines = [
+        title,
+        "",
+        "## Current Project Structure",
+        "",
+        "- Source of truth for the current filesystem layout: `docs/project-structure.md` (machine-generated).",
+    ]
+    if roots:
+        lines.append("- Current top-level roots: " + ", ".join(f"`{root}`" for root in roots) + ".")
+    else:
+        lines.append("- Current top-level roots are unavailable because `docs/project-structure.md` has not been generated yet.")
+    lines.extend([
+        "- Do not hand-maintain a separate root tree in this file; the harness owns that view to keep it aligned with the filesystem.",
+        "",
+        "## Planned Module Structure",
+        "",
+        "- Source of truth for the intended target structure: `docs/architecture.md` -> `Module Architecture`.",
+    ])
+    if planned_tree:
+        lines.extend(["", "```text", planned_tree, "```"])
+    else:
+        lines.extend(["", "- No planned module tree is currently available in `docs/architecture.md`."])
+    if authored_body:
+        lines.extend(["", authored_body])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _persist_stage_input(project_root: Path | str, stage_name: str, payload: Any) -> Path:
+    target = stage_input_path(project_root, stage_name)
+    target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return target
+
+
+def stage_input_path(project_root: Path | str, stage_name: str) -> Path:
+    paths = ensure_runtime_dirs(project_root)
+    stage_dir = paths.runtime_dir / STAGE_INPUT_DIRNAME
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    return stage_dir / f"{stage_name}.json"
+
+
+def stage_import_command(project_root: Path | str, stage_name: str, input_path: Path | None = None) -> str:
+    stage_file = input_path or stage_input_path(project_root, stage_name)
+    command_name = STAGE_CLI_COMMANDS.get(stage_name, stage_name)
+    return f"${{OPC_HOME:-$HOME/opc}}/bin/app-delivery {command_name} --project {Path(project_root).expanduser().resolve()} --input {stage_file}"
+
+
+def stage_missing_error(stage_name: str, project_root: Path | str, *, requirements_path: str | None = None) -> DeliveryError:
+    metadata = STAGE_METADATA[stage_name]
+    input_path = stage_input_path(project_root, stage_name)
+    details = {
+        "stage": stage_name,
+        "required_skill": metadata["required_skill"],
+        "project": str(Path(project_root).expanduser().resolve()),
+        "expected_input_path": str(input_path),
+        "expected_output_files": [str(Path(project_root).expanduser().resolve() / value) for value in metadata["expected_outputs"]],
+        "import_command": stage_import_command(project_root, stage_name, input_path),
+    }
+    if requirements_path:
+        details["requirements_path"] = str(Path(requirements_path).expanduser().resolve())
+    return DeliveryError(
+        code=str(metadata["missing_code"]),
+        message=f"required stage artifacts are missing; run the {metadata['required_skill']} stage skill first",
+        exit_code=2,
+        details=details,
+        suggested_action=f"Use the {metadata['required_skill']} stage skill to create {input_path.name}, then import it with: {details['import_command']}",
+    )
+
+
+def _shape_error(stage_name: str, input_path: Path, message: str, *, details: dict[str, Any] | None = None) -> DeliveryError:
+    payload_details = {"stage": stage_name, "input_path": str(input_path)}
+    if details:
+        payload_details.update(details)
+    return DeliveryError(
+        code="input_invalid_shape",
+        message=message,
+        exit_code=2,
+        details=payload_details,
+        suggested_action=f"Ask the stage skill to repair the JSON for {stage_name} and rerun: {stage_import_command(input_path.parents[2], stage_name, input_path)}",
+    )
+
+
+def load_stage_payload(
+    project_root: Path | str,
+    stage_name: str,
+    input_value: str | None,
+    *,
+    expected_type: type[dict] | type[list],
+    required_fields: list[str] | None = None,
+) -> tuple[dict[str, Any] | list[Any], Path]:
+    input_path = Path(input_value).expanduser().resolve() if input_value else stage_input_path(project_root, stage_name)
+    if not input_path.exists():
+        raise DeliveryError(
+            code="input_missing",
+            message=f"stage input payload does not exist: {input_path}",
+            exit_code=2,
+            details={
+                "stage": stage_name,
+                "input_path": str(input_path),
+                "import_command": stage_import_command(project_root, stage_name, input_path),
+            },
+            suggested_action="Have the stage skill write the stage result JSON to the expected path, then rerun the same stage import command",
+        )
+    try:
+        payload = json.loads(input_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise DeliveryError(
+            code="input_invalid_json",
+            message=f"stage input payload is not valid JSON: {input_path}",
+            exit_code=2,
+            details={"stage": stage_name, "input_path": str(input_path), "error": str(exc)},
+            suggested_action="Ask the stage skill to rewrite the file as raw JSON without prose, markdown fences, or trailing commentary",
+        ) from exc
+    if expected_type is dict and not isinstance(payload, dict):
+        raise _shape_error(stage_name, input_path, f"stage input payload must be a JSON object: {input_path}", details={"expected": "object"})
+    if expected_type is list and not isinstance(payload, list):
+        raise _shape_error(stage_name, input_path, f"stage input payload must be a JSON array: {input_path}", details={"expected": "array"})
+    if required_fields and isinstance(payload, dict):
+        missing = [field for field in required_fields if field not in payload]
+        if missing:
+            raise DeliveryError(
+                code="input_missing_fields",
+                message=f"stage input payload is missing required fields: {', '.join(missing)}",
+                exit_code=2,
+                details={"stage": stage_name, "input_path": str(input_path), "missing_fields": missing},
+                suggested_action="Ask the stage skill to regenerate the stage JSON with all required top-level fields present",
+            )
+    return payload, input_path
+
+
+def import_spec_review(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
+    requirements = payload.get("requirements")
+    acceptance_scenarios = payload.get("acceptance_scenarios")
+    clarifications = payload.get("clarifications") if isinstance(payload.get("clarifications"), list) else []
+    source_requirements_path = str(payload.get("source_requirements_path") or "").strip()
+    if not isinstance(requirements, list) or not isinstance(acceptance_scenarios, list):
+        raise _shape_error("spec-review", input_path, "spec-review payload must contain requirements[] and acceptance_scenarios[] arrays")
+    project_root = Path(project_root).expanduser().resolve()
+    _persist_stage_input(project_root, "spec-review", payload)
+    docs_dir = project_root / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    if source_requirements_path:
+        archive_requirements_source(project_root, source_requirements_path)
+    requirements_payload = {
+        "requirements": requirements,
+        "acceptance_scenarios": acceptance_scenarios,
+    }
+    (docs_dir / "requirements.json").write_text(json.dumps(requirements_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    save_project_dependency_hints(project_root, payload.get("technology_hints"))
+    blocking = [
+        item
+        for item in clarifications
+        if isinstance(item, dict) and str(item.get("severity") or "").strip().upper() == "C1"
+    ]
+    clarification_path = docs_dir / "clarification-needed.md"
+    if clarifications:
+        lines = [f"blocking_count: {len(blocking)}", "# Clarification Needed", ""]
+        for item in clarifications:
+            if not isinstance(item, dict):
+                continue
+            severity = str(item.get("severity") or "C2").strip()
+            question = str(item.get("question") or "").strip()
+            rationale = str(item.get("rationale") or "").strip()
+            affected = ", ".join(str(value).strip() for value in item.get("affected_requirement_ids", []) if str(value).strip()) or "none"
+            lines.append(f"## {severity} - {question}")
+            lines.append("")
+            if rationale:
+                lines.append(rationale)
+                lines.append("")
+            lines.append(f"Affected requirements: {affected}")
+            lines.append("")
+        clarification_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    elif clarification_path.exists():
+        clarification_path.unlink()
+    return 2 if blocking else 0
+
+
+def import_arch_design(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
+    if not isinstance(payload.get("architecture_md"), str) or not isinstance(payload.get("shared_components_md"), str):
+        raise _shape_error("arch-design", input_path, "arch-design payload must contain string fields architecture_md and shared_components_md")
+    if not isinstance(payload.get("ui_required"), bool):
+        raise _shape_error("arch-design", input_path, "arch-design payload field ui_required must be a boolean")
+    _validate_architecture_markdown(input_path, str(payload.get("architecture_md") or ""))
+    project_root = Path(project_root).expanduser().resolve()
+    _persist_stage_input(project_root, "arch-design", payload)
+    docs_dir = project_root / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "architecture.md").write_text(str(payload.get("architecture_md") or ""), encoding="utf-8")
+    (docs_dir / "shared-components.md").write_text(str(payload.get("shared_components_md") or ""), encoding="utf-8")
+
+    def _normalize_arch_doc_path(raw_value: str, *, target: str) -> str:
+        raw_path = str(raw_value or "").strip().lstrip("/")
+        if raw_path.startswith("docs/"):
+            raw_path = raw_path[len("docs/") :]
+        parts = Path(raw_path).parts
+        filename = Path(raw_path).name
+        if target == "module":
+            return f"modules/{filename}"
+        return f"adr/{filename}"
+
+    for row in payload.get("modules", []) or []:
+        if not isinstance(row, dict):
+            continue
+        raw_path = _normalize_arch_doc_path(str(row.get("path") or ""), target="module")
+        path = docs_dir / raw_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(row.get("content") or ""), encoding="utf-8")
+    for row in payload.get("adrs", []) or []:
+        if not isinstance(row, dict):
+            continue
+        raw_path = _normalize_arch_doc_path(str(row.get("path") or ""), target="adr")
+        path = docs_dir / raw_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(row.get("content") or ""), encoding="utf-8")
+    save_architecture_meta(project_root, {"schema_version": "1", "ui_required": bool(payload.get("ui_required"))})
+    return 0
+
+
+def import_ui_design(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
+    required = ["template_selection_md", "design_system_md", "page_archetypes_md", "states_md"]
+    if any(not isinstance(payload.get(field), str) for field in required):
+        raise _shape_error("ui-design", input_path, "ui-design payload must contain string markdown fields for template_selection_md, design_system_md, page_archetypes_md, and states_md")
+    project_root = Path(project_root).expanduser().resolve()
+    _persist_stage_input(project_root, "ui-design", payload)
+    ui_dir = project_root / "docs" / "ui"
+    ui_dir.mkdir(parents=True, exist_ok=True)
+    (ui_dir / "template-selection.md").write_text(str(payload.get("template_selection_md") or ""), encoding="utf-8")
+    (ui_dir / "design-system.md").write_text(str(payload.get("design_system_md") or ""), encoding="utf-8")
+    (ui_dir / "page-archetypes.md").write_text(str(payload.get("page_archetypes_md") or ""), encoding="utf-8")
+    (ui_dir / "states.md").write_text(str(payload.get("states_md") or ""), encoding="utf-8")
+    return 0
+
+
+def import_context_sync(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
+    if not isinstance(payload.get("code_map_md"), str):
+        raise _shape_error("project-context-sync", input_path, "context-sync payload must contain string field code_map_md")
+    if not isinstance(payload.get("test_plan"), dict):
+        raise _shape_error("project-context-sync", input_path, "context-sync payload must contain a test_plan object")
+    project_root = Path(project_root).expanduser().resolve()
+    _persist_stage_input(project_root, "project-context-sync", payload)
+    write_project_structure_snapshot(project_root)
+    runtime = load_project_runtime(project_root) or "claude"
+    context_file = root_context_filename(runtime)
+    context_key = "claude_md" if context_file == "CLAUDE.md" else "agents_md"
+    context_text = payload.get(context_key)
+    if not isinstance(context_text, str):
+        raise _shape_error("project-context-sync", input_path, f"context-sync payload must contain string field {context_key} for runtime {runtime}")
+    merged_context = _merge_runtime_context(runtime, context_text)
+    project_root.joinpath(context_file).write_text(merged_context, encoding="utf-8")
+    project_root.joinpath("CODE_MAP.md").write_text(_build_code_map_markdown(project_root, str(payload.get("code_map_md") or "")), encoding="utf-8")
+    save_test_plan(project_root, payload.get("test_plan") or {"schema_version": "1", "generated_at": utc_now_iso(), "coverage": []})
+    return 0
+
+
+def import_decompose(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
+    project_root = Path(project_root).expanduser().resolve()
+    _persist_stage_input(project_root, "task-decompose", payload)
+    include_shared = (project_root / "docs" / "shared-components.md").exists()
+    items = parse_task_json(json.dumps(payload, ensure_ascii=False))
+    try:
+        work_items_payload = decompose_tasks(project_root, items, include_shared_foundation=include_shared)
+    except ValueError as exc:
+        raise DeliveryError(
+            code="stage_output_invalid",
+            message=str(exc),
+            exit_code=2,
+            details={"stage": "task-decompose", "input_path": str(input_path), "project": str(Path(project_root).expanduser().resolve())},
+            suggested_action="Ask the stage skill to repair the task graph using the validation error and rerun the same import command",
+        ) from exc
+    contract_errors = {
+        task_id: row["errors"]
+        for task_id, row in lint_task_contracts(
+            [Task.from_dict(item) for item in work_items_payload.get("items", []) if isinstance(item, dict)]
+        ).items()
+        if row.get("errors")
+    }
+    if contract_errors:
+        raise DeliveryError(
+            code="stage_output_invalid",
+            message="task-decompose produced one or more invalid task contracts",
+            exit_code=2,
+            details={
+                "stage": "task-decompose",
+                "input_path": str(input_path),
+                "project": str(project_root),
+                "contract_errors": contract_errors,
+            },
+            suggested_action="Ask the stage skill to repair the task graph using the reported contract errors and rerun the same import command",
+        )
+    save_work_items(project_root, work_items_payload)
+    sync_gates(project_root, stage_payload=payload)
+    return 0

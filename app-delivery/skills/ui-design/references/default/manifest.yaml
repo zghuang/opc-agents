@@ -1,0 +1,17 @@
+id: default
+label: Default Product UI
+domains:
+  - generic-web-app
+  - unknown
+  - mixed
+preferred_for:
+  - Projects without a clear product category.
+  - Early prototypes that still need a professional baseline.
+avoid_for:
+  - Pixel-matched corporate systems with strict brand rules.
+  - Highly expressive marketing sites.
+density: medium
+navigation: top-or-sidebar
+tone: neutral
+fallback_priority: 100
+required_screenshots: []

@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+    "useUnknownInCatchVariables": true,
+    "jsx": "react-jsx",
+    "types": ["vite/client", "vitest/globals"],
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}

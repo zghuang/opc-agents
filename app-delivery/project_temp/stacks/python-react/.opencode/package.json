@@ -1,0 +1,8 @@
+{
+  "name": "opc-project-opencode-plugin",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@opencode-ai/plugin": "1.14.24"
+  }
+}

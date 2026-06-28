@@ -1,0 +1,45 @@
+Read the source requirements document below and normalize it to structured JSON.
+
+Return JSON with top-level fields: requirements, acceptance_scenarios, clarifications, source_requirements_path.
+You may also include an optional top-level field: technology_hints.
+
+source_requirements_path:
+- Must be the absolute path of the raw requirements document used for normalization when that path is known.
+- Use null or omit only when the source path is genuinely unavailable.
+
+requirements:
+- Each item must include id, title, summary.
+- Preserve stable REQ- or NFR- style IDs when they already exist.
+- If an item has no explicit ID, create a stable one.
+- Keep summaries concise and implementation-neutral.
+- Do not invent requirements that are not grounded in the source.
+- Preserve contradictions instead of smoothing them over.
+- If the source explicitly mandates technologies, runtimes, frameworks, packages, libraries, infrastructure components, or external contracts, preserve those constraints in the normalized requirements instead of dropping them.
+
+acceptance_scenarios:
+- Each item must include id, title, summary, source_requirement_ids.
+- Preserve stable AS- style IDs when they already exist.
+- Every scenario must point back to one or more requirement IDs.
+- Create scenarios not only from explicit headings like "user story" or "use case", but also from any clearly implied multi-step journey, approval flow, operator workflow, fallback/recovery path, or end-to-end process that later design, decomposition, and QA must preserve.
+
+clarifications:
+- Use this array when the source contains contradictions, missing decisions, ambiguous ownership, vague acceptance rules, or architecture-blocking uncertainty.
+- Each item must include severity, question, rationale, affected_requirement_ids, blocking.
+- Severity should typically be C1, C2, or C3.
+- Mark blocking=true only when delivery should stop for clarification before architecture or implementation continues.
+
+technology_hints:
+- Optional array for explicit technology choices that later planning and implementation must preserve.
+- Use this only when the source explicitly names a runtime, framework, package family, component library, SDK, protocol stack, or infrastructure choice that should guide dependency manifests and implementation direction.
+- Each item should include: name, ecosystem, reason, evidence.
+- `ecosystem` should usually be `backend`, `frontend`, `infra`, or `project`.
+- Do not guess package names from memory when the source only names a product or framework family; preserve the named technology choice and let later implementation verify the exact package coordinates.
+
+Judgment rules:
+- If the source has contradictions or unclear points, surface them in clarifications rather than guessing.
+- If the ambiguity can materially change architecture, scope, security, data model, or acceptance, make it blocking.
+- If the source is clear enough to proceed, clarifications may be an empty array.
+- If a prior clarification-needed file or clarification-answers file exists for this project, treat those answers as part of the available source evidence and fold defensible resolved answers back into the normalized requirement output instead of preserving an already-resolved C1 blocker.
+
+Source document:
+{{source_document}}
