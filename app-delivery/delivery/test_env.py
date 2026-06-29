@@ -104,11 +104,29 @@ def frontend_e2e_env_prefix(project_root: Path | str) -> str:
 def classify_test_environment(task: dict[str, Any], spec: str) -> str:
     task_id = str(task.get("id") or "").strip()
     normalized = str(spec or "").strip().casefold()
-    if task_id == "T001":
-        return "shared_infra"
     if any(marker in normalized for marker in BROWSER_E2E_MARKERS):
         return "browser_e2e"
+    if task_id == "T001":
+        return "shared_infra"
     return "none"
+
+
+def project_has_browser_e2e(project_root: Path | str) -> bool:
+    project_dir = Path(project_root).expanduser().resolve()
+    frontend_root = project_dir / "frontend"
+    if not frontend_root.exists():
+        return False
+    if any(frontend_root.glob("e2e/**/*.spec.*")):
+        return True
+    package_json = frontend_root / "package.json"
+    if not package_json.exists():
+        return False
+    try:
+        payload = json.loads(package_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    scripts = payload.get("scripts") if isinstance(payload.get("scripts"), dict) else {}
+    return any(str(name).strip() in {"e2e", "test:e2e", "playwright"} for name in scripts)
 
 
 def _package_manager(frontend_root: Path) -> str:
@@ -357,3 +375,17 @@ def ensure_task_test_environment(project_root: Path | str, task: dict[str, Any],
     state["profiles"][profile] = {"ready": True, "last_ready_at": utc_now_iso(), "task_id": str(task.get("id") or "").strip() or None}
     save_env_state(project_dir, state)
     return EnvPrepareResult(True, profile, "task test environment is ready", actions, details)
+
+
+def warm_browser_e2e_environment(project_root: Path | str, *, reason: str = "") -> EnvPrepareResult:
+    project_dir = Path(project_root).expanduser().resolve()
+    if not project_has_browser_e2e(project_dir):
+        state = load_env_state(project_dir)
+        state["profiles"]["browser_e2e"] = {"ready": True, "last_ready_at": utc_now_iso(), "reason": reason or "no browser e2e declared"}
+        save_env_state(project_dir, state)
+        return EnvPrepareResult(True, "browser_e2e", "no browser e2e tests declared", [], {})
+    return ensure_task_test_environment(
+        project_dir,
+        {"id": "T001", "output_tests": ["frontend/e2e/__environment__.spec.ts"]},
+        "frontend/e2e/__environment__.spec.ts",
+    )

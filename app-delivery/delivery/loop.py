@@ -4,6 +4,7 @@ import json
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .environment_repair import ENVIRONMENT_REPAIR_TASK_PREFIX, build_environment_repair_plan, has_environment_failures
 from .errors import DeliveryError
 from .gates import refresh_gates
 from .loop_gitops import ensure_git_repo, git_commit_task, git_commit_timestamp, git_head_sha, git_latest_task_commit, git_stage_task_snapshot, park_task_exception_changes, repair_invalid_verified_tasks, review_artifact_status, task_scoped_changed_paths
@@ -13,6 +14,7 @@ from .loop_review import write_code_review_request, write_final_review_request
 from .runtime_config import resolve_runtime
 from .scaffold import scaffold_project
 from .session import RuntimeErrorResponse, RuntimeSession, current_session, execute_in_session, retire_session, save_current_session, start_task_session, touch_session
+from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID
 from .state import (
     clear_task_runtime_failure,
     ensure_runtime_dirs,
@@ -40,7 +42,7 @@ from .task import (
     reset_task,
     save_tasks,
 )
-from .test_env import warm_shared_test_environment
+from .test_env import project_has_browser_e2e, warm_browser_e2e_environment, warm_shared_test_environment
 from .loop_task_prompt import build_fix_prompt, build_scope_fix_prompt, build_stalled_recovery_prompt, build_task_prompt
 from .verify import infer_final_repair_candidates, is_path_test_spec, run_full_suite, run_task_tests, test_results_to_summary, write_final_repair_report
 
@@ -88,6 +90,13 @@ def _dedupe_task_ids(values: list[str]) -> list[str]:
         seen.add(normalized)
         ordered.append(normalized)
     return ordered
+
+
+def _format_missing_test_types(missing_test_types: list[tuple[str, str]]) -> str:
+    values = [f"{requirement_id}:{test_type}" for requirement_id, test_type in missing_test_types[:5]]
+    if len(missing_test_types) > 5:
+        values.append("...")
+    return ", ".join(values) or "none"
 
 
 def _collapse_repair_scope_paths(paths: list[str], *, limit: int = 20) -> list[str]:
@@ -263,29 +272,42 @@ def _ensure_final_repair_task(
 def _invalidate_prefinal_audit_after_repair(tasks: list[Task], repair_task_id: str | None) -> list[Task]:
     if not repair_task_id:
         return tasks
-    audit = next((task for task in tasks if task.id == PREFINAL_AUDIT_TASK_ID), None)
-    if audit is None:
+    audit_task_ids = [task_id for task_id in (FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID) if any(task.id == task_id for task in tasks)]
+    if not audit_task_ids:
         return tasks
-    dependencies = [
-        task.id
+    dependencies_by_audit_id: dict[str, list[str]] = {}
+    if FRONTEND_API_AUDIT_TASK_ID in audit_task_ids:
+        dependencies_by_audit_id[FRONTEND_API_AUDIT_TASK_ID] = [
+            task.id
+            for task in tasks
+            if task.id not in {FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
+        ]
+    if PREFINAL_AUDIT_TASK_ID in audit_task_ids:
+        dependencies_by_audit_id[PREFINAL_AUDIT_TASK_ID] = [
+            task.id
+            for task in tasks
+            if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
+        ]
+    for dependencies in dependencies_by_audit_id.values():
+        if repair_task_id not in dependencies:
+            dependencies.append(repair_task_id)
+    reset_required_by_audit_id = {
+        task.id: task.status == "verified" or repair_task_id not in task.dependencies
         for task in tasks
-        if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
-    ]
-    if repair_task_id not in dependencies:
-        dependencies.append(repair_task_id)
-    reset_required = audit.status == "verified" or repair_task_id not in audit.dependencies
-    if not reset_required:
+        if task.id in audit_task_ids
+    }
+    if not any(reset_required_by_audit_id.values()):
         return tasks
     updated: list[Task] = []
     for task in tasks:
-        if task.id != PREFINAL_AUDIT_TASK_ID:
+        if task.id not in audit_task_ids or not reset_required_by_audit_id.get(task.id):
             updated.append(task)
             continue
         data = task.to_dict()
         data.update(
             {
                 "status": "pending",
-                "dependencies": dependencies,
+                "dependencies": dependencies_by_audit_id[task.id],
                 "git_commit": None,
                 "status_session_id": None,
                 "started_at": None,
@@ -294,7 +316,11 @@ def _invalidate_prefinal_audit_after_repair(tasks: list[Task], repair_task_id: s
                 "review_artifact": None,
                 "reviewed_at": None,
                 "verified_at": None,
-                "blocked_reason": "system audit must rerun after final verification repair",
+                "blocked_reason": (
+                    "frontend/API audit must rerun after final verification repair"
+                    if task.id == FRONTEND_API_AUDIT_TASK_ID
+                    else "system audit must rerun after final verification repair"
+                ),
                 "attempts": 0,
             }
         )
@@ -350,7 +376,6 @@ def recover(project_root: Path | str) -> list[Task]:
         )
         reconciled.append(reconciled_task)
     tasks = reconciled
-    head_commit = git_head_sha(project_root)
     active_session = current_session(project_root)
     active_session_id = str(active_session.id or "").strip() if active_session is not None else ""
     active_session_task_id = str(active_session.current_task_id or "").strip() if active_session is not None else ""
@@ -380,11 +405,6 @@ def recover(project_root: Path | str) -> list[Task]:
             ]
         )
     )
-    if not head_commit:
-        scaffold_task = next((task for task in tasks if task.id == SCAFFOLD_TASK_ID and task.status == "verified"), None)
-        if scaffold_task is not None:
-            reset_ids.insert(0, scaffold_task.id)
-
     updated = tasks
     if reset_ids:
         seen: set[str] = set()
@@ -615,6 +635,26 @@ class DeliveryLoop:
                     save_tasks(self.project_root, tasks)
                     _release_session_after_exception(self.project_root, session)
                     return False, "exception"
+                if project_has_browser_e2e(self.project_root):
+                    browser_env = warm_browser_e2e_environment(self.project_root, reason="shared foundation")
+                    if not browser_env.ready:
+                        tasks = all_tasks(self.project_root)
+                        exception_report = _write_exception_report(self.project_root, task, browser_env.summary)
+                        tasks = mark_task(
+                            tasks,
+                            task.id,
+                            "exception",
+                            status_session_id=task.status_session_id or str(session.id or "").strip() or None,
+                            completed_at=None,
+                            verified_at=None,
+                            blocked_reason=browser_env.summary,
+                            review_artifact=exception_report,
+                            reviewed_at=utc_now_iso(),
+                            attempts=max(int(task.attempts or 0), 1),
+                        )
+                        save_tasks(self.project_root, tasks)
+                        _release_session_after_exception(self.project_root, session)
+                        return False, "exception"
             runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
             baseline_changed_paths_value = runtime_state.get("initial_changed_paths")
             if isinstance(baseline_changed_paths_value, list):
@@ -830,21 +870,40 @@ class DeliveryLoop:
                     break
         ready_for_final_review = all(result.passed for result in results) and requirement_coverage["all_covered"] and not missing_test_types and not non_verified_gates
         final_pass = ready_for_final_review and str(final_review_status or "").strip().casefold() == "pass"
-        repair_candidates = _dedupe_task_ids(
-            [
-                task_id
-                for gate in non_verified_gates
-                for task_id in gate.get("repair_candidates", [])
-            ]
-            + infer_final_repair_candidates(self.project_root, results, missing_test_types)
-        )
+        environment_blocked = has_environment_failures(results)
+        if environment_blocked:
+            repair_candidates: list[str] = []
+        else:
+            repair_candidates = _dedupe_task_ids(
+                [
+                    task_id
+                    for gate in non_verified_gates
+                    for task_id in gate.get("repair_candidates", [])
+                ]
+                + infer_final_repair_candidates(self.project_root, results, missing_test_types)
+            )
         current_repair_task_id = str(normalize_task_runtime_state(load_task_runtime_state(self.project_root, FINAL_VERIFY_TASK_ID)).get("repair_task_id") or "").strip()
         current_repair_task = next((task for task in tasks if task.id == current_repair_task_id), None) if current_repair_task_id else None
-        repair_path_exhausted = current_repair_task is not None and current_repair_task.status in {"verified", "exception"}
-        repair_required = bool(repair_candidates) and not repair_path_exhausted
+        current_repair_is_environment = current_repair_task is not None and current_repair_task.title.startswith(ENVIRONMENT_REPAIR_TASK_PREFIX)
+        repair_path_exhausted = current_repair_task is not None and current_repair_task.status in {"verified", "exception"} and (
+            current_repair_is_environment if environment_blocked else True
+        )
+        repair_required = (environment_blocked or bool(repair_candidates)) and not repair_path_exhausted
         repair_task_id = None
-        if repair_candidates and current_repair_task is not None and current_repair_task.status in {"verified", "exception"}:
+        if environment_blocked and current_repair_is_environment and current_repair_task is not None and current_repair_task.status in {"verified", "exception"}:
             repair_task_id = current_repair_task.id
+        elif repair_candidates and current_repair_task is not None and current_repair_task.status in {"verified", "exception"}:
+            repair_task_id = current_repair_task.id
+        elif repair_required and environment_blocked:
+            environment_plan = build_environment_repair_plan(
+                self.project_root,
+                tasks,
+                results=results,
+            )
+            tasks = environment_plan.tasks
+            repair_task_id = environment_plan.repair_task_id
+            repair_candidates = environment_plan.repair_candidates
+            tasks = _invalidate_prefinal_audit_after_repair(tasks, repair_task_id)
         elif repair_required:
             tasks, repair_task_id = _ensure_final_repair_task(
                 self.project_root,
@@ -879,7 +938,7 @@ class DeliveryLoop:
                     }
                     for gate in non_verified_gates
                 ],
-                "final_verify_status": "pass" if final_pass else ("review_pending" if ready_for_final_review else ("repair_required" if repair_required else "blocked")),
+                "final_verify_status": "pass" if final_pass else ("review_pending" if ready_for_final_review else ("environment_blocked" if environment_blocked and repair_required else ("repair_required" if repair_required else "blocked"))),
             },
         )
         if any(task.id == FINAL_VERIFY_TASK_ID for task in tasks):
@@ -921,9 +980,13 @@ class DeliveryLoop:
                     review_artifact=None,
                     reviewed_at=None,
                     blocked_reason=(
-                        f"final verification created repair task {repair_task_id}; preserve verified tasks and repair through that bundle"
-                        if repair_task_id
-                        else "final verification found repairable issues; repair bundle required"
+                        f"final verification created environment repair task {repair_task_id}; repair validation environment readiness first"
+                        if environment_blocked and repair_task_id
+                        else (
+                            f"final verification created repair task {repair_task_id}; preserve verified tasks and repair through that bundle"
+                            if repair_task_id
+                            else "final verification found repairable issues; repair bundle required"
+                        )
                     ),
                 )
             else:
@@ -941,14 +1004,18 @@ class DeliveryLoop:
                         else (
                             f"repair task {repair_task_id} entered exception before final verification could pass"
                             if repair_task_id and current_repair_task is not None and current_repair_task.status == "exception"
-                            else "final verification requirements are not yet satisfied"
+                            else (
+                                f"final verification has missing test coverage without a strongly attributed repair owner: {_format_missing_test_types(missing_test_types)}"
+                                if missing_test_types
+                                else "final verification requirements are not yet satisfied"
+                            )
                         )
                     ),
                 )
             save_tasks(self.project_root, tasks)
         return {
             "passed": final_pass,
-            "status": "pass" if final_pass else ("review_pending" if ready_for_final_review else ("repair_required" if repair_required else "blocked")),
+            "status": "pass" if final_pass else ("review_pending" if ready_for_final_review else ("environment_blocked" if environment_blocked and repair_required else ("repair_required" if repair_required else "blocked"))),
             "summary": summary,
             "requirement_coverage": requirement_coverage,
             "missing_test_types": missing_test_types,

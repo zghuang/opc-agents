@@ -30,7 +30,6 @@ ALWAYS_ALLOWED_FRAMEWORK_PATHS = {
     "docs/work-items.md",
     "docs/project-summary.json",
     "docs/project-summary.md",
-    "CODE_MAP.md",
     "CLAUDE.md",
     "AGENTS.md",
     "docs/reviews/final-repair-report.md",
@@ -45,7 +44,6 @@ T000_ONLY_FRAMEWORK_PATHS = {
     "docs/shared-components.md",
     "docs/architecture-meta.json",
     "docs/test-plan.json",
-    "CODE_MAP.md",
     "CLAUDE.md",
     "AGENTS.md",
 }
@@ -182,15 +180,13 @@ def verified_task_issue(project_root: Path | str, task: Task) -> str | None:
 
 
 def repair_invalid_verified_tasks(project_root: Path | str, tasks: list[Task]) -> tuple[list[Task], dict[str, str]]:
-    repaired = tasks
     issues: dict[str, str] = {}
     for task in tasks:
         issue = verified_task_issue(project_root, task)
         if not issue:
             continue
-        repaired = reset_task(repaired, task.id, blocked_reason=f"verification evidence missing: {issue}")
         issues[task.id] = issue
-    return repaired, issues
+    return tasks, issues
 
 
 def ensure_git_repo(project_root: Path | str) -> None:

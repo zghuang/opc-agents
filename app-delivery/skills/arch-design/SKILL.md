@@ -11,7 +11,7 @@ Inputs:
 Procedure:
 1. Ensure `docs/requirements.json` exists.
 2. Load the stage contract from [references/stage-contract.md](./references/stage-contract.md), replace placeholders with the actual project inputs, and produce a JSON object containing architecture markdown, shared components, ADR/module docs, and `ui_required`.
-3. `architecture_md` must always include a dedicated `Module Architecture` section that shows the intended repository/module tree in a fenced code block and explains the responsibility of the major directories or modules. Do not rely on `docs/modules/*` alone for this; the top-level `docs/architecture.md` must contain the codebase structure summary directly.
+3. `architecture_md` must always include a dedicated `Module Architecture` section that shows the intended repository/module tree in a fenced code block and explains the responsibility of the major directories or modules. Do not rely on `docs/modules/*` alone for this; the top-level `docs/architecture.md` must contain the codebase structure summary directly. Treat this fenced tree as the T000 scaffold skeleton contract: the deterministic scaffold step will create the listed directories and lightweight placeholder files before implementation tasks run.
 4. Write that JSON to `${project}/.app-delivery-runtime/stage-inputs/arch-design.json`.
 5. Import the stage result through the harness:
 ```bash

@@ -36,6 +36,7 @@ from .state import (
     read_lock_metadata,
     render_work_items_markdown,
     save_task_runtime_state,
+    task_runtime_state_path,
     utc_now_iso,
 )
 from .task import all_tasks, reset_task, save_tasks
@@ -401,6 +402,12 @@ def _run_fix_once(
         current = next((task for task in tasks if task.id == task_id), None)
         updated = reset_task(tasks, task_id)
         save_tasks(resolved, updated)
+        runtime_state_path = task_runtime_state_path(resolved, task_id)
+        if runtime_state_path.exists():
+            runtime_state_path.unlink()
+        review_artifact_path = resolved / "docs" / "reviews" / f"code-review-{task_id}.md"
+        if review_artifact_path.exists():
+            review_artifact_path.unlink()
         if current and current.status_session_id:
             active_session = current_session(resolved)
             if active_session and active_session.id == current.status_session_id:
@@ -646,7 +653,7 @@ def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path
             "project-context-sync",
             input_path_value,
             expected_type=dict,
-            required_fields=["code_map_md", "test_plan"],
+            required_fields=["test_plan"],
         )
         assert isinstance(payload, dict)
         exit_code = import_context_sync(project_root, payload, loaded_input_path)
@@ -864,7 +871,7 @@ def cmd_ui_design(args: argparse.Namespace) -> int:
 def cmd_context_sync(args: argparse.Namespace) -> int:
     project_root = resolve_project_root(args.project)
     with _project_execution_guard(project_root, already_locked=_command_locked(args)):
-        payload, input_path = load_stage_payload(project_root, "project-context-sync", args.input, expected_type=dict, required_fields=["code_map_md", "test_plan"])
+        payload, input_path = load_stage_payload(project_root, "project-context-sync", args.input, expected_type=dict, required_fields=["test_plan"])
         assert isinstance(payload, dict)
         return import_context_sync(project_root, payload, input_path)
 

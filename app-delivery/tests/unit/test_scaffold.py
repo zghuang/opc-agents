@@ -136,13 +136,16 @@ def test_scaffold_project_creates_directory_skeleton_from_module_architecture(tm
     (template_root / "backend").mkdir(parents=True)
     (project_root / "docs").mkdir(parents=True, exist_ok=True)
     (project_root / "docs" / "architecture.md").write_text(
-        "# Architecture\n\n## 3. Module Architecture\n\n```text\notif-control-tower/\n├── backend/\n│   ├── src/\n│   │   ├── agents/\n│   │   └── shared/\n├── frontend/\n│   └── src/\n│       └── features/\n└── docs/\n    └── modules/\n```\n",
+        "# Architecture\n\n## 3. Module Architecture\n\n```text\notif-control-tower/\n├── backend/\n│   ├── src/\n│   │   ├── agents/\n│   │   │   └── __init__.py\n│   │   └── shared/\n├── frontend/\n│   └── src/\n│       └── features/\n│           └── .gitkeep\n└── docs/\n    └── modules/\n        └── .gitkeep\n```\n",
         encoding="utf-8",
     )
 
     scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
 
     assert (project_root / "backend" / "src" / "agents").is_dir()
+    assert (project_root / "backend" / "src" / "agents" / "__init__.py").is_file()
     assert (project_root / "backend" / "src" / "shared").is_dir()
     assert (project_root / "frontend" / "src" / "features").is_dir()
+    assert (project_root / "frontend" / "src" / "features" / ".gitkeep").is_file()
     assert (project_root / "docs" / "modules").is_dir()
+    assert (project_root / "docs" / "modules" / ".gitkeep").is_file()

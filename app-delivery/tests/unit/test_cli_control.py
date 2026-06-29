@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from delivery.builtin_tasks import FRONTEND_API_AUDIT_OUTPUT_PATHS, FRONTEND_API_AUDIT_OUTPUT_TESTS, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_OUTPUT_TESTS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID
 from delivery.errors import DeliveryError
 from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
 from delivery.loop_review import code_review_request_path
@@ -16,8 +17,8 @@ from delivery.loop import status as loop_status
 from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt
 from delivery.stage_harness import stage_import_command, stage_input_path
-from delivery.state import load_gates, load_session_state, load_task_runtime_state, save_architecture_meta, save_session_state, save_task_runtime_state, save_test_plan, save_work_items
-from delivery.task import PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_OUTPUT_TESTS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID, Task
+from delivery.state import load_gates, load_session_state, load_task_runtime_state, save_architecture_meta, save_session_state, save_task_runtime_state, save_test_plan, save_test_results, save_work_items
+from delivery.task import Task
 
 
 cli = import_module("delivery.__main__")
@@ -62,6 +63,62 @@ def test_build_task_prompt_explains_project_relative_test_paths(tmp_path: Path) 
     assert "frontend/package.json" in prompt
 
 
+def test_task_and_review_prompts_inline_relevant_technology_constraints(tmp_path: Path) -> None:
+    from delivery.loop_review import build_code_review_request
+    from delivery.loop_task_prompt import build_task_prompt
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(
+        json.dumps(
+            {
+                "dependency_hints": [
+                    {
+                        "ecosystem": "backend",
+                        "name": "LangGraph",
+                        "source": "requirements-analysis",
+                        "reason": "Agent orchestration framework with checkpointing and human-in-the-loop resume.",
+                        "evidence": "ADR-001",
+                    },
+                    {
+                        "ecosystem": "backend",
+                        "name": "PostgreSQL",
+                        "source": "requirements-analysis",
+                        "reason": "Primary database.",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    task = Task.from_dict(
+        {
+            "id": "T015",
+            "title": "Orchestrator Agent Graph: LangGraph State Machine",
+            "status": "pending",
+            "requirements": ["REQ-017"],
+            "acceptance_scenarios": [],
+            "dependencies": ["T013"],
+            "output_tests": ["backend/tests/agents/test_orchestrator_graph.py"],
+            "output_paths": ["backend/src/agents/graph.py", "backend/src/agents/orchestrator.py"],
+        }
+    )
+
+    task_prompt = build_task_prompt(tmp_path, task)
+    review_prompt = build_code_review_request(tmp_path, task)
+
+    assert "Project technology constraints for this task:" in task_prompt
+    assert "LangGraph (backend): Agent orchestration framework" in task_prompt
+    assert "ADR-001" in task_prompt
+    assert "do not replace them with custom implementations silently" in task_prompt
+    assert "PostgreSQL" not in task_prompt
+    assert "Project technology constraints to verify:" in review_prompt
+    assert "LangGraph (backend): Agent orchestration framework" in review_prompt
+    assert "dependency entries, imports/usages, adapters, configuration" in review_prompt
+    assert "status=changes_requested" in review_prompt
+    assert "PostgreSQL" not in review_prompt
+
+
 def test_build_prefinal_audit_prompt_is_self_contained(tmp_path: Path) -> None:
     from delivery.loop_task_prompt import build_task_prompt
 
@@ -90,6 +147,33 @@ def test_build_prefinal_audit_prompt_is_self_contained(tmp_path: Path) -> None:
     assert "T-FINAL" not in prompt
     assert "Run browser/end-to-end checks only" in prompt
     assert "Do not modify the app-delivery framework repository" not in prompt
+
+
+def test_build_frontend_api_audit_prompt_requires_real_backend_e2e_assessment(tmp_path: Path) -> None:
+    from delivery.loop_task_prompt import build_task_prompt
+
+    task = Task(
+        id=FRONTEND_API_AUDIT_TASK_ID,
+        title="Frontend API integration audit",
+        status="pending",
+        requirements=[],
+        acceptance_scenarios=[],
+        dependencies=["T002"],
+        output_tests=list(FRONTEND_API_AUDIT_OUTPUT_TESTS),
+        output_paths=list(FRONTEND_API_AUDIT_OUTPUT_PATHS),
+        task_kind="audit",
+    )
+
+    prompt = build_task_prompt(tmp_path, task)
+
+    assert FRONTEND_API_AUDIT_REPORT_PATH in prompt
+    assert "page.route" in prompt
+    assert "route.fulfill" in prompt
+    assert "real backend E2E" in prompt
+    assert "## API Surface Mapping" in prompt
+    assert "## Mocked Browser Test Assessment" in prompt
+    assert "## Real Backend E2E Readiness" in prompt
+    assert "test data" in prompt.casefold()
 
 
 def test_stage_input_path_uses_runtime_stage_inputs_dir(tmp_path: Path) -> None:
@@ -359,7 +443,8 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
                 "summary": "Looks good.",
                 "findings": [],
                 "requirement_assessment": [
-                    {"id": "REQ-001", "status": "pass", "notes": "The declared feature behavior is complete."}
+                    {"id": "REQ-001", "status": "pass", "notes": "The declared feature behavior is complete."},
+                    {"id": "REQ-002", "status": "pass", "notes": "The related requirement behavior is complete."},
                 ],
             }
         ),
@@ -376,6 +461,203 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
     assert payload["items"][0]["git_commit"] == "abc123"
     assert payload["items"][0]["review_status"] == "pass"
     assert payload["items"][0]["review_artifact"] == "docs/reviews/code-review-T002.md"
+
+
+def test_cmd_code_review_rejects_pass_when_latest_task_tests_failed(tmp_path: Path, monkeypatch) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T000"],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/src/feature.py"],
+                    "status_session_id": "ses-1",
+                    "completed_at": "2026-06-24T01:00:00Z",
+                    "attempts": 1,
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "generated_at": "2026-06-24T01:01:00Z",
+            "results": [
+                {
+                    "task_id": "T002",
+                    "timestamp": "2026-06-24T01:01:00Z",
+                    "test_files": ["backend/tests/test_feature.py"],
+                    "test_types": ["unit"],
+                    "requirement_ids": ["REQ-001"],
+                    "passed": False,
+                    "passed_count": 0,
+                    "failed_count": 1,
+                    "failures": [{"test": "backend/tests/test_feature.py", "message": "assertion failed", "traceback": "..."}],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {},
+        },
+    )
+    input_path = tmp_path / "code-review.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "status": "pass",
+                "summary": "Looks good.",
+                "findings": [],
+                "requirement_assessment": [
+                    {"id": "REQ-001", "status": "pass", "notes": "Looks complete."},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
+
+    assert exc_info.value.code == "review_pass_preconditions_failed"
+    assert "latest task validation failed" in exc_info.value.details["precondition_errors"][0]
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "review_pending"
+    assert not (tmp_path / "docs" / "reviews" / "code-review-T002.md").exists()
+
+
+def test_cmd_code_review_rejects_prefinal_audit_pass_when_report_missing(tmp_path: Path, monkeypatch) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": PREFINAL_AUDIT_TASK_ID,
+                    "title": "Pre-final full-system audit",
+                    "status": "review_pending",
+                    "task_kind": "audit",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T002"],
+                    "output_tests": list(PREFINAL_AUDIT_OUTPUT_TESTS),
+                    "output_paths": list(PREFINAL_AUDIT_OUTPUT_PATHS),
+                    "status_session_id": "ses-audit",
+                    "completed_at": "2026-06-24T01:00:00Z",
+                    "attempts": 1,
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "generated_at": "2026-06-24T01:01:00Z",
+            "results": [
+                {
+                    "task_id": PREFINAL_AUDIT_TASK_ID,
+                    "timestamp": "2026-06-24T01:01:00Z",
+                    "test_files": list(PREFINAL_AUDIT_OUTPUT_TESTS),
+                    "test_types": ["unit"],
+                    "requirement_ids": [],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {},
+        },
+    )
+    input_path = tmp_path / "audit-review.json"
+    input_path.write_text(json.dumps({"status": "pass", "summary": "Audit ready.", "findings": [], "requirement_assessment": [], "acceptance_assessment": []}), encoding="utf-8")
+    monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=PREFINAL_AUDIT_TASK_ID, input=str(input_path)))
+
+    assert exc_info.value.code == "review_pass_preconditions_failed"
+    assert "required audit report is missing" in exc_info.value.details["precondition_errors"][0]
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "review_pending"
+    assert not (tmp_path / "docs" / "reviews" / "code-review-T-SYSTEM-AUDIT.md").exists()
+
+
+def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp_path: Path, monkeypatch) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": FRONTEND_API_AUDIT_TASK_ID,
+                    "title": "Frontend API integration audit",
+                    "status": "review_pending",
+                    "task_kind": "audit",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T002"],
+                    "output_tests": list(FRONTEND_API_AUDIT_OUTPUT_TESTS),
+                    "output_paths": list(FRONTEND_API_AUDIT_OUTPUT_PATHS),
+                    "status_session_id": "ses-frontend-audit",
+                    "completed_at": "2026-06-24T01:00:00Z",
+                    "attempts": 1,
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "generated_at": "2026-06-24T01:01:00Z",
+            "results": [
+                {
+                    "task_id": FRONTEND_API_AUDIT_TASK_ID,
+                    "timestamp": "2026-06-24T01:01:00Z",
+                    "test_files": list(FRONTEND_API_AUDIT_OUTPUT_TESTS),
+                    "test_types": ["unit"],
+                    "requirement_ids": [],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {},
+        },
+    )
+    input_path = tmp_path / "frontend-audit-review.json"
+    input_path.write_text(json.dumps({"status": "pass", "summary": "Audit ready.", "findings": [], "requirement_assessment": [], "acceptance_assessment": []}), encoding="utf-8")
+    monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=FRONTEND_API_AUDIT_TASK_ID, input=str(input_path)))
+
+    assert exc_info.value.code == "review_pass_preconditions_failed"
+    assert "required frontend/API audit report is missing" in exc_info.value.details["precondition_errors"][0]
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "review_pending"
+    assert not (tmp_path / "docs" / "reviews" / f"code-review-{FRONTEND_API_AUDIT_TASK_ID}.md").exists()
 
 
 def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path) -> None:
@@ -430,6 +712,77 @@ def test_final_repair_invalidates_verified_prefinal_audit() -> None:
     assert audit.git_commit is None
     assert audit.review_status is None
     assert audit.blocked_reason == "system audit must rerun after final verification repair"
+
+
+def test_final_verify_creates_environment_repair_for_environment_failures(tmp_path: Path, monkeypatch) -> None:
+    from delivery.loop import DeliveryLoop
+    from delivery.verify import TestFailure, TestResult
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["frontend/e2e/feature.spec.ts"], "output_paths": ["frontend/src/feature.tsx"]},
+                {"id": PREFINAL_AUDIT_TASK_ID, "title": "Pre-final full-system audit", "status": "verified", "task_kind": "audit", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": list(PREFINAL_AUDIT_OUTPUT_TESTS), "output_paths": list(PREFINAL_AUDIT_OUTPUT_PATHS)},
+                {"id": FINAL_VERIFY_TASK_ID, "title": "最终验证", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": [PREFINAL_AUDIT_TASK_ID], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    result = TestResult(
+        task_id="T002",
+        timestamp="2026-06-24T01:00:00Z",
+        test_files=["frontend/e2e/feature.spec.ts"],
+        test_types=["browser", "e2e"],
+        requirement_ids=["REQ-001"],
+        passed=False,
+        passed_count=0,
+        failed_count=1,
+        failures=[TestFailure("frontend/e2e/feature.spec.ts", "test environment not ready (browser_e2e): shared test services did not become healthy", "{}", failure_kind="environment_not_ready")],
+        attempt=1,
+    )
+    monkeypatch.setattr("delivery.loop.run_full_suite", lambda project_root, mode="all": [result])
+    monkeypatch.setattr("delivery.loop.refresh_gates", lambda project_root: {"gates": []})
+    monkeypatch.setattr("delivery.loop.check_requirements_coverage", lambda project_root, requirements_payload: {"total": 1, "covered": 1, "uncovered": [], "all_covered": True})
+    monkeypatch.setattr("delivery.loop.check_test_type_coverage", lambda project_root: [])
+    monkeypatch.setattr("delivery.loop.render_release_evidence", lambda project_root, summary, requirement_coverage, missing_test_types: docs_dir / "release-evidence.md")
+    monkeypatch.setattr("delivery.loop.write_final_repair_report", lambda project_root, results, requirement_coverage, missing_test_types, repair_candidates: "docs/reviews/final-repair-report.md")
+
+    payload = DeliveryLoop(tmp_path, runtime="opencode").final_verify()
+
+    assert payload["status"] == "environment_blocked"
+    items = json.loads((docs_dir / "work-items.json").read_text(encoding="utf-8"))["items"]
+    repair = next(item for item in items if item["title"] == "Validation Environment Repair Bundle")
+    assert payload["repair_candidates"] == [repair["id"]]
+    assert repair["task_kind"] == "repair"
+    assert repair["output_tests"] == ["frontend/e2e/feature.spec.ts"]
+    assert "docker-compose.yml" in repair["output_paths"] or "docs/reviews/final-repair-report.md" in repair["output_paths"]
+    final_task = next(item for item in items if item["id"] == FINAL_VERIFY_TASK_ID)
+    assert final_task["status"] == "blocked"
+    assert "environment repair task" in final_task["blocked_reason"]
+
+
+def test_default_python_react_environment_repair_scope_is_explicit_stack_heuristic(tmp_path: Path) -> None:
+    from delivery.environment_repair import default_python_react_environment_repair_scope_paths
+
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "playwright.config.ts").write_text("export default {}\n", encoding="utf-8")
+    (tmp_path / "backend" / "src" / "core").mkdir(parents=True)
+    (tmp_path / "backend" / ".env").write_text("DATABASE_URL=sqlite://\n", encoding="utf-8")
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+    paths = default_python_react_environment_repair_scope_paths(tmp_path)
+
+    assert "docker-compose.yml" in paths
+    assert "frontend/playwright.config.ts" in paths
+    assert "backend/.env" in paths
 
 
 def test_cmd_verify_rejects_full_verify_when_non_final_tasks_are_incomplete(tmp_path: Path) -> None:
@@ -692,7 +1045,6 @@ def test_cmd_start_reuses_existing_bootstrap(tmp_path: Path, monkeypatch) -> Non
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -753,7 +1105,6 @@ def test_cmd_control_status_routes_blocked_final_verify_to_repair_task(tmp_path:
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -776,6 +1127,7 @@ def test_cmd_control_status_routes_blocked_final_verify_to_repair_task(tmp_path:
         encoding="utf-8",
     )
     monkeypatch.setattr("delivery.control_plane.needs_scaffold", lambda project_root: False)
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
 
     result = cli.cmd_control(
         argparse.Namespace(
@@ -807,7 +1159,6 @@ def test_cmd_control_status_does_not_resume_exception_final_repair_task(tmp_path
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -830,6 +1181,7 @@ def test_cmd_control_status_does_not_resume_exception_final_repair_task(tmp_path
         encoding="utf-8",
     )
     monkeypatch.setattr("delivery.control_plane.needs_scaffold", lambda project_root: False)
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
 
     result = cli.cmd_control(
         argparse.Namespace(
@@ -895,7 +1247,7 @@ def test_status_does_not_spawn_second_gate_repair_task_when_verified_gate_repair
     assert payload["next_task"]["id"] == "T-FINAL"
 
 
-def test_status_gate_repair_task_includes_missing_type_command_specs(tmp_path: Path, monkeypatch) -> None:
+def test_status_does_not_create_gate_repair_task_for_missing_types(tmp_path: Path, monkeypatch) -> None:
     from delivery.loop_reporting import status as loop_status
     from delivery.state import save_gates
 
@@ -933,13 +1285,118 @@ def test_status_gate_repair_task_includes_missing_type_command_specs(tmp_path: P
         },
     )
 
-    loop_status(tmp_path)
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
-    repair_task = next(item for item in payload["items"] if item.get("task_kind") == "repair")
-    assert "npm run lint" in repair_task["output_tests"]
-    assert "npm run typecheck" in repair_task["output_tests"]
-    assert "npm run build" in repair_task["output_tests"]
-    assert "backend/tests/" in repair_task["output_tests"]
+    assert not any(item.get("task_kind") == "repair" for item in payload["items"])
+
+    status_payload = loop_status(tmp_path)
+    gate = status_payload["gates"]["gates"][0]
+    assert gate["status"] == "blocked"
+    assert gate["missing_test_types"] == ["lint", "typecheck", "build", "integration"]
+
+
+def test_status_prunes_obsolete_pending_gate_repair_when_gates_verified(tmp_path: Path, monkeypatch) -> None:
+    from delivery.loop_reporting import status as loop_status
+    from delivery.state import save_gates
+
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": tmp_path.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "脚手架", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "功能", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": "pass", "git_commit": "abc123"},
+                {"id": "T013", "title": "Validation Gate Repair Bundle (GATE-auth)", "status": "pending", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "blocked_reason": "validation gate repair bundle", "attempts": 0},
+                {"id": "T-FINAL", "title": "最终验证", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    save_gates(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": tmp_path.name,
+            "complexity": {"tier": "S", "score": 0, "signals": {}, "source": "task-decompose"},
+            "gates": [
+                {"id": "GATE-auth", "kind": "module", "title": "Auth gate", "status": "verified", "scope_tasks": ["T002"], "scope_requirements": ["REQ-001"], "required_test_types": [], "source": "task-decompose", "repair_candidates": [], "report_artifact": "docs/reviews/gate-report-GATE-auth.md"}
+            ],
+        },
+    )
+
+    status_payload = loop_status(tmp_path)
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+
+    assert status_payload["gates"]["gates"][0]["status"] == "verified"
+    assert not any(item["id"] == "T013" for item in payload["items"])
+
+
+def test_cmd_control_status_reruns_final_verify_after_repair_verified(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    project_root = tmp_path
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
+    monkeypatch.setattr("delivery.control_plane.needs_scaffold", lambda project_root: False)
+    docs_dir = project_root / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    (docs_dir / "requirements-source.md").write_text("# Raw requirements\n", encoding="utf-8")
+    (docs_dir / "architecture.md").write_text("architecture\n", encoding="utf-8")
+    (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
+    save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
+    project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
+    project_root.joinpath("AGENTS.md").write_text("agents\n", encoding="utf-8")
+    save_test_plan(project_root, {"schema_version": "1", "coverage": []})
+    save_work_items(
+        project_root,
+        {
+            "schema_version": "2",
+            "project": project_root.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "脚手架", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "功能", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": "pass", "git_commit": "abc123"},
+                {"id": "T003", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature/"], "review_status": "pass", "git_commit": "def456", "verified_at": "2999-06-24T00:10:00Z"},
+                {"id": "T-FINAL", "title": "最终验证", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002", "T003"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"], "blocked_reason": "repair task T003 completed but final verification is still failing"},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        project_root,
+        "T-FINAL",
+        {
+            "repair_candidates": ["T002"],
+            "repair_task_id": "T003",
+            "repair_report_artifact": "docs/reviews/final-repair-report.md",
+            "final_verify_status": "repair_required",
+            "updated_at": "2026-06-24T00:05:00Z",
+        },
+    )
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(project_root),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["control_status"] == "in_progress"
+    assert payload["next_step"]["action"] == "run_final_verify"
+    assert payload["next_step"]["owner"] == "framework"
+    assert payload["next_step"]["repair_task_id"] == "T003"
 
 
 def test_status_prunes_stale_pending_repair_task_when_verified_repair_with_same_title_exists(tmp_path: Path, monkeypatch) -> None:
@@ -1112,7 +1569,6 @@ def test_cmd_control_status_prefers_review_pending_task_over_blocked_final_repai
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -1165,7 +1621,6 @@ def test_cmd_control_status_blocks_when_final_repair_task_is_missing(tmp_path: P
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -1218,7 +1673,6 @@ def test_cmd_control_auto_stops_when_final_repair_task_is_missing(tmp_path: Path
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -1271,7 +1725,6 @@ def test_cmd_control_auto_executes_repair_task_for_blocked_final_verify(tmp_path
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -1306,6 +1759,7 @@ def test_cmd_control_auto_executes_repair_task_for_blocked_final_verify(tmp_path
 
     monkeypatch.setattr(cli, "_run_fix_once", fake_run_fix_once)
     monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
 
     result = cli.cmd_control(
         argparse.Namespace(
@@ -1322,8 +1776,9 @@ def test_cmd_control_auto_executes_repair_task_for_blocked_final_verify(tmp_path
 
     payload = json.loads(capsys.readouterr().out)
     assert result == 1
-    assert called == ["T002"]
-    assert payload["executed_steps"][0]["action"] == "run_repair_task"
+    assert called == []
+    assert payload["control_status"] == "blocked"
+    assert payload["next_step"] is None
     assert payload["must_continue"] is False
 
 
@@ -1653,7 +2108,6 @@ def test_cmd_control_status_routes_blocked_validation_gate_to_repair_before_fina
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     ensure_git_repo(project_root)
     git(["add", "--", "."], cwd=project_root)
@@ -1735,9 +2189,9 @@ def test_cmd_control_status_routes_blocked_validation_gate_to_repair_before_fina
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
     assert payload["control_status"] == "in_progress"
-    assert payload["next_step"]["action"] == "run_resume"
-    assert payload["next_step"]["owner"] == "framework"
-    assert payload["next_step"]["task_id"] == "T003"
+    assert payload["next_step"]["action"] == "review_gate_blocker"
+    assert payload["next_step"]["owner"] == "host"
+    assert payload["next_step"]["repair_candidates"] == ["T002"]
 
 
 def test_cmd_control_status_prefers_runnable_next_task_over_blocked_future_gate(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1752,7 +2206,6 @@ def test_cmd_control_status_prefers_runnable_next_task_over_blocked_future_gate(
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -1907,7 +2360,6 @@ def test_cmd_start_spawns_watchdog_only_when_project_enables_it(tmp_path: Path, 
     (docs_dir / "project-bootstrap.json").write_text(json.dumps({"runtime": "claude", "watchdog_enabled": True}), encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -1943,7 +2395,6 @@ def test_cmd_start_requires_hermes_decompose_when_work_items_empty(tmp_path: Pat
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -2117,7 +2568,6 @@ def test_routed_status_ignores_stale_final_blocker_until_regular_tasks_finish(tm
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(tmp_path, {"schema_version": "1", "ui_required": False})
     tmp_path.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    tmp_path.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(tmp_path, {"schema_version": "1", "coverage": []})
     save_work_items(
         tmp_path,
@@ -2154,7 +2604,7 @@ def test_routed_status_ignores_stale_final_blocker_until_regular_tasks_finish(tm
     assert payload["next_step"]["task_id"] == "T003"
 
 
-def test_cmd_control_auto_stops_when_final_task_is_blocked(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cmd_control_auto_stops_when_final_task_is_blocked(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "requirements-source.md").write_text("# Raw requirements\n", encoding="utf-8")
@@ -2163,7 +2613,6 @@ def test_cmd_control_auto_stops_when_final_task_is_blocked(tmp_path: Path, capsy
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(tmp_path, {"schema_version": "1", "ui_required": False})
     tmp_path.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    tmp_path.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(tmp_path, {"schema_version": "1", "coverage": []})
     save_work_items(
         tmp_path,
@@ -2179,6 +2628,7 @@ def test_cmd_control_auto_stops_when_final_task_is_blocked(tmp_path: Path, capsy
             ],
         },
     )
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
 
     result = cli.cmd_control(
         argparse.Namespace(
@@ -2316,7 +2766,7 @@ def test_status_normalizes_stale_running_runtime_state_on_next_task(tmp_path: Pa
     assert payload["next_task"]["runtime_state"]["status"] == "interrupted"
 
 
-def test_status_repairs_verified_task_without_evidence(tmp_path: Path) -> None:
+def test_status_reports_verified_task_without_evidence_without_reopening(tmp_path: Path) -> None:
     save_work_items(
         tmp_path,
         {
@@ -2335,14 +2785,14 @@ def test_status_repairs_verified_task_without_evidence(tmp_path: Path) -> None:
     payload = loop_status(tmp_path)
 
     assert payload["final_verify_ready"] is False
-    assert payload["counts"]["pending"] == 3
+    assert payload["counts"]["verified"] == 3
     assert payload["invalid_verified_tasks"] == {
         "T000": "missing task commit and pass code review evidence",
         "T001": "missing task commit and pass code review evidence",
         "T-FINAL": "missing pass final review evidence",
     }
     persisted = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
-    assert all(item["status"] == "pending" for item in persisted["items"])
+    assert all(item["status"] == "verified" for item in persisted["items"])
 
 
 def test_cmd_start_stops_on_blocking_clarification(tmp_path: Path, monkeypatch) -> None:
@@ -2411,6 +2861,48 @@ def test_cmd_fix_retires_matching_active_session(tmp_path: Path) -> None:
     payload = load_session_state(tmp_path)
     assert payload["active"] is None
     assert payload["retired"][-1]["id"] == "session-1"
+
+
+def test_cmd_fix_clears_completed_task_runtime_state(tmp_path: Path) -> None:
+    review_path = tmp_path / "docs" / "reviews" / "code-review-T002.md"
+    review_path.parent.mkdir(parents=True, exist_ok=True)
+    review_path.write_text("status: pass\nsummary: ok\n", encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"]},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "task_id": "T002",
+            "status": "completed",
+            "started_at": "2026-06-24T00:00:00Z",
+            "completed_at": "2026-06-24T00:05:00Z",
+            "exit_code": 0,
+            "session_id": "ses-old",
+        },
+    )
+
+    result = cli.cmd_fix(argparse.Namespace(project=str(tmp_path), task_id="T002", no_start=True, runtime="claude"))
+
+    assert result == 0
+    assert load_task_runtime_state(tmp_path, "T002") == {}
+    assert not review_path.exists()
+
+    from delivery.loop import recover
+
+    updated = recover(tmp_path)
+    task = next(task for task in updated if task.id == "T002")
+    assert task.status == "pending"
 
 
 def test_cmd_fix_terminates_active_runtime_processes_for_same_task(tmp_path: Path, monkeypatch) -> None:
@@ -2697,7 +3189,6 @@ def test_cmd_start_rejects_concurrent_execution(tmp_path: Path) -> None:
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -2738,7 +3229,6 @@ def test_cmd_start_rejects_invalid_task_contracts(tmp_path: Path) -> None:
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -2770,7 +3260,6 @@ def test_cmd_start_does_not_autorepair_invalid_task_contracts(tmp_path: Path, mo
     (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
     save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
     project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text("code map\n", encoding="utf-8")
     save_test_plan(project_root, {"schema_version": "1", "coverage": []})
     save_work_items(
         project_root,
@@ -2799,7 +3288,6 @@ def test_cmd_context_sync_accepts_runtime_specific_context_only(tmp_path: Path) 
         json.dumps(
             {
                 "claude_md": "claude\n",
-                "code_map_md": "# CODE_MAP.md — Demo\n\n## Project Root\n\nold tree\n\n## Where to Add New Code\n\n- add routes under backend/src/api/\n",
                 "test_plan": {"schema_version": "1", "coverage": []},
             }
         ),
@@ -2824,18 +3312,15 @@ def test_cmd_context_sync_accepts_runtime_specific_context_only(tmp_path: Path) 
     assert (tmp_path / "CLAUDE.md").exists()
     assert not (tmp_path / "AGENTS.md").exists()
     claude_text = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
-    code_map_text = (tmp_path / "CODE_MAP.md").read_text(encoding="utf-8")
     assert "claude\n" in claude_text
     assert "## Runtime Baseline" in claude_text
     assert "docs/requirements-source.md is the raw requirements record" in claude_text
     assert "framework artifacts for planning and traceability" in claude_text
     assert "do not guess APIs from memory" in claude_text
-    assert "Source of truth for the current filesystem layout: `docs/project-structure.md`" in code_map_text
-    assert "Source of truth for the intended target structure: `docs/architecture.md` -> `Module Architecture`." in code_map_text
-    assert "old tree" not in code_map_text
-    assert "add routes under backend/src/api/" in code_map_text
+    assert not (tmp_path / "CODE_MAP.md").exists()
+    assert (tmp_path / "docs" / "test-plan.json").exists()
     persisted = json.loads((tmp_path / ".app-delivery-runtime" / "stage-inputs" / "project-context-sync.json").read_text(encoding="utf-8"))
-    assert persisted["code_map_md"].startswith("# CODE_MAP.md — Demo")
+    assert persisted["test_plan"] == {"schema_version": "1", "coverage": []}
 
 
 def test_cmd_arch_design_normalizes_design_paths(tmp_path: Path) -> None:

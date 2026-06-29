@@ -5,12 +5,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from delivery.state import load_active_task_records, save_work_items
 from delivery import test_env as test_env_module
 from delivery.verify import _command_for_test_spec
 from delivery.verify import _parse_pytest_output, detect_js_package_manager, infer_test_types, is_command_test_spec, is_placeholder_test_file, run_full_suite, run_task_tests, weak_command_reason, weak_test_file_reason
-from delivery.test_env import ensure_task_test_environment, warm_shared_test_environment
+from delivery.verify import infer_final_repair_candidates
+from delivery.test_env import classify_test_environment, ensure_task_test_environment, load_env_state, warm_browser_e2e_environment, warm_shared_test_environment
 
 
 def test_weak_command_reason_flags_echo() -> None:
@@ -24,6 +26,11 @@ def test_weak_command_reason_accepts_pytest() -> None:
 def test_infer_test_types_from_paths() -> None:
     kinds = infer_test_types(["tests/auth/test_api_register.py", "tests/e2e/test_register_flow.py"])
     assert kinds == ["api", "e2e"]
+
+
+def test_infer_test_types_from_accessibility_test_filename() -> None:
+    kinds = infer_test_types(["frontend/src/__tests__/accessibility.test.tsx", "frontend/src/__tests__/a11y.test.tsx"])
+    assert kinds == ["accessibility"]
 
 
 def test_command_and_placeholder_test_spec_detection() -> None:
@@ -69,6 +76,64 @@ def test_run_task_tests_supports_command_specs(tmp_path: Path) -> None:
     assert "status: pass" in report.read_text(encoding="utf-8")
 
 
+def test_run_task_tests_infers_accessibility_from_command_output(tmp_path: Path, monkeypatch) -> None:
+    from delivery import verify as verify_module
+
+    monkeypatch.setattr(verify_module, "ensure_task_test_environment", lambda *args, **kwargs: SimpleNamespace(ready=True))
+    monkeypatch.setattr(
+        verify_module,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            0,
+            stdout="✓ src/__tests__/accessibility.test.tsx (7 tests)\n7 passed\n",
+            stderr="",
+        ),
+    )
+
+    result = run_task_tests(
+        tmp_path,
+        {
+            "id": "T013",
+            "requirements": ["REQ-13"],
+            "output_tests": ["npm run test"],
+        },
+    )
+
+    assert result.passed is True
+    assert "src/__tests__/accessibility.test.tsx" in result.test_files
+    assert "accessibility" in result.test_types
+
+
+def test_run_task_tests_discovers_js_test_files_for_npm_test_command(tmp_path: Path, monkeypatch) -> None:
+    from delivery import verify as verify_module
+
+    frontend_tests = tmp_path / "frontend" / "src" / "__tests__"
+    frontend_tests.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "frontend" / "package.json").write_text(json.dumps({"scripts": {"test": "vitest run"}}), encoding="utf-8")
+    (frontend_tests / "accessibility.test.tsx").write_text("import { test } from 'vitest'\n", encoding="utf-8")
+
+    monkeypatch.setattr(verify_module, "ensure_task_test_environment", lambda *args, **kwargs: SimpleNamespace(ready=True))
+    monkeypatch.setattr(
+        verify_module,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout="Test Files 1 passed (1)\nTests 1 passed (1)\n", stderr=""),
+    )
+
+    result = run_task_tests(
+        tmp_path,
+        {
+            "id": "T013",
+            "requirements": ["REQ-13"],
+            "output_tests": ["npm run test"],
+        },
+    )
+
+    assert result.passed is True
+    assert "frontend/src/__tests__/accessibility.test.tsx" in result.test_files
+    assert "accessibility" in result.test_types
+
+
 def test_run_task_tests_with_no_output_tests_passes(tmp_path: Path) -> None:
     result = run_task_tests(tmp_path, {"id": "T101", "requirements": ["REQ-001"], "output_tests": []})
     assert result.passed is True
@@ -111,6 +176,44 @@ def test_run_records_validation_activity_for_status_visibility(tmp_path: Path, m
 
 def test_infer_test_types_unknown_path_falls_back_to_unit() -> None:
     assert infer_test_types(["checks/custom-validator.txt"]) == ["unit"]
+
+
+def test_infer_final_repair_candidates_targets_missing_type_requirement_owner(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Auth", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/auth.spec.ts"], "output_paths": ["frontend/src/auth/Login.tsx"]},
+                {"id": "T003", "title": "API", "status": "verified", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_api.py"], "output_paths": ["backend/src/api.py"]},
+                {"id": "T-FINAL", "title": "最终验证", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002", "T003"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+
+    assert infer_final_repair_candidates(tmp_path, [], [("REQ-002", "integration")]) == ["T003"]
+
+
+def test_infer_final_repair_candidates_does_not_guess_from_ecosystem_missing_type(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Frontend", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/auth.spec.ts"], "output_paths": ["frontend/src/auth/Login.tsx"]},
+                {"id": "T003", "title": "Backend", "status": "verified", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_api.py"], "output_paths": ["backend/src/api.py"]},
+                {"id": "T-FINAL", "title": "最终验证", "status": "pending", "requirements": ["NFR-002"], "acceptance_scenarios": [], "dependencies": ["T002", "T003"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+
+    assert infer_final_repair_candidates(tmp_path, [], [("NFR-002", "integration")]) == []
 
 
 def test_infer_test_types_marks_backend_suite_as_api_and_integration() -> None:
@@ -238,6 +341,29 @@ def test_run_full_suite_supports_non_verified_mode(tmp_path: Path) -> None:
     results = run_full_suite(tmp_path, mode="non-verified")
     assert len(results) == 1
     assert results[0].task_id == "T002"
+
+
+def test_run_full_suite_skips_pending_repair_tasks(tmp_path: Path) -> None:
+    test_file = tmp_path / "tests" / "test_sample.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T001", "title": "Done", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["tests/test_sample.py"], "output_paths": []},
+                {"id": "T099", "title": "Pending repair", "status": "pending", "task_kind": "repair", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": ["tests/test_sample.py"], "output_paths": []},
+            ],
+        },
+    )
+
+    results = run_full_suite(tmp_path, mode="all")
+
+    assert [result.task_id for result in results] == ["T001"]
 
 
 def test_run_full_suite_adds_frontend_quality_gate_commands(tmp_path: Path) -> None:
@@ -417,6 +543,31 @@ def test_ensure_task_test_environment_skips_extra_setup_for_non_browser_specs(tm
 
     assert result.ready is True
     assert result.profile == "none"
+
+
+def test_classify_test_environment_prefers_browser_marker_over_t001_fallback() -> None:
+    profile = classify_test_environment({"id": "T001"}, "frontend/e2e/__environment__.spec.ts")
+
+    assert profile == "browser_e2e"
+
+
+def test_warm_browser_e2e_environment_records_browser_profile_for_t001(tmp_path: Path) -> None:
+    frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir(parents=True, exist_ok=True)
+    (frontend_dir / "package.json").write_text(
+        json.dumps({"scripts": {"e2e": "playwright test"}}),
+        encoding="utf-8",
+    )
+    (frontend_dir / "node_modules").mkdir(exist_ok=True)
+    (frontend_dir / "e2e").mkdir(exist_ok=True)
+    (frontend_dir / "e2e" / "smoke.spec.ts").write_text("test('ok', async () => {})\n", encoding="utf-8")
+
+    result = warm_browser_e2e_environment(tmp_path, reason="shared foundation")
+
+    state = load_env_state(tmp_path)
+    assert result.ready is True
+    assert result.profile == "browser_e2e"
+    assert state["profiles"]["browser_e2e"]["ready"] is True
 
 
 def test_shared_service_names_are_derived_from_compose_and_exclude_app_local_services(tmp_path: Path, monkeypatch) -> None:

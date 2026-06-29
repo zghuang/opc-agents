@@ -3,7 +3,6 @@ Generate project context files from the architecture, requirements, and architec
 Return JSON with these fields:
 - claude_md
 - agents_md
-- code_map_md
 - test_plan
 
 test_plan must be an object with:
@@ -21,12 +20,10 @@ Constraints:
 - Prefer a compact bullet list or short table in `Tech Design` rather than long prose.
 - Fold project-wide invariants or collaboration conventions into `Tech Design` when they are genuinely cross-cutting; avoid separate verbose sections unless they add unique value.
 - Do not duplicate long generic runtime rules or framework-wide command policy boilerplate in `claude_md` / `agents_md`; the harness appends a standard runtime baseline automatically.
-- Do not repeat code-structure/module-map content in `claude_md` / `agents_md`; put navigation guidance in `code_map_md` instead.
-- Do not hand-author a separate `Project Root` tree in `code_map_md`. The harness injects the current filesystem structure from `docs/project-structure.md` and the planned module tree from `docs/architecture.md` automatically.
+- Keep code-organization guidance in `claude_md` / `agents_md` compact and stable; do not duplicate long repository trees from architecture or project-structure artifacts.
 - Do not repeat validation commands, task-scope rules, or test execution instructions that belong in task prompts or the runtime baseline.
 - Do not restate feature-specific acceptance details unless they are true project-wide invariants.
 - Do not invent constraints that are not grounded in the provided requirements, architecture, shared components, or clarification answers.
-- CODE_MAP.md must explain the major modules and where new code should go, but treat it as a navigation layer rather than an independently authored source of structural truth.
 - test_plan coverage rows must include every requirement ID.
 - test_types should be realistic, such as unit, api, integration, browser, e2e, accessibility, or performance.
 

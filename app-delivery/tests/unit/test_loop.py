@@ -125,14 +125,12 @@ def test_task_scope_delta_ignores_machine_owned_structure_and_context_docs(tmp_p
     (tmp_path / "backend" / "src" / "feature.py").write_text("print('base')\n", encoding="utf-8")
     (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
     (tmp_path / "docs" / "project-structure.md").write_text("# structure\n", encoding="utf-8")
-    tmp_path.joinpath("CODE_MAP.md").write_text("# map\n", encoding="utf-8")
     tmp_path.joinpath("AGENTS.md").write_text("# agents\n", encoding="utf-8")
     git(["add", "--", "."], cwd=tmp_path)
     git(["commit", "-m", "init"], cwd=tmp_path)
 
     (tmp_path / "backend" / "src" / "feature.py").write_text("print('task')\n", encoding="utf-8")
     (tmp_path / "docs" / "project-structure.md").write_text("# structure updated\n", encoding="utf-8")
-    tmp_path.joinpath("CODE_MAP.md").write_text("# map updated\n", encoding="utf-8")
     tmp_path.joinpath("AGENTS.md").write_text("# agents updated\n", encoding="utf-8")
 
     delta = task_scope_delta(
@@ -234,6 +232,94 @@ def test_build_task_prompt_frontend_acceptance_requires_browser_guidance(tmp_pat
     assert "No browser/e2e test is currently declared" in prompt
 
 
+def test_build_validation_task_prompt_explains_validation_role(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "Incident handling", "summary": "System handles incidents."}],
+                "acceptance_scenarios": [{"id": "AS-001", "title": "Happy path", "summary": "Low-risk case completes automatically.", "source_requirement_ids": ["REQ-001"]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    from delivery.task import Task
+
+    task = Task.from_dict(
+        {
+            "id": "T010",
+            "title": "Acceptance validation",
+            "status": "pending",
+            "task_kind": "validation",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": ["AS-001"],
+            "dependencies": ["T009"],
+            "output_tests": ["backend/tests/test_acceptance/test_as001.py", "frontend/e2e/incident-happy-path.spec.ts"],
+            "output_paths": ["backend/tests/test_acceptance/", "frontend/e2e/"],
+        }
+    )
+
+    prompt = build_task_prompt(tmp_path, task)
+
+    assert "Validation task mission:" in prompt
+    assert "This is a validation task." in prompt
+    assert "app-delivery control loop will deterministically execute the declared Tests" in prompt
+    assert "Prefer improving or adding acceptance tests, end-to-end tests, fixtures, scenario data, and test helpers before changing product code." in prompt
+    assert "Do not turn this task into broad new product implementation" in prompt
+    assert "Each declared acceptance scenario should map to at least one concrete validation path" in prompt
+    assert "This task owns frontend-facing validation coverage." in prompt
+
+
+def test_build_validation_code_review_prompt_reviews_validation_assets(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "Incident handling", "summary": "System handles incidents."}],
+                "acceptance_scenarios": [{"id": "AS-001", "title": "Happy path", "summary": "Low-risk case completes automatically.", "source_requirement_ids": ["REQ-001"]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    from delivery.task import Task
+
+    task = Task.from_dict(
+        {
+            "id": "T010",
+            "title": "Acceptance validation",
+            "status": "review_pending",
+            "task_kind": "validation",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": ["AS-001"],
+            "dependencies": ["T009"],
+            "output_tests": ["backend/tests/test_acceptance/test_as001.py", "frontend/e2e/incident-happy-path.spec.ts"],
+            "output_paths": ["backend/tests/test_acceptance/", "frontend/e2e/"],
+        }
+    )
+
+    prompt = build_code_review_request(
+        tmp_path,
+        task,
+        scope_report={
+            "changed_paths": ["backend/tests/test_acceptance/test_as001.py", "backend/src/mock/fixtures.py", "docs/test-results.json"],
+            "out_of_scope": ["backend/src/mock/fixtures.py"],
+        },
+    )
+
+    assert "validation-task review" in prompt
+    assert "declared output_tests as contractual validation entrypoints" in prompt
+    assert "every declared acceptance scenario maps to concrete assertions" in prompt
+    assert "placeholder tests, shallow smoke checks, missing scenario coverage" in prompt
+    assert "Minimal support code, mocks, fixtures, or wiring may be acceptable" in prompt
+    assert "out_of_scope: backend/src/mock/fixtures.py" in prompt
+    assert "necessary fixtures, support wiring, scenario data, or test helpers" in prompt
+    assert "docs/test-results.json" not in prompt
+    assert "requirement_assessment" in prompt
+    assert "acceptance_assessment" in prompt
+
+
 def test_build_task_prompt_includes_dependency_hints(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -273,7 +359,7 @@ def test_build_task_prompt_includes_dependency_hints(tmp_path: Path) -> None:
         ),
     )
 
-    assert "Project metadata declares technology constraints relevant to this task." in prompt
+    assert "Project technology constraints for this task:" not in prompt
     assert "Ant Design" not in prompt
 
 
@@ -553,7 +639,7 @@ def test_write_code_review_request_persists_prompt(tmp_path: Path) -> None:
         tmp_path,
         Task("T002", "Login", "pending", ["REQ-001"], [], [], [], []),
         scope_report={
-            "changed_paths": ["backend/src/login/service.py", "frontend/src/shared/auth.ts"],
+            "changed_paths": ["backend/src/login/service.py", "frontend/src/shared/auth.ts", "docs/work-items.json", "docs/reviews/test-report-T002.md"],
             "out_of_scope": ["frontend/src/shared/auth.ts"],
         },
     )
@@ -565,6 +651,12 @@ def test_write_code_review_request_persists_prompt(tmp_path: Path) -> None:
     assert "out_of_scope: frontend/src/shared/auth.ts" in text
     assert "Treat these paths as advisory, not an automatic failure." in text
     assert "necessary shared infrastructure or contract-aligned support" in text
+    assert "Implementation-relevant changed paths seen by the framework:" in text
+    assert "backend/src/login/service.py" in text
+    assert "docs/work-items.json" not in text
+    assert "docs/reviews/test-report-T002.md" not in text
+    assert "task-scoped staged snapshot" in text
+    assert "current working tree" not in text
     assert "Reply in raw JSON" in text
 
 
@@ -2190,7 +2282,6 @@ def test_git_commit_task_allows_t000_planning_artifacts(tmp_path: Path) -> None:
     (tmp_path / ".app-delivery-runtime" / "stage-inputs").mkdir(parents=True, exist_ok=True)
     (tmp_path / ".app-delivery-runtime" / "stage-inputs" / "spec-review.json").write_text("{}\n", encoding="utf-8")
     (tmp_path / "CLAUDE.md").write_text("claude\n", encoding="utf-8")
-    (tmp_path / "CODE_MAP.md").write_text("map\n", encoding="utf-8")
 
     git(["add", "--", "."], cwd=tmp_path)
     git(["commit", "-m", "init"], cwd=tmp_path)
@@ -2864,7 +2955,7 @@ def test_recover_reconciles_verified_task_from_pass_review_and_commit(tmp_path: 
     assert updated[0].review_artifact == "docs/reviews/code-review-T001.md"
 
 
-def test_recover_resets_invalid_verified_scaffold_without_git_history(tmp_path: Path) -> None:
+def test_recover_preserves_invalid_verified_scaffold_without_git_history(tmp_path: Path) -> None:
     save_work_items(
         tmp_path,
         {
@@ -2903,13 +2994,13 @@ def test_recover_resets_invalid_verified_scaffold_without_git_history(tmp_path: 
     updated = recover(tmp_path)
 
     by_id = {task.id: task for task in updated}
-    assert by_id["T000"].status == "pending"
-    assert by_id["T000"].review_status is None
-    assert by_id["T000"].review_artifact is None
-    assert by_id["T000"].verified_at is None
+    assert by_id["T000"].status == "verified"
+    assert by_id["T000"].review_status == "pass"
+    assert by_id["T000"].review_artifact == "docs/reviews/code-review-T000.md"
+    assert by_id["T000"].verified_at == "2026-06-24T00:02:00Z"
 
 
-def test_recover_resets_verified_task_without_commit_or_review_evidence(tmp_path: Path) -> None:
+def test_recover_preserves_verified_task_without_commit_or_review_evidence(tmp_path: Path) -> None:
     save_work_items(
         tmp_path,
         {
@@ -2937,15 +3028,15 @@ def test_recover_resets_verified_task_without_commit_or_review_evidence(tmp_path
 
     updated = recover(tmp_path)
 
-    assert updated[0].status == "pending"
+    assert updated[0].status == "verified"
     assert updated[0].git_commit is None
-    assert updated[0].review_status is None
-    assert updated[0].review_artifact is None
-    assert updated[0].verified_at is None
-    assert updated[0].blocked_reason == "verification evidence missing: missing task commit and pass code review evidence"
+    assert updated[0].review_status == "pass"
+    assert updated[0].review_artifact == "docs/reviews/code-review-T001.md"
+    assert updated[0].verified_at == "2026-06-24T00:02:00Z"
+    assert updated[0].blocked_reason is None
 
 
-def test_recover_reopens_verified_task_when_validation_gate_is_blocked(tmp_path: Path, monkeypatch) -> None:
+def test_recover_preserves_verified_task_when_validation_gate_is_blocked(tmp_path: Path, monkeypatch) -> None:
     from delivery.loop_gitops import ensure_git_repo, git
 
     ensure_git_repo(tmp_path)
@@ -3012,13 +3103,13 @@ def test_recover_reopens_verified_task_when_validation_gate_is_blocked(tmp_path:
     updated = recover(tmp_path)
 
     by_id = {task.id: task for task in updated}
-    assert by_id["T002"].status == "pending"
-    assert by_id["T002"].review_status is None
-    assert by_id["T002"].verified_at is None
-    assert by_id["T002"].blocked_reason == "validation gate GATE-auth requires repair"
+    assert by_id["T002"].status == "verified"
+    assert by_id["T002"].review_status == "pass"
+    assert by_id["T002"].verified_at == "2026-06-24T00:02:00Z"
+    assert by_id["T002"].blocked_reason is None
 
 
-def test_run_reopens_blocked_gate_repair_task_before_downstream_execution(tmp_path: Path, monkeypatch) -> None:
+def test_run_does_not_reopen_verified_gate_repair_candidate_before_downstream_execution(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
         tmp_path,
         {
@@ -3079,9 +3170,9 @@ def test_run_reopens_blocked_gate_repair_task_before_downstream_execution(tmp_pa
 
     result = loop.run()
 
-    assert executed == ["T002"]
+    assert executed == ["T003"]
     assert result["status"] == "review_pending"
-    assert result["task_id"] == "T002"
+    assert result["task_id"] == "T003"
 
 
 def test_recover_does_not_reopen_multiple_verified_gate_repair_candidates(tmp_path: Path, monkeypatch) -> None:
@@ -3794,6 +3885,68 @@ def test_final_verify_blocks_when_validation_gate_is_not_verified(tmp_path: Path
     assert runtime_state["final_verify_status"] == "repair_required"
 
 
+def test_final_verify_blocks_unattributed_missing_test_coverage_without_repair_task(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import all_tasks
+    from delivery.verify import TestResult
+
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [
+                    {"id": "REQ-001", "title": "One", "summary": "One"},
+                    {"id": "NFR-002", "title": "Integration coverage", "summary": "Project-wide integration checks"},
+                ],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": "pass", "git_commit": "abc123"},
+                {"id": "T-FINAL", "title": "最终验证", "status": "pending", "requirements": ["NFR-002"], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    loop = DeliveryLoop(tmp_path)
+
+    monkeypatch.setattr(
+        "delivery.loop.run_full_suite",
+        lambda project_root, mode="all": [
+            TestResult(
+                task_id="T002",
+                timestamp="2026-06-24T00:00:00Z",
+                test_files=["backend/tests/test_feature.py"],
+                test_types=["api"],
+                requirement_ids=["REQ-001"],
+                passed=True,
+                passed_count=1,
+                failed_count=0,
+                failures=[],
+                attempt=1,
+            )
+        ],
+    )
+    monkeypatch.setattr("delivery.loop.check_test_type_coverage", lambda project_root: [("NFR-002", "integration")])
+
+    result = loop.final_verify()
+
+    assert result["status"] == "blocked"
+    assert result["repair_candidates"] == []
+    assert result["repair_task_id"] is None
+    by_id = {task.id: task for task in all_tasks(tmp_path)}
+    assert by_id["T-FINAL"].blocked_reason == "final verification has missing test coverage without a strongly attributed repair owner: NFR-002:integration"
+    runtime_state = load_task_runtime_state(tmp_path, "T-FINAL")
+    assert runtime_state["final_verify_status"] == "blocked"
+
+
 def test_final_verify_defers_when_non_final_feature_tasks_are_incomplete(tmp_path: Path) -> None:
     (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
     (tmp_path / "docs" / "requirements.json").write_text(
@@ -3848,6 +4001,42 @@ def test_shared_foundation_enters_exception_when_shared_env_cannot_warm(tmp_path
 
     assert success is False
     assert state == "exception"
+
+
+def test_shared_foundation_enters_exception_when_browser_env_cannot_warm(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import all_tasks
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T001", "title": "共享基础设施", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/src/tests/test_health.py"], "output_paths": ["backend/src/core/"]},
+            ],
+        },
+    )
+
+    monkeypatch.setattr(
+        "delivery.loop.warm_shared_test_environment",
+        lambda project_root, reason="": type("Result", (), {"ready": True, "summary": "shared env ready"})(),
+    )
+    monkeypatch.setattr("delivery.loop.project_has_browser_e2e", lambda project_root: True)
+    monkeypatch.setattr(
+        "delivery.loop.warm_browser_e2e_environment",
+        lambda project_root, reason="": type("Result", (), {"ready": False, "summary": "browser env unavailable"})(),
+    )
+
+    loop = DeliveryLoop(tmp_path)
+    task = next(task for task in all_tasks(tmp_path) if task.id == "T001")
+    success, state = loop._execute_task(task)
+
+    assert success is False
+    assert state == "exception"
+    updated = next(task for task in all_tasks(tmp_path) if task.id == "T001")
+    assert updated.blocked_reason == "browser env unavailable"
 
 
 def test_run_blocks_active_repair_task_until_non_repair_feature_tasks_finish(tmp_path: Path, monkeypatch) -> None:

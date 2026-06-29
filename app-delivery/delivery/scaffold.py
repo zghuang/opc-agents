@@ -167,7 +167,7 @@ def _create_scaffold_from_module_architecture(project_root: Path) -> None:
             stack = [*stack[:depth], name]
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.name == "__init__.py" and not target.exists():
+        if target.name in {"__init__.py", ".gitkeep"} and not target.exists():
             target.write_text("", encoding="utf-8")
 
 

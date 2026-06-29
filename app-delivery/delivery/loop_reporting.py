@@ -619,6 +619,8 @@ def _backfill_missing_status_session_ids(project_root: Path, tasks: list[Any]) -
 def _prune_superseded_repair_tasks(project_root: Path, tasks: list[Any]) -> list[Any]:
     final_runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, FINAL_VERIFY_TASK_ID))
     current_final_repair_task_id = str(final_runtime_state.get("repair_task_id") or "").strip()
+    final_task = next((task for task in tasks if task.id == FINAL_VERIFY_TASK_ID), None)
+    final_dependency_ids = {str(task_id).strip() for task_id in getattr(final_task, "dependencies", []) if str(task_id).strip()}
     repair_groups: dict[str, list[Any]] = {}
     for task in tasks:
         if getattr(task, "task_kind", "") != "repair":
@@ -639,7 +641,7 @@ def _prune_superseded_repair_tasks(project_root: Path, tasks: list[Any]) -> list
         preferred = terminal[-1]
         for task in grouped:
             if task.status not in {"verified", "exception"}:
-                if task.id == current_final_repair_task_id:
+                if task.id == current_final_repair_task_id and task.id in final_dependency_ids:
                     continue
                 drop_ids.add(task.id)
                 replacements[task.id] = preferred.id
@@ -653,6 +655,32 @@ def _prune_superseded_repair_tasks(project_root: Path, tasks: list[Any]) -> list
     replacement_id = replacements.get(current_repair_task_id)
     if replacement_id:
         save_task_runtime_state(project_root, FINAL_VERIFY_TASK_ID, {"repair_task_id": replacement_id})
+    return updated
+
+
+def _prune_obsolete_gate_repair_tasks(project_root: Path, tasks: list[Any], gates_payload: dict[str, Any]) -> list[Any]:
+    gate_rows = gates_payload.get("gates") if isinstance(gates_payload.get("gates"), list) else []
+    non_verified_gates = [
+        gate
+        for gate in gate_rows
+        if isinstance(gate, dict) and str(gate.get("status") or "").strip() not in {"", "verified"}
+    ]
+    if non_verified_gates:
+        return tasks
+
+    drop_ids = {
+        task.id
+        for task in tasks
+        if getattr(task, "task_kind", "") == "repair"
+        and str(task.title or "").startswith(GATE_REPAIR_TASK_PREFIX)
+        and task.status == "pending"
+        and not str(getattr(task, "status_session_id", "") or "").strip()
+        and int(getattr(task, "attempts", 0) or 0) == 0
+    }
+    if not drop_ids:
+        return tasks
+    updated = [task for task in tasks if task.id not in drop_ids]
+    save_tasks(project_root, updated)
     return updated
 
 
@@ -891,12 +919,10 @@ def status(project_root: Path | str) -> dict[str, Any]:
     prune_stale_active_task_records(project_dir)
     gates_payload = refresh_gates(project_dir)
     tasks = all_tasks(project_dir)
+    tasks = _prune_obsolete_gate_repair_tasks(project_dir, tasks, gates_payload)
     tasks = _prune_superseded_repair_tasks(project_dir, tasks)
-    tasks = _ensure_gate_repair_task(project_dir, tasks, gates_payload)
     tasks = _backfill_missing_status_session_ids(project_dir, tasks)
     tasks, invalid_verified = repair_invalid_verified_tasks(project_dir, tasks)
-    if invalid_verified:
-        save_tasks(project_dir, tasks)
     final_runtime_state = _reconcile_final_repair_runtime_state(project_dir, tasks)
     display_tasks = _display_tasks(project_dir, tasks)
     by_status: dict[str, int] = {}

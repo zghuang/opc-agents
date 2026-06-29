@@ -74,6 +74,7 @@ TRIVIAL_JS_EXPECT_PATTERN = re.compile(r"expect\(\s*true\s*\)\.toBe\(\s*true\s*\
 JS_EXPECT_PATTERN = re.compile(r"expect\(", re.IGNORECASE)
 TRIVIAL_PY_ASSERT_PATTERN = re.compile(r"assert\s+True\b", re.IGNORECASE)
 PY_ASSERT_PATTERN = re.compile(r"assert\b", re.IGNORECASE)
+TEST_ARTIFACT_PATTERN = re.compile(r"[A-Za-z0-9_./@+-]+(?:test|spec)\.(?:tsx|ts|jsx|js|py)")
 
 
 @dataclass
@@ -81,6 +82,7 @@ class TestFailure:
     test: str
     message: str
     traceback: str
+    failure_kind: str | None = None
 
 
 @dataclass
@@ -194,32 +196,11 @@ def infer_final_repair_candidates(
         for task in tasks
         if task.status == "verified" and task.id not in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FINAL_VERIFY_TASK_ID}
     ]
-    frontend_tasks = [
-        task
-        for task in verified_tasks
-        if any(path.startswith("frontend/") for path in task.output_paths)
-        or any(spec.startswith("frontend/") for spec in task.output_tests)
-    ]
-    backend_tasks = [
-        task
-        for task in verified_tasks
-        if any(path.startswith("backend/") for path in task.output_paths)
-        or any(spec.startswith("backend/") for spec in task.output_tests)
-    ]
 
-    for requirement_id, test_type in missing_test_types:
+    for requirement_id, _test_type in missing_test_types:
         direct_matches = [task for task in verified_tasks if requirement_id in task.requirements]
-        if direct_matches:
-            for task in direct_matches:
-                add_candidate(task.id)
-            continue
-        if test_type in {"browser", "e2e", "unit", "typecheck", "lint", "build"}:
-            for task in frontend_tasks:
-                add_candidate(task.id)
-            continue
-        if test_type in {"api", "integration"}:
-            for task in backend_tasks:
-                add_candidate(task.id)
+        for task in direct_matches:
+            add_candidate(task.id)
     return candidates
 
 
@@ -380,6 +361,10 @@ def infer_test_types(test_files: list[str]) -> list[str]:
             ("/browser/", "browser"),
             ("/performance/", "performance"),
             ("/accessibility/", "accessibility"),
+            ("accessibility.test", "accessibility"),
+            ("a11y.test", "accessibility"),
+            ("test_accessibility", "accessibility"),
+            ("test_a11y", "accessibility"),
             ("test_api_", "api"),
             ("test_ui_", "browser"),
             ("playwright", "browser"),
@@ -415,6 +400,45 @@ def infer_test_types(test_files: list[str]) -> list[str]:
         if any(marker in lowered for marker in ("npm run e2e", "pnpm run e2e", "yarn e2e")) and "browser" not in kinds:
             kinds.append("browser")
     return kinds or ["unit"]
+
+
+def _observed_test_specs_from_output(output: str) -> list[str]:
+    specs: list[str] = []
+    for match in TEST_ARTIFACT_PATTERN.finditer(str(output or "")):
+        spec = match.group(0).strip().lstrip("./")
+        if spec and spec not in specs:
+            specs.append(spec)
+    return specs
+
+
+def _discovered_js_test_specs_for_command(project_root: Path, spec: str) -> list[str]:
+    normalized = str(spec or "").strip()
+    lowered = normalized.casefold()
+    if not any(marker in lowered for marker in ("npm run test", "pnpm run test", "yarn test", "vitest")):
+        return []
+    candidate_roots: list[Path] = []
+    frontend_root = project_root / "frontend"
+    if (frontend_root / "package.json").exists():
+        candidate_roots.append(frontend_root)
+    if (project_root / "package.json").exists():
+        candidate_roots.append(project_root)
+    specs: list[str] = []
+    ignored_parts = {"node_modules", "dist", "build", "coverage", "playwright-report"}
+    for root in candidate_roots:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if ignored_parts.intersection(path.relative_to(root).parts):
+                continue
+            if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"}:
+                continue
+            lowered_name = path.name.casefold()
+            if ".test." not in lowered_name and ".spec." not in lowered_name:
+                continue
+            relative = str(path.relative_to(project_root))
+            if relative not in specs:
+                specs.append(relative)
+    return specs
 
 
 def _frontend_quality_gate_tasks(project_root: Path) -> list[dict[str, Any]]:
@@ -704,6 +728,7 @@ def run_task_tests(project_root: Path | str, task: dict[str, Any], *, attempt: i
     failed_count = 0
     failures: list[TestFailure] = []
     overall_passed = True
+    observed_test_specs = list(test_specs)
     for spec in test_specs:
         env_result = ensure_task_test_environment(project_dir, task, spec)
         if not env_result.ready:
@@ -714,6 +739,7 @@ def run_task_tests(project_root: Path | str, task: dict[str, Any], *, attempt: i
                     test=spec,
                     message=f"test environment not ready ({env_result.profile}): {env_result.summary}",
                     traceback=json.dumps({"actions_run": env_result.actions_run, "details": env_result.details}, ensure_ascii=False),
+                    failure_kind="environment_not_ready",
                 )
             )
             continue
@@ -722,13 +748,13 @@ def run_task_tests(project_root: Path | str, task: dict[str, Any], *, attempt: i
             if reason:
                 overall_passed = False
                 failed_count += 1
-                failures.append(TestFailure(test=spec, message=reason, traceback=spec))
+                failures.append(TestFailure(test=spec, message=reason, traceback=spec, failure_kind="validation_contract"))
                 continue
         weak_file_reason = weak_test_file_reason(project_dir, spec)
         if weak_file_reason:
             overall_passed = False
             failed_count += 1
-            failures.append(TestFailure(test=spec, message=weak_file_reason, traceback=spec))
+            failures.append(TestFailure(test=spec, message=weak_file_reason, traceback=spec, failure_kind="validation_contract"))
             continue
         command = _command_for_test_spec(project_dir, spec)
         completed = _run(
@@ -739,6 +765,13 @@ def run_task_tests(project_root: Path | str, task: dict[str, Any], *, attempt: i
             task_title=str(task.get("title") or ""),
             spec=spec,
         )
+        for observed_spec in _observed_test_specs_from_output(completed.stdout):
+            if observed_spec not in observed_test_specs:
+                observed_test_specs.append(observed_spec)
+        if completed.returncode == 0:
+            for discovered_spec in _discovered_js_test_specs_for_command(project_dir, spec):
+                if discovered_spec not in observed_test_specs:
+                    observed_test_specs.append(discovered_spec)
         if _looks_like_pytest_spec(spec, command):
             spec_passed, spec_failed, spec_failures = _parse_pytest_output(completed.stdout)
             passed_count += spec_passed
@@ -756,8 +789,8 @@ def run_task_tests(project_root: Path | str, task: dict[str, Any], *, attempt: i
     result = TestResult(
         task_id=str(task.get("id") or ""),
         timestamp=utc_now_iso(),
-        test_files=test_specs,
-        test_types=infer_test_types(test_specs),
+        test_files=observed_test_specs,
+        test_types=infer_test_types(observed_test_specs),
         requirement_ids=[str(value).strip() for value in task.get("requirements", []) if str(value).strip()],
         passed=overall_passed and failed_count == 0,
         passed_count=passed_count,
@@ -778,6 +811,8 @@ def run_full_suite(project_root: Path | str, *, mode: str = "all") -> list[TestR
         if not isinstance(item, dict):
             continue
         if str(item.get("status") or "") == "cancelled":
+            continue
+        if str(item.get("task_kind") or "") == "repair" and str(item.get("status") or "") != "verified":
             continue
         if mode == "non-verified" and str(item.get("status") or "") == "verified":
             continue

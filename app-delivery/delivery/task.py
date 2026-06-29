@@ -6,6 +6,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .builtin_tasks import (
+    FINAL_VERIFY_TASK_ID,
+    FRONTEND_API_AUDIT_OUTPUT_PATHS,
+    FRONTEND_API_AUDIT_OUTPUT_TESTS,
+    FRONTEND_API_AUDIT_REPORT_PATH,
+    FRONTEND_API_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_OUTPUT_PATHS,
+    PREFINAL_AUDIT_OUTPUT_TESTS,
+    PREFINAL_AUDIT_REPORT_PATH,
+    PREFINAL_AUDIT_TASK_ID,
+    SCAFFOLD_TASK_ID,
+    SHARED_FOUNDATION_TASK_ID,
+    needs_frontend_api_audit,
+)
 from .state import load_test_plan, load_work_items, project_paths, save_work_items, utc_now_iso
 
 
@@ -16,68 +30,41 @@ REQ_RANGE_RE = re.compile(
 )
 TASK_ID_RE = re.compile(r"^T\d{3,}$")
 VALID_STATUSES = {"pending", "active", "review_pending", "done", "verified", "blocked", "exception", "cancelled"}
-SCAFFOLD_TASK_ID = "T000"
-SHARED_FOUNDATION_TASK_ID = "T001"
-PREFINAL_AUDIT_TASK_ID = "T-SYSTEM-AUDIT"
-FINAL_VERIFY_TASK_ID = "T-FINAL"
-PREFINAL_AUDIT_REPORT_PATH = "docs/reviews/system-audit.md"
 FOUNDATION_SCOPE_PREFIXES = (
     "backend/",
     "backend/pyproject.toml",
     "backend/uv.lock",
-    "backend/conftest.py",
     "backend/src/main.py",
-    "backend/src/core/",
-    "backend/src/shared/",
+    "backend/src/runtime/",
     "backend/src/tests/",
-    "backend/tests/core/",
     "frontend/package.json",
     "frontend/package-lock.json",
-    "frontend/src/shared/",
     "frontend/src/lib/",
-    "frontend/src/layouts/",
-    "frontend/src/components/feedback/",
     "frontend/src/styles/",
     "frontend/src/App.tsx",
     "frontend/src/App.test.tsx",
+    "frontend/e2e/",
 )
 SHARED_FOUNDATION_OUTPUT_PATHS = [
     "backend/pyproject.toml",
     "backend/uv.lock",
-    "backend/conftest.py",
     "backend/src/main.py",
-    "backend/src/core/",
-    "backend/src/shared/",
+    "backend/src/runtime/",
     "backend/src/tests/",
-    "backend/tests/core/",
     "frontend/package.json",
     "frontend/package-lock.json",
     "frontend/pnpm-lock.yaml",
     "frontend/yarn.lock",
-    "frontend/src/shared/",
     "frontend/src/lib/",
-    "frontend/src/layouts/",
-    "frontend/src/components/feedback/",
     "frontend/src/styles/",
     "frontend/src/App.tsx",
     "frontend/src/App.test.tsx",
+    "frontend/e2e/",
 ]
 SHARED_FOUNDATION_OUTPUT_TESTS = [
     "backend/src/tests/test_health.py",
-    "backend/tests/core/",
+    "backend/src/tests/test_database.py",
     "frontend/src/App.test.tsx",
-]
-PREFINAL_AUDIT_OUTPUT_PATHS = [
-    "backend/",
-    "frontend/",
-    "mock-server/",
-    "scripts/",
-    "docker-compose.yml",
-    "README.md",
-    PREFINAL_AUDIT_REPORT_PATH,
-]
-PREFINAL_AUDIT_OUTPUT_TESTS = [
-    "bash -lc 'test -s docs/reviews/system-audit.md && grep -q \"## Requirement Gap Matrix\" docs/reviews/system-audit.md && grep -q \"## Validation Summary\" docs/reviews/system-audit.md'",
 ]
 FOUNDATION_TITLE_MARKERS = (
     "基础设施",
@@ -170,14 +157,12 @@ def _normalize_shared_foundation_output_tests(values: list[str]) -> list[str]:
         normalized = str(value or "").strip()
         if not normalized:
             continue
-        if normalized != "backend/tests/core/" and normalized.startswith("backend/tests/core/"):
-            continue
         preserved.append(normalized)
     return _dedupe_preserve([*SHARED_FOUNDATION_OUTPUT_TESTS, *preserved])
 
 
 def _is_shared_foundation_candidate(task: Task) -> bool:
-    if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FINAL_VERIFY_TASK_ID}:
+    if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
         return False
     title = task.title.casefold()
     if any(req.startswith("REQ-") for req in task.requirements):
@@ -231,7 +216,7 @@ def _collapse_shared_foundation_tasks(tasks: list[Task]) -> list[Task]:
     migrated_requirements = merged_foundation.requirements
     if migrated_requirements:
         for index, task in enumerate(collapsed):
-            if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FINAL_VERIFY_TASK_ID}:
+            if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
                 continue
             data = task.to_dict()
             data["requirements"] = _dedupe_preserve([*migrated_requirements, *task.requirements])
@@ -249,6 +234,14 @@ def _normalize_builtin_task_contract(task: "Task") -> "Task":
         data["dependencies"] = [SCAFFOLD_TASK_ID]
         data["output_paths"] = _dedupe_preserve([*SHARED_FOUNDATION_OUTPUT_PATHS, *task.output_paths])
         data["output_tests"] = _normalize_shared_foundation_output_tests(task.output_tests)
+        return Task.from_dict(data)
+    if task.id == FRONTEND_API_AUDIT_TASK_ID:
+        data["title"] = task.title or "Frontend API integration audit"
+        data["task_kind"] = "audit"
+        data["requirements"] = []
+        data["acceptance_scenarios"] = []
+        data["output_paths"] = _dedupe_preserve([*FRONTEND_API_AUDIT_OUTPUT_PATHS, *task.output_paths])
+        data["output_tests"] = _dedupe_preserve([*FRONTEND_API_AUDIT_OUTPUT_TESTS, *task.output_tests])
         return Task.from_dict(data)
     if task.id == PREFINAL_AUDIT_TASK_ID:
         data["title"] = task.title or "Pre-final full-system audit"
@@ -396,7 +389,7 @@ def index_tasks(tasks: list[Task]) -> dict[str, Task]:
 def next_generated_task_id(tasks: list[Task], *, minimum: int = 2) -> str:
     next_index = max(2, int(minimum))
     for task in tasks:
-        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
+        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
         if not TASK_ID_RE.match(task.id):
             continue
@@ -537,7 +530,7 @@ def _validate_requirement_task_coverage(project_root: Path | str, tasks: list[Ta
         return
     covered: set[str] = set()
     for task in tasks:
-        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
+        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
         covered.update(task.requirements)
     covered.update(req_id for req_id in requirement_ids if _is_final_verify_requirement(req_id))
@@ -580,7 +573,7 @@ def _validate_dependency_graph(tasks: list[Task]) -> None:
 def _validate_task_shape(tasks: list[Task]) -> None:
     oversized: list[str] = []
     for task in tasks:
-        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FINAL_VERIFY_TASK_ID}:
+        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
         if len(task.output_paths) > 20 or len(task.output_tests) > 10:
             oversized.append(
@@ -596,7 +589,7 @@ def lint_task_contract(task: Task) -> dict[str, list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
-    if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FINAL_VERIFY_TASK_ID}:
+    if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
         return {"errors": errors, "warnings": warnings}
 
     if not task.output_paths:
@@ -753,7 +746,7 @@ def decompose_tasks(
     normalized_items.append(
         Task(
             id=SCAFFOLD_TASK_ID,
-            title="脚手架",
+            title="Scaffold",
             status="pending",
             requirements=[],
             acceptance_scenarios=[],
@@ -767,7 +760,7 @@ def decompose_tasks(
         normalized_items.append(
             Task(
                 id=SHARED_FOUNDATION_TASK_ID,
-                title="共享基础设施",
+                title="Shared foundation",
                 status="pending",
                 requirements=[],
                 acceptance_scenarios=[],
@@ -786,9 +779,9 @@ def decompose_tasks(
         if not isinstance(raw_item, dict):
             continue
         task_id = str(raw_item.get("id") or "").strip()
-        if task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
+        if task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
-        if not TASK_ID_RE.match(task_id) or task_id in task_ids or task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, PREFINAL_AUDIT_TASK_ID}:
+        if not TASK_ID_RE.match(task_id) or task_id in task_ids or task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID}:
             task_id = f"T{next_index:03d}"
         next_index += 1
         dependencies = [str(value).strip() for value in raw_item.get("dependencies", []) if str(value).strip()]
@@ -836,6 +829,22 @@ def decompose_tasks(
     normalized_items = resolved_items
     if include_shared_foundation:
         normalized_items = _collapse_shared_foundation_tasks(normalized_items)
+    frontend_api_audit_needed = needs_frontend_api_audit(project_root, normalized_items)
+    if frontend_api_audit_needed:
+        frontend_api_audit_dependencies = [task.id for task in normalized_items if task.id not in {FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}]
+        normalized_items.append(
+            Task(
+                id=FRONTEND_API_AUDIT_TASK_ID,
+                title="Frontend API integration audit",
+                status="pending",
+                requirements=[],
+                acceptance_scenarios=[],
+                dependencies=frontend_api_audit_dependencies,
+                output_tests=list(FRONTEND_API_AUDIT_OUTPUT_TESTS),
+                output_paths=list(FRONTEND_API_AUDIT_OUTPUT_PATHS),
+                task_kind="audit",
+            )
+        )
     audit_dependencies = [task.id for task in normalized_items if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}]
     normalized_items.append(
         Task(

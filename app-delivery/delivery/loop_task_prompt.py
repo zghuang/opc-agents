@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from .requirements_context import format_acceptance_context, format_requirement_context
 from .runtime_config import load_project_metadata
 from .state import load_gates, load_test_results, project_paths
-from .task import PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, Task, lint_task_contract
+from .builtin_task_prompts import render_frontend_api_audit_prompt, render_prefinal_audit_prompt
+from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
+from .task import Task, lint_task_contract
 
 
 def _prompt_dir(project_root: Path | str) -> Path:
@@ -93,7 +96,48 @@ def _has_browser_style_test(task: Task) -> bool:
     return False
 
 
-def _relevant_dependency_hints(project_root: Path | str, task: Task) -> list[dict[str, str]]:
+def _dependency_hint_tokens(name: str) -> list[str]:
+    return [token for token in re.split(r"[^A-Za-z0-9]+", str(name or "").casefold()) if len(token) >= 3]
+
+
+def _task_hint_context(task: Task, requirement_context: list[str], acceptance_context: list[str]) -> str:
+    parts = [
+        task.title,
+        " ".join(task.requirements),
+        " ".join(task.acceptance_scenarios),
+        " ".join(task.output_paths),
+        " ".join(task.output_tests),
+        " ".join(requirement_context),
+        " ".join(acceptance_context),
+    ]
+    return "\n".join(parts).casefold()
+
+
+def _task_touches_manifest_for_ecosystem(task: Task, ecosystem: str) -> bool:
+    paths = set(task.output_paths)
+    if ecosystem == "backend":
+        return bool(paths.intersection({"backend/pyproject.toml", "backend/uv.lock"}))
+    if ecosystem == "frontend":
+        return bool(paths.intersection({"frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}))
+    if ecosystem in {"infra", "project"}:
+        return any(path in paths for path in {"docker-compose.yml", "README.md"})
+    return False
+
+
+def _dependency_hint_relevant(task: Task, hint: dict[str, str], context: str) -> bool:
+    ecosystem = str(hint.get("ecosystem") or "project").strip().lower() or "project"
+    if _task_touches_manifest_for_ecosystem(task, ecosystem):
+        return True
+    name = str(hint.get("name") or "").strip()
+    if not name:
+        return False
+    if name.casefold() in context:
+        return True
+    tokens = _dependency_hint_tokens(name)
+    return bool(tokens) and any(token in context for token in tokens)
+
+
+def _relevant_dependency_hints(project_root: Path | str, task: Task, requirement_context: list[str] | None = None, acceptance_context: list[str] | None = None) -> list[dict[str, str]]:
     metadata = load_project_metadata(project_root)
     raw_hints = metadata.get("dependency_hints") if isinstance(metadata.get("dependency_hints"), list) else []
     ecosystems = {"project"}
@@ -111,19 +155,46 @@ def _relevant_dependency_hints(project_root: Path | str, task: Task) -> list[dic
         name = str(row.get("name") or "").strip()
         if not name:
             continue
-        result.append(
-            {
-                "ecosystem": ecosystem,
-                "name": name,
-                "reason": str(row.get("reason") or "").strip(),
-            }
-        )
+        hint = {
+            "ecosystem": ecosystem,
+            "name": name,
+            "reason": str(row.get("reason") or "").strip(),
+            "source": str(row.get("source") or "").strip(),
+            "evidence": str(row.get("evidence") or "").strip(),
+        }
+        context = _task_hint_context(task, requirement_context or [], acceptance_context or [])
+        if _dependency_hint_relevant(task, hint, context):
+            result.append(hint)
     return result
 
 
+def _append_dependency_hint_section(lines: list[str], dependency_hints: list[dict[str, str]]) -> None:
+    if not dependency_hints:
+        return
+    lines.append("Project technology constraints for this task:")
+    for hint in dependency_hints:
+        suffix = ""
+        evidence = str(hint.get("evidence") or "").strip()
+        source = str(hint.get("source") or "").strip()
+        if evidence or source:
+            suffix = f" [{'; '.join(part for part in [source, evidence] if part)}]"
+        reason = str(hint.get("reason") or "").strip() or "Required by project planning artifacts."
+        lines.append(f"- {hint['name']} ({hint['ecosystem']}): {reason}{suffix}")
+    lines.append("- Treat the listed technologies as task requirements unless an existing ADR or clarification explicitly supersedes them; do not replace them with custom implementations silently.")
+    lines.append("")
+
+
 def build_task_prompt(project_root: Path | str, task: Task) -> str:
+    if task.id == FRONTEND_API_AUDIT_TASK_ID:
+        prompt = render_frontend_api_audit_prompt(project_root, task)
+        write_task_prompt(project_root, task, prompt)
+        return prompt
     if task.id == PREFINAL_AUDIT_TASK_ID:
-        return build_prefinal_audit_prompt(project_root, task)
+        prompt = render_prefinal_audit_prompt(project_root, task)
+        write_task_prompt(project_root, task, prompt)
+        return prompt
+    if task.task_kind == "validation":
+        return build_validation_task_prompt(project_root, task)
     project_dir = Path(project_root).expanduser().resolve()
     test_results = load_test_results(project_dir)
     failed_summary = []
@@ -141,18 +212,22 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         lines.append(f"Requirements: {', '.join(task.requirements)}")
         lines.append("")
         lines.append("Requirement details:")
-        lines.extend(format_requirement_context(project_root, task.requirements) or ["- none"]) 
+        requirement_context = format_requirement_context(project_root, task.requirements) or []
+        lines.extend(requirement_context or ["- none"]) 
         lines.append("")
+    else:
+        requirement_context = []
     if task.acceptance_scenarios:
         lines.append(f"Acceptance scenarios: {', '.join(task.acceptance_scenarios)}")
         lines.append("")
         lines.append("Acceptance scenario details:")
-        lines.extend(format_acceptance_context(project_root, task.acceptance_scenarios) or ["- none"])
+        acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
+        lines.extend(acceptance_context or ["- none"])
         lines.append("")
-    dependency_hints = _relevant_dependency_hints(project_root, task)
-    if dependency_hints:
-        lines.append("Project metadata declares technology constraints relevant to this task. If the requirement explicitly mandates a package, component library, or framework family, use it instead of silently leaving declared dependencies unused.")
-        lines.append("")
+    else:
+        acceptance_context = []
+    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
+    _append_dependency_hint_section(lines, dependency_hints)
     if task.output_paths:
         lines.append(f"Paths: {', '.join(task.output_paths)}")
         lines.append("")
@@ -194,6 +269,11 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         else:
             lines.append("- Repair the cited review issues before re-running validation.")
         lines.append("")
+    elif task.task_kind == "repair" and task.blocked_reason:
+        lines.append("Repair context:")
+        lines.append(f"- {task.blocked_reason}")
+        lines.append("- Start from the failed validation evidence and the declared tests below; do not broaden into unrelated product work.")
+        lines.append("")
     has_backend_specs = any(spec.startswith("backend/") for spec in task.output_tests)
     has_frontend_specs = any(spec.startswith("frontend/") for spec in task.output_tests)
     has_frontend_paths = any(path.startswith("frontend/") for path in task.output_paths)
@@ -221,75 +301,108 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
     return prompt
 
 
-def build_prefinal_audit_prompt(project_root: Path | str, task: Task) -> str:
+def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
     project_dir = Path(project_root).expanduser().resolve()
+    test_results = load_test_results(project_dir)
+    failed_summary = []
+    for row in _relevant_failed_results(task, test_results):
+        failed_summary.append(f"- {row.get('task_id')}: {row.get('test_files')} -> {row.get('failed_count')} failed")
+    contract_lint = lint_task_contract(task)
+    gate_rows = _relevant_gate_rows(project_root, task)
     lines = [
         f"## Task {task.id}: {task.title}",
         "",
         f"Project path: {project_dir}",
         "",
-        "You are running a final pre-release system audit for the current repository state.",
-        "This is a new runtime session: do not rely on hidden conversation history. Base conclusions on the files and evidence present in this project directory.",
-        "",
-        "Mission:",
-        "- Read the original requirements, the normalized requirements, any requirement clarification or conflict-resolution decisions, and the current system source code.",
-        "- Compare implemented behavior against those requirement sources. Use other project docs, ledgers, reviews, and test evidence only as supporting evidence, not as replacements for the requirement sources.",
-        "- Fix release-relevant gaps, incorrect implementations, broken flows, or missing validation evidence that can be responsibly fixed inside this task.",
-        f"- Write a detailed audit report to `{PREFINAL_AUDIT_REPORT_PATH}`.",
-        "",
-        "Authoritative inputs to inspect:",
-        "- docs/requirements-source.md",
-        "- docs/requirements.json",
-        "- docs/clarification-needed.md, docs/clarification-answers.md, or equivalent clarification files, if present",
-        "- docs/adr/, docs/adrs/, or equivalent decision/conflict-resolution records, if they clarify or supersede requirements",
-        "",
-        "Supporting evidence to consult as needed:",
-        "- docs/work-items.json, docs/test-plan.json, docs/gates.json, and docs/reviews/",
-        "- architecture, UI, module, or design documents only when they help interpret requirements or explain implementation intent",
-        "",
-        "Code surfaces to inspect:",
-        "- Inspect the full application source tree for this project, including production code, tests, fixtures/mocks, integration adapters, UI code if present, configuration, manifests, and app-owned scripts.",
-        "- Adapt to the repository's actual stack and layout; do not assume Python, React, backend/frontend folders, or mock-server folders exist.",
-        "- Ignore dependency/vendor/build/runtime noise unless it is directly relevant to a requirement or failing behavior.",
-        "",
-        "Audit rules:",
-        "- Do not trust task status, green tests, route existence, or intermediate review summaries as proof of full requirement satisfaction; use them as evidence only.",
-        "- Do not mark a requirement as satisfied merely because scaffolding, stubs, shared wiring, or placeholders exist. Require evidence of the actual owned behavior.",
-        "- Distinguish complete behavior from partial support, deferred behavior, missing behavior, and incorrect behavior.",
-        "- If a user-visible flow is claimed complete, inspect the real user-facing behavior and appropriate end-to-end evidence for this stack.",
-        "- If an integration, workflow, background job, data pipeline, or agent capability is claimed complete, inspect the real code path, contracts, fallback behavior, evidence model, and tests.",
-        "- If you find a gap that can be fixed without inventing new product scope, fix it and add or strengthen relevant validation.",
-        "- If a gap requires major product reinterpretation or external clarification, document it as a blocker instead of hiding it behind a partial fix.",
-        "",
-        "Scope authority:",
-        "- This task has project-wide scope for release-correctness fixes inside the target application project.",
-        "- Do not rewrite unrelated code for style, architecture preference, or polish unless it is necessary to close a concrete release gap.",
-        "",
-        "Validation rules:",
-        "- Do not run the full release suite here. The framework will run exhaustive final verification after this audit task is reviewed.",
-        "- For fixes made in this task, run focused repository-native validations that are strong enough to prove the fix did not break the touched area.",
-        "- Prefer targeted unit, component, contract, or integration tests near the changed code. If a failing test is itself stale or incorrect, repair the test and explain why in the report.",
-        "- Run browser/end-to-end checks only when the audit fix changes a user-facing flow or when no lighter validation can credibly prove the behavior.",
-        "- Record every validation command and result in the audit report. If a broader validation is deferred to final verification, say so explicitly.",
-        "",
-        f"Required report: `{PREFINAL_AUDIT_REPORT_PATH}`",
-        "The report must contain these markdown sections exactly:",
-        "- # System Audit",
-        "- ## Audit Scope",
-        "- ## Executive Verdict",
-        "- ## Fixed Issues",
-        "- ## Remaining Gaps / Blockers",
-        "- ## Requirement Gap Matrix",
-        "- ## Validation Summary",
-        "- ## Changed Files",
-        "- ## Final Recommendation",
-        "",
-        "Completion rules:",
-        f"- `{PREFINAL_AUDIT_REPORT_PATH}` must exist and be fully populated before stopping.",
-        "- If you changed code, tests, config, or mocks, include those files and validation evidence in the report.",
-        "- Stop only when all responsibly fixable release gaps are fixed and reported, or when remaining blockers are explicitly documented.",
-        "- When this task is complete, blocked, or ready for review, stop and let the framework route the next step.",
     ]
+    if task.requirements:
+        lines.append(f"Requirements: {', '.join(task.requirements)}")
+        lines.append("")
+        lines.append("Requirement details:")
+        requirement_context = format_requirement_context(project_root, task.requirements) or []
+        lines.extend(requirement_context or ["- none"])
+        lines.append("")
+    else:
+        requirement_context = []
+    if task.acceptance_scenarios:
+        lines.append(f"Acceptance scenarios: {', '.join(task.acceptance_scenarios)}")
+        lines.append("")
+        lines.append("Acceptance scenario details:")
+        acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
+        lines.extend(acceptance_context or ["- none"])
+        lines.append("")
+    else:
+        acceptance_context = []
+    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
+    _append_dependency_hint_section(lines, dependency_hints)
+    if task.output_paths:
+        lines.append(f"Paths: {', '.join(task.output_paths)}")
+        lines.append("")
+    if task.output_tests:
+        lines.append(f"Tests: {', '.join(task.output_tests)}")
+        lines.append("")
+    if contract_lint["warnings"]:
+        lines.append("Task contract warnings:")
+        for warning in contract_lint["warnings"]:
+            lines.append(f"- {warning}")
+        lines.append("")
+    if failed_summary:
+        lines.append("Relevant recent failing test summary:")
+        lines.extend(failed_summary)
+        lines.append("")
+    if gate_rows:
+        lines.append("Related gate requirements:")
+        for gate in gate_rows:
+            required = ", ".join(str(value).strip() for value in gate.get("required_test_types", []) if str(value).strip()) or "none"
+            observed = ", ".join(str(value).strip() for value in gate.get("observed_test_types", []) if str(value).strip()) or "none"
+            missing = ", ".join(str(value).strip() for value in gate.get("missing_test_types", []) if str(value).strip()) or "none"
+            reason = str(gate.get("blocked_reason") or "").strip() or str(gate.get("status") or "").strip() or "gate requirements outstanding"
+            report_artifact = str(gate.get("report_artifact") or "").strip() or "none"
+            lines.append(
+                f"- {str(gate.get('id') or '-').strip()}: status={str(gate.get('status') or '-').strip()} required={required} observed={observed} missing={missing} reason={reason} report={report_artifact}"
+            )
+        lines.append("")
+    if str(task.review_status or "").strip().casefold() == "changes_requested":
+        lines.append("Previous independent code review requested changes:")
+        if task.blocked_reason:
+            lines.append(f"- Review summary: {task.blocked_reason}")
+        if task.review_artifact:
+            lines.append(f"- Review artifact: {task.review_artifact}")
+            lines.append("- Read that artifact and repair the cited issues before re-running validation.")
+        else:
+            lines.append("- Repair the cited review issues before re-running validation.")
+        lines.append("")
+
+    has_backend_specs = any(spec.startswith("backend/") for spec in task.output_tests)
+    has_frontend_specs = any(spec.startswith("frontend/") for spec in task.output_tests)
+    has_frontend_paths = any(path.startswith("frontend/") for path in task.output_paths)
+    has_browser_specs = _has_browser_style_test(task)
+
+    lines.append("Validation task mission:")
+    lines.append("- This is a validation task. Your primary responsibility is to complete or strengthen the declared validation assets for the requirements and acceptance scenarios above.")
+    lines.append("- After this runtime turn, the app-delivery control loop will deterministically execute the declared Tests. Treat those Tests as contractual validation entrypoints, not optional examples.")
+    lines.append("- Make sure every declared test path or command exists, is runnable in this repository, and produces meaningful evidence for the owned scenarios.")
+    lines.append("- Prefer improving or adding acceptance tests, end-to-end tests, fixtures, scenario data, and test helpers before changing product code.")
+    lines.append("- If a declared scenario cannot be validated truthfully without a small supporting implementation fix, apply the minimal code change required to enable the validation and keep it tightly scoped.")
+    lines.append("- Do not turn this task into broad new product implementation that belongs to upstream feature tasks.")
+    lines.append("")
+    lines.append("Execution guidance:")
+    lines.append("- Use the declared Paths and Tests as the main scope and delivery contract for this task.")
+    lines.append("- Treat passing tests as necessary but not sufficient. Do not stop if the declared acceptance scenarios are still not directly represented by executable validation.")
+    lines.append("- If existing tests are weak, incomplete, missing fixtures, or not executable, fix them in this task.")
+    lines.append("- If a scenario remains unprovable without broad new product work, stop and surface the blocker instead of faking coverage.")
+    if task.acceptance_scenarios:
+        lines.append("- Each declared acceptance scenario should map to at least one concrete validation path, assertion set, or explicitly documented coverage route in this task.")
+    if has_frontend_paths or any(str(value).strip().startswith("frontend/") for value in task.output_tests):
+        lines.append("- This task owns frontend-facing validation coverage. Keep browser/e2e checks explicit for user-visible flows rather than relying only on unit tests.")
+        if not has_browser_specs:
+            lines.append("- No browser/e2e test is currently declared for the frontend-facing scenarios in this validation task. Add one unless the task contract is explicitly wrong and must be corrected upstream.")
+    lines.append("- Complete only the current task. Do not start the next task, pre-implement future work, or widen scope after this task's declared tests pass.")
+    if has_backend_specs:
+        lines.append("- Backend validation: prefer package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`, using the repository environment rather than bare system python.")
+    if has_frontend_specs:
+        lines.append("- Frontend validation: prefer the scripts declared in `frontend/package.json` (`npm run test`, `typecheck`, `lint`, `build`, `e2e`) instead of custom one-off commands.")
+    lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
     prompt = "\n".join(lines)
     write_task_prompt(project_root, task, prompt)
     return prompt

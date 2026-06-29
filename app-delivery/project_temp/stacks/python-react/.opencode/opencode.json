@@ -4,7 +4,6 @@
   "default_agent": "build",
   "instructions": [
     "AGENTS.md",
-    "CODE_MAP.md",
     "frontend/FRONTEND-RULES.md"
   ],
   "plugin": [

@@ -68,7 +68,6 @@ def context_ready(project_root: Path) -> bool:
     context_file = root_context_filename(project_runtime)
     return (
         file_has_content(project_root / context_file)
-        and file_has_content(project_root / "CODE_MAP.md")
         and isinstance(test_plan, dict)
         and isinstance(test_plan.get("coverage"), list)
     )

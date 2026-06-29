@@ -35,7 +35,7 @@ STAGE_METADATA: dict[str, dict[str, Any]] = {
     "project-context-sync": {
         "missing_code": "context_missing",
         "required_skill": "project-context-sync",
-        "expected_outputs": ["CODE_MAP.md", "docs/test-plan.json"],
+        "expected_outputs": ["docs/test-plan.json"],
     },
     "task-decompose": {
         "missing_code": "work_items_missing",
@@ -53,8 +53,6 @@ STAGE_CLI_COMMANDS: dict[str, str] = {
 }
 
 MODULE_ARCHITECTURE_HEADING_RE = re.compile(r"^##+\s+(?:\d+\.\s*)?(?:Module Architecture|模块架构)\s*$", re.IGNORECASE | re.MULTILINE)
-FENCED_BLOCK_RE = re.compile(r"```(?:text|plaintext|txt)?\n(?P<body>.*?)\n```", re.DOTALL | re.IGNORECASE)
-CODE_MAP_SECTION_RE = re.compile(r"^##+\s+(?P<title>.+?)\s*$")
 
 
 def _runtime_context_baseline(runtime: str) -> str:
@@ -67,8 +65,7 @@ def _runtime_context_baseline(runtime: str) -> str:
             "",
             "### Session Startup Order",
             "1. Read this file for project-level rules that always apply.",
-            "2. Use CODE_MAP.md as navigation, not as the source of behavior truth.",
-            "3. Read only the relevant source docs for the current task.",
+            "2. Read only the relevant source docs for the current task.",
             "",
             "### Source of Truth",
             "- docs/requirements-source.md is the raw requirements record and the business source of truth.",
@@ -120,98 +117,6 @@ def _validate_architecture_markdown(input_path: Path, architecture_md: str) -> N
             input_path,
             "arch-design Module Architecture section must include a fenced code block showing the repository/module tree",
         )
-
-
-def _extract_module_architecture_tree(architecture_text: str) -> str:
-    match = MODULE_ARCHITECTURE_HEADING_RE.search(str(architecture_text or ""))
-    if not match:
-        return ""
-    section = str(architecture_text or "")[match.end() :]
-    fenced = FENCED_BLOCK_RE.search(section)
-    if not fenced:
-        return ""
-    return str(fenced.group("body") or "").strip()
-
-
-def _code_map_title(text: str, project_root: Path) -> str:
-    for line in str(text or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("# "):
-            return stripped
-        break
-    return f"# CODE_MAP.md — {project_root.name}"
-
-
-def _strip_generated_code_map_sections(text: str) -> str:
-    lines = str(text or "").splitlines()
-    result: list[str] = []
-    index = 0
-    generated_titles = {"project root", "project structure", "current project structure", "planned module structure"}
-    while index < len(lines):
-        line = lines[index]
-        match = CODE_MAP_SECTION_RE.match(line.strip())
-        if match:
-            title = str(match.group("title") or "").strip().casefold()
-            if title in generated_titles:
-                index += 1
-                while index < len(lines) and not CODE_MAP_SECTION_RE.match(lines[index].strip()):
-                    index += 1
-                continue
-        result.append(line)
-        index += 1
-    body = "\n".join(result).strip()
-    if body.startswith("# "):
-        body = "\n".join(body.splitlines()[1:]).strip()
-    return body
-
-
-def _top_level_project_roots(project_root: Path) -> list[str]:
-    structure_path = project_root / "docs" / "project-structure.md"
-    if not structure_path.exists():
-        return []
-    roots: list[str] = []
-    for raw_line in structure_path.read_text(encoding="utf-8").splitlines():
-        if not raw_line.startswith("- "):
-            continue
-        roots.append(raw_line[2:].strip())
-    return roots
-
-
-def _build_code_map_markdown(project_root: Path, authored_code_map: str) -> str:
-    title = _code_map_title(authored_code_map, project_root)
-    authored_body = _strip_generated_code_map_sections(authored_code_map)
-    architecture_path = project_root / "docs" / "architecture.md"
-    planned_tree = ""
-    if architecture_path.exists():
-        planned_tree = _extract_module_architecture_tree(architecture_path.read_text(encoding="utf-8"))
-    roots = _top_level_project_roots(project_root)
-    lines = [
-        title,
-        "",
-        "## Current Project Structure",
-        "",
-        "- Source of truth for the current filesystem layout: `docs/project-structure.md` (machine-generated).",
-    ]
-    if roots:
-        lines.append("- Current top-level roots: " + ", ".join(f"`{root}`" for root in roots) + ".")
-    else:
-        lines.append("- Current top-level roots are unavailable because `docs/project-structure.md` has not been generated yet.")
-    lines.extend([
-        "- Do not hand-maintain a separate root tree in this file; the harness owns that view to keep it aligned with the filesystem.",
-        "",
-        "## Planned Module Structure",
-        "",
-        "- Source of truth for the intended target structure: `docs/architecture.md` -> `Module Architecture`.",
-    ])
-    if planned_tree:
-        lines.extend(["", "```text", planned_tree, "```"])
-    else:
-        lines.extend(["", "- No planned module tree is currently available in `docs/architecture.md`."])
-    if authored_body:
-        lines.extend(["", authored_body])
-    return "\n".join(lines).rstrip() + "\n"
 
 
 def _persist_stage_input(project_root: Path | str, stage_name: str, payload: Any) -> Path:
@@ -420,8 +325,6 @@ def import_ui_design(project_root: Path | str, payload: dict[str, Any], input_pa
 
 
 def import_context_sync(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
-    if not isinstance(payload.get("code_map_md"), str):
-        raise _shape_error("project-context-sync", input_path, "context-sync payload must contain string field code_map_md")
     if not isinstance(payload.get("test_plan"), dict):
         raise _shape_error("project-context-sync", input_path, "context-sync payload must contain a test_plan object")
     project_root = Path(project_root).expanduser().resolve()
@@ -435,7 +338,6 @@ def import_context_sync(project_root: Path | str, payload: dict[str, Any], input
         raise _shape_error("project-context-sync", input_path, f"context-sync payload must contain string field {context_key} for runtime {runtime}")
     merged_context = _merge_runtime_context(runtime, context_text)
     project_root.joinpath(context_file).write_text(merged_context, encoding="utf-8")
-    project_root.joinpath("CODE_MAP.md").write_text(_build_code_map_markdown(project_root, str(payload.get("code_map_md") or "")), encoding="utf-8")
     save_test_plan(project_root, payload.get("test_plan") or {"schema_version": "1", "generated_at": utc_now_iso(), "coverage": []})
     return 0
 

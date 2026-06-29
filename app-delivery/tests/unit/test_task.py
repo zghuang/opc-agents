@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from delivery.builtin_tasks import FINAL_VERIFY_TASK_ID, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from delivery.state import save_gates, save_test_plan, save_test_results, save_work_items
 from delivery.task import Task, check_requirements_coverage, check_test_type_coverage, decompose_tasks, lint_task_contract, mark_task, pick_next_task, referenced_req_ids, reset_task
 from delivery.gates import normalize_complexity_override, normalize_stage_gates, refresh_gates, validate_validation_tasks, validate_gate_references
@@ -89,28 +90,27 @@ def test_decompose_tasks_inserts_builtin_foundations(tmp_path: Path) -> None:
     )
     ids = [item["id"] for item in payload["items"]]
     assert ids[:3] == ["T000", "T001", "T002"]
-    assert ids[-1] == "T-FINAL"
-    assert payload["items"][-1]["dependencies"] == ["T000", "T001", "T002"]
+    assert payload["items"][0]["title"] == "Scaffold"
+    assert payload["items"][1]["title"] == "Shared foundation"
+    assert ids[-2:] == [PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID]
+    by_id = {item["id"]: item for item in payload["items"]}
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
+    assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == [PREFINAL_AUDIT_TASK_ID]
     assert payload["items"][1]["output_paths"] == [
         "backend/pyproject.toml",
         "backend/uv.lock",
-        "backend/conftest.py",
         "backend/src/main.py",
-        "backend/src/core/",
-        "backend/src/shared/",
+        "backend/src/runtime/",
         "backend/src/tests/",
-        "backend/tests/core/",
         "frontend/package.json",
         "frontend/package-lock.json",
         "frontend/pnpm-lock.yaml",
         "frontend/yarn.lock",
-        "frontend/src/shared/",
         "frontend/src/lib/",
-        "frontend/src/layouts/",
-        "frontend/src/components/feedback/",
         "frontend/src/styles/",
         "frontend/src/App.tsx",
         "frontend/src/App.test.tsx",
+        "frontend/e2e/",
     ]
 
 
@@ -139,9 +139,83 @@ def test_decompose_tasks_ignores_replayed_builtin_items(tmp_path: Path) -> None:
     )
 
     ids = [item["id"] for item in payload["items"]]
-    assert ids == ["T000", "T001", "T002", "T-FINAL"]
-    assert payload["items"][2]["title"] == "Feature"
-    assert payload["items"][-1]["dependencies"] == ["T000", "T001", "T002"]
+    assert ids == ["T000", "T001", "T002", PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID]
+    by_id = {item["id"]: item for item in payload["items"]}
+    assert by_id["T002"]["title"] == "Feature"
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
+    assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == [PREFINAL_AUDIT_TASK_ID]
+
+
+def test_decompose_tasks_does_not_insert_frontend_api_audit_for_frontend_only_scope(tmp_path: Path) -> None:
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Static marketing page",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": ["AS-001"],
+                "output_tests": ["frontend/e2e/static-page.spec.ts"],
+                "output_paths": ["frontend/src/pages/StaticPage.tsx", "frontend/src/api/client.ts"],
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    ids = [item["id"] for item in payload["items"]]
+
+    assert FRONTEND_API_AUDIT_TASK_ID not in ids
+    assert ids[-2:] == [PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID]
+
+
+def test_decompose_tasks_inserts_frontend_api_audit_for_python_react_stack(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(json.dumps({"stack": "python-react"}), encoding="utf-8")
+
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Incident workspace UI",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": ["AS-001"],
+                "output_tests": ["frontend/e2e/incident.spec.ts"],
+                "output_paths": ["frontend/src/pages/IncidentWorkspace.tsx"],
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    by_id = {item["id"]: item for item in payload["items"]}
+
+    assert FRONTEND_API_AUDIT_TASK_ID in by_id
+    assert by_id[FRONTEND_API_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002", FRONTEND_API_AUDIT_TASK_ID]
+
+
+def test_decompose_tasks_inserts_frontend_api_audit_for_frontend_with_backend_api_scope(tmp_path: Path) -> None:
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Incident workspace",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": ["AS-001"],
+                "output_tests": ["frontend/e2e/incident-flow.spec.ts", "backend/tests/test_api/test_incidents.py"],
+                "output_paths": ["frontend/src/pages/IncidentWorkspace.tsx", "backend/src/api/incidents.py"],
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    by_id = {item["id"]: item for item in payload["items"]}
+
+    assert FRONTEND_API_AUDIT_TASK_ID in by_id
+    assert by_id[FRONTEND_API_AUDIT_TASK_ID]["task_kind"] == "audit"
+    assert by_id[FRONTEND_API_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
+    assert by_id[FRONTEND_API_AUDIT_TASK_ID]["output_paths"][-1] == FRONTEND_API_AUDIT_REPORT_PATH
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002", FRONTEND_API_AUDIT_TASK_ID]
+    assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == [PREFINAL_AUDIT_TASK_ID]
 
 
 def test_decompose_tasks_normalizes_backend_app_contract_paths(tmp_path: Path) -> None:
@@ -879,7 +953,7 @@ def test_all_tasks_normalizes_existing_t001_contract(tmp_path: Path) -> None:
             "last_updated_commit": "",
             "items": [
                 {"id": "T000", "title": "脚手架", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/"]},
-                {"id": "T001", "title": "共享基础设施", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/core/"]},
+                {"id": "T001", "title": "共享基础设施", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/main.py"]},
             ],
         },
     )
@@ -888,12 +962,14 @@ def test_all_tasks_normalizes_existing_t001_contract(tmp_path: Path) -> None:
 
     assert "backend/src/main.py" in tasks["T001"].output_paths
     assert "backend/pyproject.toml" in tasks["T001"].output_paths
+    assert "backend/src/runtime/" in tasks["T001"].output_paths
     assert "frontend/src/App.tsx" in tasks["T001"].output_paths
     assert "frontend/package-lock.json" in tasks["T001"].output_paths
     assert "frontend/pnpm-lock.yaml" in tasks["T001"].output_paths
-    assert "frontend/src/components/feedback/" in tasks["T001"].output_paths
-    assert "backend/tests/core/" in tasks["T001"].output_tests
+    assert "frontend/e2e/" in tasks["T001"].output_paths
+    assert "backend/tests/core/" not in tasks["T001"].output_tests
     assert "backend/src/tests/test_health.py" in tasks["T001"].output_tests
+    assert "backend/src/tests/test_database.py" in tasks["T001"].output_tests
     assert "frontend/src/App.test.tsx" in tasks["T001"].output_tests
 
 
