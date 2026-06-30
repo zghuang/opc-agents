@@ -50,6 +50,17 @@ def test_mark_task_sets_verified_timestamp() -> None:
     assert updated[0].verified_at is not None
 
 
+def test_mark_task_accumulates_session_history() -> None:
+    tasks = [Task("T001", "功能", "pending", [], [], [], [], [], task_kind="feature")]
+    updated = mark_task(tasks, "T001", "active", status_session_id="session-1")
+    updated = mark_task(updated, "T001", "pending", status_session_id=None)
+    updated = mark_task(updated, "T001", "active", status_session_id="session-2")
+    updated = mark_task(updated, "T001", "review_pending", status_session_id="session-2")
+
+    assert updated[0].status_session_id == "session-2"
+    assert updated[0].session_ids == ["session-1", "session-2"]
+
+
 def test_reset_task_clears_review_and_block_state() -> None:
     tasks = [
         Task(
@@ -112,6 +123,48 @@ def test_decompose_tasks_inserts_builtin_foundations(tmp_path: Path) -> None:
         "frontend/src/App.test.tsx",
         "frontend/e2e/",
     ]
+
+
+def test_decompose_tasks_preserves_normalized_task_intent(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Case workspace",
+                "requirements": ["REQ-001"],
+                "output_tests": ["backend/tests/test_case.py"],
+                "output_paths": ["backend/src/case/"],
+                "intent": {
+                    "objective": "  Enable case review.  ",
+                    "journey": "User opens a case and sees current state.",
+                    "done_when": ["Case API works", "Case API works", "Case test passes"],
+                    "non_goals": ["Do not build unrelated dashboards", ""],
+                    "ignored": "value",
+                },
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    by_id = {item["id"]: item for item in payload["items"]}
+    assert by_id["T002"]["intent"] == {
+        "objective": "Enable case review.",
+        "journey": "User opens a case and sees current state.",
+        "done_when": ["Case API works", "Case test passes"],
+        "non_goals": ["Do not build unrelated dashboards"],
+    }
 
 
 def test_decompose_tasks_ignores_replayed_builtin_items(tmp_path: Path) -> None:
@@ -256,6 +309,41 @@ def test_decompose_tasks_normalizes_backend_app_contract_paths(tmp_path: Path) -
         "backend/src/domain/models.py",
         "backend/src/main.py",
     ]
+
+
+def test_decompose_tasks_rejects_companion_mock_server_contract_paths(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        decompose_tasks(
+            tmp_path,
+            [
+                {
+                    "title": "Mock contracts",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T001"],
+                    "output_tests": ["companion/mock-server/tests/all_mock_contracts.py"],
+                    "output_paths": ["companion/mock-server/routers/erp.py"],
+                }
+            ],
+            include_shared_foundation=True,
+        )
+    except ValueError as exc:
+        assert "non-canonical mock-server paths" in str(exc)
+        assert "use project-root mock-server/..." in str(exc)
+    else:
+        raise AssertionError("expected companion/mock-server paths to be rejected")
 
 
 def test_normalize_complexity_override_requires_task_decompose_metadata() -> None:
@@ -1336,6 +1424,76 @@ def test_check_test_type_coverage_uses_test_plan_bindings(tmp_path: Path) -> Non
         },
     )
     assert check_test_type_coverage(tmp_path) == [("REQ-001", "browser")]
+
+
+def test_check_test_type_coverage_accepts_verified_gate_observed_type(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [],
+        },
+    )
+    save_test_plan(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "coverage": [{"requirement_id": "REQ-001", "test_types": ["scenario"], "suite": "backend/scenarios"}],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {"schema_version": "1", "project": "demo", "generated_at": "2026-06-24T00:00:00Z", "results": [], "full_suite_results": {}},
+    )
+    save_gates(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "gates": [
+                {
+                    "id": "GATE-scenario",
+                    "status": "verified",
+                    "scope_requirements": ["REQ-001"],
+                    "observed_test_types": ["scenario"],
+                    "required_test_types": ["scenario"],
+                }
+            ],
+        },
+    )
+
+    assert check_test_type_coverage(tmp_path) == []
+
+
+def test_check_test_type_coverage_treats_req_performance_accessibility_as_advisory(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [],
+        },
+    )
+    save_test_plan(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "coverage": [{"requirement_id": "REQ-001", "test_types": ["performance", "accessibility"], "suite": "release advisory"}],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {"schema_version": "1", "project": "demo", "generated_at": "2026-06-24T00:00:00Z", "results": [], "full_suite_results": {}},
+    )
+
+    assert check_test_type_coverage(tmp_path) == []
 
 
 def test_check_test_type_coverage_counts_pass_review_as_review_evidence(tmp_path: Path) -> None:

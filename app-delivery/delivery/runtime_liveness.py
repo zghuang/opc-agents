@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from .state import load_task_runtime_state, process_alive, utc_now_iso
-from .task import FINAL_VERIFY_TASK_ID, Task
+from .task import FINAL_VERIFY_TASK_ID, Task, all_tasks
 
 
 DEFAULT_ATTENTION_SECONDS = 600
 DEFAULT_HARD_STALL_SECONDS = 900
+DEFAULT_AUDIT_HARD_STALL_SECONDS = 1500
 DEFAULT_READ_ONLY_STREAK = 20
 SOURCE_ROOTS = ("backend/src", "frontend/src", "mock-server")
 IGNORED_PARTS = {".app-delivery-runtime", ".git", "node_modules", ".venv", "__pycache__"}
@@ -65,6 +67,22 @@ def _positive_pids(runtime_state: dict[str, Any]) -> list[int]:
 def any_runtime_pid_alive(runtime_state: dict[str, Any]) -> bool:
     pids = _positive_pids(runtime_state)
     return bool(pids) and any(process_alive(pid) for pid in pids)
+
+
+def hard_stall_threshold_for_task(project_root: Path | str, task_id: str) -> int:
+    override = os.environ.get("APP_DELIVERY_RUNTIME_HARD_STALL_SECONDS")
+    if override:
+        return int(override)
+    normalized_task_id = str(task_id or "").strip()
+    if normalized_task_id in {FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID}:
+        return DEFAULT_AUDIT_HARD_STALL_SECONDS
+    try:
+        task = next((row for row in all_tasks(project_root) if row.id == normalized_task_id), None)
+    except Exception:
+        task = None
+    if task is not None and task.task_kind == "audit":
+        return DEFAULT_AUDIT_HARD_STALL_SECONDS
+    return DEFAULT_HARD_STALL_SECONDS
 
 
 def _path_is_interesting(path: Path) -> bool:
@@ -226,7 +244,7 @@ def wrapper_should_interrupt(
     now_monotonic: float,
     threshold_seconds: int | None = None,
 ) -> RuntimeLiveness:
-    threshold = threshold_seconds or int(os.environ.get("APP_DELIVERY_RUNTIME_HARD_STALL_SECONDS") or DEFAULT_HARD_STALL_SECONDS)
+    threshold = int(threshold_seconds) if threshold_seconds is not None else hard_stall_threshold_for_task(project_root, task_id)
     elapsed = int(max(0, now_monotonic - started_monotonic))
     if elapsed < threshold:
         return RuntimeLiveness(False, "running", "runtime is below the hard stall threshold", {"elapsed_seconds": elapsed})

@@ -483,9 +483,43 @@ def restore_paths_to_head(project_root: Path | str, paths: list[str]) -> list[st
     return normalized_paths
 
 
+def _filter_git_pathspecs_for_snapshot(project_dir: Path, paths: list[str]) -> list[str]:
+    normalized_paths = [_normalize_scope_path(path) for path in paths if _normalize_scope_path(path)]
+    if not normalized_paths:
+        return []
+    head_paths = _git_paths_in_head(project_dir, normalized_paths)
+    index_paths = _git_paths_in_index(project_dir, normalized_paths)
+    status_by_path = {path: status for status, path in git_status_entries(project_dir)}
+    keep: list[str] = []
+    remove_cached: list[str] = []
+    restore_framework_deletions: list[str] = []
+    for path in normalized_paths:
+        file_path = project_dir / path
+        status = status_by_path.get(path, "  ")
+        if status[:1] == "D" and not file_path.exists() and not file_path.is_symlink():
+            if path in head_paths and _is_always_allowed_framework_path(path):
+                restore_framework_deletions.append(path)
+            continue
+        if file_path.exists() or file_path.is_symlink() or path in head_paths:
+            keep.append(path)
+            continue
+        if path in index_paths:
+            remove_cached.append(path)
+    if restore_framework_deletions:
+        restore_result = git(["restore", "--staged", "--worktree", "--source=HEAD", "--", *restore_framework_deletions], cwd=project_dir)
+        if restore_result.returncode != 0:
+            raise RuntimeError(restore_result.stdout.strip() or "git restore failed while pruning stale framework deletion paths")
+    if remove_cached:
+        remove_cached_result = git(["rm", "--cached", "-f", "--", *remove_cached], cwd=project_dir)
+        if remove_cached_result.returncode != 0:
+            raise RuntimeError(remove_cached_result.stdout.strip() or "git rm --cached failed while pruning stale snapshot paths")
+    return keep
+
+
 def park_task_exception_changes(project_root: Path | str, task: Task) -> str | None:
     project_dir = Path(project_root).expanduser().resolve()
     scoped_paths = task_scoped_changed_paths(project_dir, task)
+    scoped_paths = _filter_git_pathspecs_for_snapshot(project_dir, scoped_paths)
     patch_path = task_exception_patch_path(project_dir, task.id)
     patch_path.parent.mkdir(parents=True, exist_ok=True)
     if not scoped_paths:
@@ -559,6 +593,7 @@ def git_stage_task_snapshot(
     if out_of_scope:
         raise RuntimeError(f"task produced out-of-scope changes: {', '.join(out_of_scope)}")
     staged_paths = report["staged_paths"]
+    staged_paths = _filter_git_pathspecs_for_snapshot(project_dir, staged_paths)
     if staged_paths:
         add_result = git(["add", "--", *staged_paths], cwd=project_dir)
         if add_result.returncode != 0:
@@ -601,6 +636,7 @@ def git_commit_explicit_paths(project_root: Path | str, paths: list[str], messag
             continue
         seen.add(path)
         deduped.append(path)
+    deduped = _filter_git_pathspecs_for_snapshot(project_dir, deduped)
     if deduped:
         add_result = git(["add", "--", *deduped], cwd=project_dir)
         if add_result.returncode != 0:

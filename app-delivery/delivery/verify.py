@@ -75,6 +75,15 @@ JS_EXPECT_PATTERN = re.compile(r"expect\(", re.IGNORECASE)
 TRIVIAL_PY_ASSERT_PATTERN = re.compile(r"assert\s+True\b", re.IGNORECASE)
 PY_ASSERT_PATTERN = re.compile(r"assert\b", re.IGNORECASE)
 TEST_ARTIFACT_PATTERN = re.compile(r"[A-Za-z0-9_./@+-]+(?:test|spec)\.(?:tsx|ts|jsx|js|py)")
+PLACEHOLDER_TEST_MARKERS = (
+    "placeholder test not implemented yet",
+    "test.skip(\"placeholder",
+    "test.skip('placeholder",
+    "describe.skip(\"placeholder",
+    "describe.skip('placeholder",
+    "it.skip(\"placeholder",
+    "it.skip('placeholder",
+)
 
 
 @dataclass
@@ -305,6 +314,9 @@ def weak_test_file_reason(project_root: Path | str, spec: str) -> str:
     if not path.is_file():
         return ""
     content = path.read_text(encoding="utf-8", errors="replace")
+    lowered_content = content.casefold()
+    if any(marker in lowered_content for marker in PLACEHOLDER_TEST_MARKERS):
+        return "placeholder test file: replace generated placeholder with executable behavior checks"
     significant_lines: list[str] = []
     for raw_line in content.splitlines():
         stripped = raw_line.strip()

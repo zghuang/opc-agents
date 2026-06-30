@@ -15,7 +15,7 @@ from .runtime_config import load_project_metadata
 from .runtime_config import resolve_project_root
 from .session import current_session, retire_session, save_current_session
 from .state import ensure_runtime_dirs, load_task_runtime_state, load_test_results, normalize_task_runtime_state, project_paths, save_task_runtime_state, utc_now_iso
-from .task import Task, all_tasks, mark_task, save_tasks
+from .task import Task, all_tasks, mark_task, next_generated_task_id, save_tasks
 
 
 REVIEW_SCHEMA: dict[str, Any] = {
@@ -23,7 +23,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
     "properties": {
         "status": {"type": "string"},
         "summary": {"type": "string"},
-        "findings": {"type": "array", "items": {"type": "string"}},
+        "findings": {"type": "array", "items": {"type": "object"}},
         "requirement_assessment": {
             "type": "array",
             "items": {
@@ -48,12 +48,14 @@ REVIEW_SCHEMA: dict[str, Any] = {
                 "required": ["id", "status", "notes"],
             },
         },
+        "intent_assessment": {"type": "object"},
     },
     "required": ["status", "summary", "findings"],
 }
 
 ALLOWED_REVIEW_STATUSES = {"pass", "changes_requested"}
 ALLOWED_ASSESSMENT_STATUSES = {"pass", "changes_requested"}
+ALLOWED_FINDING_SEVERITIES = {"blocking", "non_blocking"}
 REVIEW_PROMPT_NOISE_PATHS = {
     "docs/gates.json",
     "docs/test-results.json",
@@ -72,6 +74,9 @@ REVIEW_PROMPT_NOISE_PREFIXES = (
 )
 
 REVIEW_PROMPT_CHANGED_PATH_LIMIT = 12
+MAX_FINAL_REPAIR_ITERATIONS = 3
+FINAL_VERIFICATION_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
+FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
 
 
 def _requires_review_matrix(task: Task) -> bool:
@@ -93,45 +98,142 @@ def _normalize_review_matrix(
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()
     allowed = set(allowed_ids)
+    errors: list[str] = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
-            raise ValueError(f"{field_name}[{index}] must be an object")
+            errors.append(f"{field_name}[{index}] must be an object")
+            continue
+        row_errors: list[str] = []
         item_id = str(row.get("id") or "").strip()
         status = str(row.get("status") or "").strip().casefold()
         notes = str(row.get("notes") or "").strip()
         if not item_id or item_id not in allowed:
-            raise ValueError(f"{field_name} contains unknown id: {item_id or '<empty>'}")
+            errors.append(f"{field_name} contains unknown id: {item_id or '<empty>'}")
+            continue
         if item_id in seen:
-            raise ValueError(f"{field_name} contains duplicate id: {item_id}")
+            errors.append(f"{field_name} contains duplicate id: {item_id}")
+            continue
         if status not in ALLOWED_ASSESSMENT_STATUSES:
-            raise ValueError(
-                f"{field_name} status for {item_id} must be one of: {', '.join(sorted(ALLOWED_ASSESSMENT_STATUSES))}"
-            )
+            row_errors.append(f"{field_name} status for {item_id} must be one of: {', '.join(sorted(ALLOWED_ASSESSMENT_STATUSES))}")
         if not notes:
-            raise ValueError(f"{field_name} notes must be non-empty for {item_id}")
+            row_errors.append(f"{field_name} notes must be non-empty for {item_id}")
+        if row_errors:
+            errors.extend(row_errors)
+            seen.add(item_id)
+            continue
         normalized.append({"id": item_id, "status": status, "notes": notes})
         seen.add(item_id)
+    if errors:
+        raise ValueError("; ".join(errors))
     return normalized
 
 
+def _normalize_findings(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("findings must be an array")
+    normalized: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, row in enumerate(value):
+        if not isinstance(row, dict):
+            errors.append(f"findings[{index}] must be an object with fields severity, message, requirement_ids, and acceptance_ids")
+            continue
+        severity = str(row.get("severity") or "").strip().casefold()
+        message = str(row.get("message") or "").strip()
+        if severity not in ALLOWED_FINDING_SEVERITIES:
+            errors.append(f"findings[{index}].severity must be one of: {', '.join(sorted(ALLOWED_FINDING_SEVERITIES))}")
+        if not message:
+            errors.append(f"findings[{index}].message must be non-empty")
+        if severity not in ALLOWED_FINDING_SEVERITIES or not message:
+            continue
+        normalized.append(
+            {
+                "severity": severity,
+                "requirement_ids": [str(item).strip() for item in row.get("requirement_ids", []) if str(item).strip()],
+                "acceptance_ids": [str(item).strip() for item in row.get("acceptance_ids", []) if str(item).strip()],
+                "message": message,
+            }
+        )
+    if errors:
+        raise ValueError("; ".join(errors))
+    return normalized
+
+
+def _normalize_intent_assessment(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("intent_assessment must be an object when provided")
+    status = str(value.get("status") or "").strip().casefold()
+    if status not in ALLOWED_ASSESSMENT_STATUSES:
+        raise ValueError("intent_assessment.status must be pass or changes_requested")
+    missing_done_when = [str(item).strip() for item in value.get("missing_done_when", []) if str(item).strip()]
+    violated_non_goals = [str(item).strip() for item in value.get("violated_non_goals", []) if str(item).strip()]
+    if status == "pass" and (missing_done_when or violated_non_goals):
+        raise ValueError("intent_assessment.status=pass cannot include missing_done_when or violated_non_goals")
+    return {
+        "status": status,
+        "missing_done_when": missing_done_when,
+        "violated_non_goals": violated_non_goals,
+        "notes": str(value.get("notes") or "").strip(),
+    }
+
+
 def _validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str, Any]:
-    requirement_assessment = _normalize_review_matrix(
-        parsed.get("requirement_assessment"),
-        field_name="requirement_assessment",
-        allowed_ids=task.requirements,
-    )
-    acceptance_assessment = _normalize_review_matrix(
-        parsed.get("acceptance_assessment"),
-        field_name="acceptance_assessment",
-        allowed_ids=task.acceptance_scenarios,
-    )
+    errors: list[str] = []
+    try:
+        findings = _normalize_findings(parsed.get("findings"))
+    except ValueError as exc:
+        findings = []
+        errors.append(str(exc))
+    if not isinstance(parsed.get("requirement_assessment"), list):
+        errors.append("requirement_assessment must be provided as an array")
+    if not isinstance(parsed.get("acceptance_assessment"), list):
+        errors.append("acceptance_assessment must be provided as an array")
+    if task.intent and not isinstance(parsed.get("intent_assessment"), dict):
+        errors.append("intent_assessment must be provided when task intent is present")
+    try:
+        requirement_assessment = _normalize_review_matrix(
+            parsed.get("requirement_assessment"),
+            field_name="requirement_assessment",
+            allowed_ids=task.requirements,
+        )
+    except ValueError as exc:
+        requirement_assessment = []
+        errors.append(str(exc))
+    try:
+        acceptance_assessment = _normalize_review_matrix(
+            parsed.get("acceptance_assessment"),
+            field_name="acceptance_assessment",
+            allowed_ids=task.acceptance_scenarios,
+        )
+    except ValueError as exc:
+        acceptance_assessment = []
+        errors.append(str(exc))
+    try:
+        intent_assessment = _normalize_intent_assessment(parsed.get("intent_assessment"))
+    except ValueError as exc:
+        intent_assessment = None
+        errors.append(str(exc))
+    if errors:
+        raise ValueError("; ".join(error for error in errors if error))
+    parsed["findings"] = findings
     parsed["requirement_assessment"] = requirement_assessment
     parsed["acceptance_assessment"] = acceptance_assessment
+    if intent_assessment is not None:
+        parsed["intent_assessment"] = intent_assessment
 
     if str(parsed.get("status") or "").strip().casefold() != "pass":
         return parsed
-    if not _requires_review_matrix(task):
-        return parsed
+
+    blocking_findings = [
+        str(row.get("message") or "").strip()
+        for row in findings
+        if isinstance(row, dict) and str(row.get("severity") or "").strip().casefold() == "blocking"
+    ]
+    if intent_assessment is not None and str(intent_assessment.get("status") or "").strip().casefold() != "pass":
+        blocking_findings.append("intent_assessment is changes_requested")
 
     requirement_ids = {row["id"] for row in requirement_assessment}
     acceptance_ids = {row["id"] for row in acceptance_assessment}
@@ -141,17 +243,20 @@ def _validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str
     non_passing_acceptance = [row["id"] for row in acceptance_assessment if row["status"] != "pass"]
 
     problems: list[str] = []
-    if missing_requirements:
-        problems.append(f"missing requirement assessments: {', '.join(missing_requirements)}")
-    if missing_acceptance:
-        problems.append(f"missing acceptance assessments: {', '.join(missing_acceptance)}")
-    if non_passing_requirements:
-        problems.append(f"non-passing requirement assessments: {', '.join(non_passing_requirements)}")
-    if non_passing_acceptance:
-        problems.append(f"non-passing acceptance assessments: {', '.join(non_passing_acceptance)}")
+    if blocking_findings:
+        problems.append("blocking findings present: " + "; ".join(blocking_findings[:5]))
+    if _requires_review_matrix(task):
+        if missing_requirements:
+            problems.append(f"missing requirement assessments: {', '.join(missing_requirements)}")
+        if missing_acceptance:
+            problems.append(f"missing acceptance assessments: {', '.join(missing_acceptance)}")
+        if non_passing_requirements:
+            problems.append(f"non-passing requirement assessments: {', '.join(non_passing_requirements)}")
+        if non_passing_acceptance:
+            problems.append(f"non-passing acceptance assessments: {', '.join(non_passing_acceptance)}")
     if problems:
         raise ValueError(
-            "status=pass requires explicit passing review assessments for every declared requirement and acceptance scenario; "
+            "status=pass requires no blocking findings, passing intent assessment when provided, and explicit passing review assessments for every declared requirement and acceptance scenario; "
             + "; ".join(problems)
         )
     return parsed
@@ -401,8 +506,6 @@ def _parse_review_payload(text: str) -> dict[str, Any]:
             continue
         status = str(payload.get("status") or "").strip()
         summary = str(payload.get("summary") or "").strip()
-        findings_raw = payload.get("findings")
-        findings = [str(item).strip() for item in findings_raw] if isinstance(findings_raw, list) else []
         if not status or not summary:
             continue
         normalized_status = status.casefold()
@@ -411,11 +514,14 @@ def _parse_review_payload(text: str) -> dict[str, Any]:
             continue
         payload["status"] = status
         payload["summary"] = summary
-        payload["findings"] = [item for item in findings if item]
         return payload
     if saw_invalid_status:
         raise ValueError("review status must be one of: pass, changes_requested")
-    raise ValueError("reviewer did not return parseable JSON object")
+    raise ValueError(
+        "reviewer did not return parseable JSON object with required fields: "
+        "status (pass|changes_requested), summary (string), findings (array of objects with severity=blocking|non_blocking and message), "
+        "requirement_assessment (array), acceptance_assessment (array)"
+    )
 
 
 REVIEW_INPUT_DIRNAME = "review-inputs"
@@ -491,8 +597,26 @@ def build_code_review_request(
         f"Project path: {Path(project_root).expanduser().resolve()}",
         f"Task title: {task.title}",
         "",
-        "Requirement details:",
     ]
+    intent = task.intent if isinstance(task.intent, dict) else {}
+    objective = str(intent.get("objective") or "").strip()
+    journey = str(intent.get("journey") or "").strip()
+    done_when = [str(value).strip() for value in intent.get("done_when", []) if str(value).strip()]
+    non_goals = [str(value).strip() for value in intent.get("non_goals", []) if str(value).strip()]
+    if any([objective, journey, done_when, non_goals]):
+        lines.append("Task intent:")
+        if objective:
+            lines.append(f"- Objective: {objective}")
+        if journey:
+            lines.append(f"- Journey: {journey}")
+        if done_when:
+            lines.append("- Done when:")
+            lines.extend(f"  - {value}" for value in done_when)
+        if non_goals:
+            lines.append("- Non-goals:")
+            lines.extend(f"  - {value}" for value in non_goals)
+        lines.append("")
+    lines.append("Requirement details:")
     requirement_context = format_requirement_context(project_root, task.requirements) or []
     lines.extend(requirement_context or ["- none"])
     lines.append("")
@@ -507,6 +631,9 @@ def build_code_review_request(
     lines.append("- Do not fail the task solely because the broader architecture or future tasks mention additional technologies, adapters, mocks, or end-to-end flows that are not yet owned by this task's declared scope.")
     lines.append("- If a missing test type is expected to be supplied by a downstream validation task rather than the current feature task, do not fail the current task for that gap alone.")
     lines.append("- Do not reject the task only because it touched files outside the original output_paths when those edits are necessary support work or regression fixes for the current task. Judge those edits on correctness and necessity.")
+    lines.append("- Use the task intent as supporting context for purpose, completion signals, and non-goals, but keep requirement and acceptance assessments tied to the declared IDs.")
+    lines.append("- If task intent is present, include `intent_assessment`. If any done_when item is missing or any non-goal is violated, set `intent_assessment.status=changes_requested` and top-level `status=changes_requested`.")
+    lines.append("- Use finding objects with `severity=blocking` for missing behavior, placeholders/stubs presented as complete, unmet declared requirements, or unowned deferrals. Top-level status must be `changes_requested` when any blocking finding exists.")
     lines.append("- Passing task tests is necessary but not sufficient. Review whether the declared requirements and acceptance scenarios are actually complete in behavior, not only whether the declared tests are green.")
     if task.requirements:
         lines.append("- For every declared requirement, include exactly one `requirement_assessment` row with `id`, `status`, and `notes`.")
@@ -547,7 +674,7 @@ def build_code_review_request(
     lines.append("Inspect the current repository state and the task-scoped staged snapshot for this task only.")
     lines.append("Determine whether the task is ready to commit or requires more implementation changes.")
     lines.append("Use status=pass only when the task is ready to accept as-is. Otherwise use status=changes_requested.")
-    lines.append("Reply in raw JSON with fields: status, summary, findings (array of strings), requirement_assessment (array), acceptance_assessment (array).")
+    lines.append("Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array), and intent_assessment (object when task intent is present). Use empty arrays for findings and assessments when there are no rows.")
     return "\n".join(lines)
 
 
@@ -564,8 +691,26 @@ def build_validation_code_review_request(
         "",
         "This is a validation-task review. Judge whether the task delivered credible executable validation assets for its owned requirements and acceptance scenarios.",
         "",
-        "Requirement details:",
     ]
+    intent = task.intent if isinstance(task.intent, dict) else {}
+    objective = str(intent.get("objective") or "").strip()
+    journey = str(intent.get("journey") or "").strip()
+    done_when = [str(value).strip() for value in intent.get("done_when", []) if str(value).strip()]
+    non_goals = [str(value).strip() for value in intent.get("non_goals", []) if str(value).strip()]
+    if any([objective, journey, done_when, non_goals]):
+        lines.append("Task intent:")
+        if objective:
+            lines.append(f"- Objective: {objective}")
+        if journey:
+            lines.append(f"- Journey: {journey}")
+        if done_when:
+            lines.append("- Done when:")
+            lines.extend(f"  - {value}" for value in done_when)
+        if non_goals:
+            lines.append("- Non-goals:")
+            lines.extend(f"  - {value}" for value in non_goals)
+        lines.append("")
+    lines.append("Requirement details:")
     requirement_context = format_requirement_context(project_root, task.requirements) or []
     lines.extend(requirement_context or ["- none"])
     lines.append("")
@@ -613,7 +758,7 @@ def build_validation_code_review_request(
     lines.append("Inspect the current repository state and the task-scoped staged snapshot for this validation task only.")
     lines.append("Determine whether the validation assets are ready to commit or require more implementation changes.")
     lines.append("Use status=pass only when the validation evidence is credible, executable, and appropriately scoped. Otherwise use status=changes_requested.")
-    lines.append("Reply in raw JSON with fields: status, summary, findings (array of strings), requirement_assessment (array), acceptance_assessment (array).")
+    lines.append("Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array). Use empty arrays for findings and assessments when there are no rows.")
     return "\n".join(lines)
 
 
@@ -659,7 +804,7 @@ def build_final_review_request(
             "",
             "Inspect the repository state and release evidence.",
             "Use status=pass only when the release is ready to accept as-is. Otherwise use status=changes_requested.",
-            "Reply in raw JSON with fields: status, summary, findings (array of strings).",
+            "Reply in raw JSON with fields: status, summary, findings (array of finding objects). Use an empty findings array when there are no findings.",
         ]
     )
     return "\n".join(lines)
@@ -711,7 +856,14 @@ def _write_review_artifact(project_root: Path | str, task: Task, review_payload:
     ]
     if findings:
         for finding in findings:
-            lines.append(f"- {finding}")
+            if isinstance(finding, dict):
+                severity = str(finding.get("severity") or "").strip() or "finding"
+                message = str(finding.get("message") or "").strip()
+                refs = [*finding.get("requirement_ids", []), *finding.get("acceptance_ids", [])]
+                suffix = f" ({', '.join(refs)})" if refs else ""
+                lines.append(f"- [{severity}] {message}{suffix}")
+            else:
+                lines.append(f"- {finding}")
     else:
         lines.append("- No blocking findings.")
     if requirement_assessment:
@@ -752,11 +904,130 @@ def _write_final_review_artifact(project_root: Path | str, review_payload: dict[
     ]
     if findings:
         for finding in findings:
-            lines.append(f"- {finding}")
+            if isinstance(finding, dict):
+                severity = str(finding.get("severity") or "").strip() or "finding"
+                message = str(finding.get("message") or "").strip()
+                refs = [*finding.get("requirement_ids", []), *finding.get("acceptance_ids", [])]
+                suffix = f" ({', '.join(refs)})" if refs else ""
+                lines.append(f"- [{severity}] {message}{suffix}")
+            else:
+                lines.append(f"- {finding}")
     else:
         lines.append("- No blocking findings.")
     review_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(review_path.relative_to(project_paths(project_root).project_root))
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _final_repair_iteration_count(tasks: list[Task]) -> int:
+    return sum(
+        1
+        for task in tasks
+        if task.task_kind == "repair"
+        and (
+            task.title.startswith(FINAL_VERIFICATION_REPAIR_TASK_PREFIX)
+            or task.title.startswith(FINAL_REVIEW_REPAIR_TASK_PREFIX)
+        )
+    )
+
+
+def _final_review_repair_candidates(tasks: list[Task], review_payload: dict[str, Any]) -> list[Task]:
+    findings = review_payload.get("findings") if isinstance(review_payload.get("findings"), list) else []
+    requirement_ids = {
+        str(value).strip()
+        for finding in findings
+        if isinstance(finding, dict)
+        for value in finding.get("requirement_ids", [])
+        if str(value).strip()
+    }
+    acceptance_ids = {
+        str(value).strip()
+        for finding in findings
+        if isinstance(finding, dict)
+        for value in finding.get("acceptance_ids", [])
+        if str(value).strip()
+    }
+    eligible = [
+        task
+        for task in tasks
+        if task.id != FINAL_VERIFY_TASK_ID and task.task_kind != "repair" and task.status == "verified"
+    ]
+    matched = [
+        task
+        for task in eligible
+        if requirement_ids.intersection(task.requirements) or acceptance_ids.intersection(task.acceptance_scenarios)
+    ]
+    if matched or not findings:
+        return matched
+    return eligible
+
+
+def _create_final_review_repair_task(project_root: Path, tasks: list[Task], review_payload: dict[str, Any], review_artifact: str) -> tuple[list[Task], str | None, list[str]]:
+    source_tasks = _final_review_repair_candidates(tasks, review_payload)
+    if not source_tasks:
+        return tasks, None, []
+    repair_candidate_ids = [task.id for task in source_tasks]
+    if _final_repair_iteration_count(tasks) >= MAX_FINAL_REPAIR_ITERATIONS:
+        return tasks, None, repair_candidate_ids
+
+    repair_task_id = next_generated_task_id(tasks)
+    requirements = _dedupe_strings([requirement for task in source_tasks for requirement in task.requirements])
+    acceptance_scenarios = _dedupe_strings([scenario for task in source_tasks for scenario in task.acceptance_scenarios])
+    output_tests = _dedupe_strings([test for task in source_tasks for test in task.output_tests])[:10]
+    output_paths = _dedupe_strings([path for task in source_tasks for path in task.output_paths] + [review_artifact])[:20]
+    dependencies = [
+        task.id
+        for task in tasks
+        if task.id not in {FINAL_VERIFY_TASK_ID, repair_task_id} and task.status == "verified"
+    ]
+    title = FINAL_REVIEW_REPAIR_TASK_PREFIX
+    if repair_candidate_ids:
+        title = f"{FINAL_REVIEW_REPAIR_TASK_PREFIX} ({', '.join(repair_candidate_ids[:3])}{'...' if len(repair_candidate_ids) > 3 else ''})"
+    summary = str(review_payload.get("summary") or "final review changes requested").strip() or "final review changes requested"
+    repair_task = Task.from_dict(
+        {
+            "id": repair_task_id,
+            "title": title,
+            "status": "pending",
+            "task_kind": "repair",
+            "requirements": requirements,
+            "acceptance_scenarios": acceptance_scenarios,
+            "dependencies": dependencies,
+            "output_tests": output_tests,
+            "output_paths": output_paths or [review_artifact],
+            "blocked_reason": f"final review requested changes: {summary}; see {review_artifact}",
+            "attempts": 0,
+        }
+    )
+    updated: list[Task] = []
+    inserted = False
+    for task in tasks:
+        if task.id == FINAL_VERIFY_TASK_ID and not inserted:
+            updated.append(repair_task)
+            inserted = True
+        if task.id == FINAL_VERIFY_TASK_ID:
+            data = task.to_dict()
+            dependencies = list(data.get("dependencies", []))
+            if repair_task_id not in dependencies:
+                dependencies.append(repair_task_id)
+            data["dependencies"] = dependencies
+            updated.append(Task.from_dict(data))
+        else:
+            updated.append(task)
+    if not inserted:
+        updated.append(repair_task)
+    return updated, repair_task_id, repair_candidate_ids
 
 
 def import_task_review(project_root: Path | str, task_id: str, payload: dict[str, Any], input_path: Path) -> int:
@@ -925,16 +1196,34 @@ def import_final_review(project_root: Path | str, payload: dict[str, Any], input
         refresh_gates(project_dir)
         return 0
 
+    current_tasks = all_tasks(project_dir)
+    current_tasks, repair_task_id, repair_candidates = _create_final_review_repair_task(project_dir, current_tasks, parsed, review_artifact)
+    blocked_reason = str(parsed.get("summary") or "final review changes requested").strip() or "final review changes requested"
+    if repair_task_id:
+        blocked_reason = f"final review created repair task {repair_task_id}; preserve verified tasks and repair through that bundle"
+    elif repair_candidates:
+        blocked_reason = f"final review reached maximum repair iterations ({MAX_FINAL_REPAIR_ITERATIONS}); remaining findings require manual escalation"
     tasks = mark_task(
-        all_tasks(project_dir),
+        current_tasks,
         FINAL_VERIFY_TASK_ID,
         "blocked",
         review_status=review_status,
         review_artifact=review_artifact,
         reviewed_at=reviewed_at,
-        blocked_reason=str(parsed.get("summary") or "final review changes requested").strip() or "final review changes requested",
+        blocked_reason=blocked_reason,
     )
     save_tasks(project_dir, tasks)
+    save_task_runtime_state(
+        project_dir,
+        FINAL_VERIFY_TASK_ID,
+        {
+            "repair_candidates": repair_candidates,
+            "repair_task_id": repair_task_id,
+            "repair_report_artifact": review_artifact,
+            "final_repair_limit_reached": bool(repair_candidates and not repair_task_id),
+            "final_verify_status": "repair_required" if repair_task_id else "blocked",
+        },
+    )
     refresh_gates(project_dir)
     return 2
 

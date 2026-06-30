@@ -49,7 +49,9 @@ from .verify import infer_final_repair_candidates, is_path_test_spec, run_full_s
 
 MAX_TEST_FIX_ATTEMPTS = 3
 MAX_STALLED_RUNTIME_RECOVERIES = 2
+MAX_FINAL_REPAIR_ITERATIONS = 3
 FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
+FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
 
 
 def _write_exception_report(project_root: Path | str, task: Task, summary: str, *, patch_relative_path: str | None = None) -> str:
@@ -190,16 +192,27 @@ def _ensure_final_repair_task(
     results: list[Any],
     missing_test_types: list[tuple[str, str]],
     non_verified_gates: list[dict[str, Any]],
-) -> tuple[list[Task], str]:
+) -> tuple[list[Task], str | None, bool]:
     by_id = {task.id: task for task in tasks}
     final_runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, FINAL_VERIFY_TASK_ID))
     current_repair_task_id = str(final_runtime_state.get("repair_task_id") or "").strip()
     current_repair_task = by_id.get(current_repair_task_id) if current_repair_task_id else None
-    if current_repair_task is not None and current_repair_task.status in {"verified", "exception"}:
-        return tasks, current_repair_task.id
-    if current_repair_task is not None:
+    if current_repair_task is not None and current_repair_task.status == "exception":
+        return tasks, current_repair_task.id, False
+    if current_repair_task is not None and current_repair_task.status != "verified":
         repair_task_id = current_repair_task.id
     else:
+        existing_final_repairs = [
+            task
+            for task in tasks
+            if task.task_kind == "repair"
+            and (
+                task.title.startswith(FINAL_REPAIR_TASK_PREFIX)
+                or task.title.startswith(FINAL_REVIEW_REPAIR_TASK_PREFIX)
+            )
+        ]
+        if len(existing_final_repairs) >= MAX_FINAL_REPAIR_ITERATIONS:
+            return tasks, current_repair_task.id if current_repair_task is not None else None, True
         repair_task_id = next_generated_task_id(tasks)
 
     source_tasks = [by_id[task_id] for task_id in repair_candidates if task_id in by_id]
@@ -234,6 +247,23 @@ def _ensure_final_repair_task(
     title = FINAL_REPAIR_TASK_PREFIX
     if repair_candidates:
         title = f"{FINAL_REPAIR_TASK_PREFIX} ({', '.join(repair_candidates[:3])}{'...' if len(repair_candidates) > 3 else ''})"
+    failed_specs = _failed_test_specs_for_repair(results)
+    gate_summaries: list[str] = []
+    for gate in non_verified_gates:
+        gate_id = str(gate.get("id") or "").strip()
+        missing_types = ", ".join(str(value).strip() for value in gate.get("missing_test_types", []) if str(value).strip())
+        if gate_id or missing_types:
+            gate_summaries.append(f"{gate_id or 'gate'} missing {missing_types or 'required evidence'}")
+    missing_type_summary = ", ".join(f"{requirement_id}:{test_type}" for requirement_id, test_type in missing_test_types[:8])
+    blocked_reason_parts = ["final verification failed; read docs/reviews/final-repair-report.md first"]
+    if repair_candidates:
+        blocked_reason_parts.append(f"repair candidates: {', '.join(repair_candidates[:8])}")
+    if failed_specs:
+        blocked_reason_parts.append(f"failed tests: {', '.join(failed_specs[:8])}")
+    if missing_type_summary:
+        blocked_reason_parts.append(f"missing test evidence: {missing_type_summary}")
+    if gate_summaries:
+        blocked_reason_parts.append(f"blocked gates: {'; '.join(gate_summaries[:5])}")
 
     replacement = Task.from_dict(
         {
@@ -246,7 +276,7 @@ def _ensure_final_repair_task(
             "dependencies": dependencies,
             "output_tests": output_tests,
             "output_paths": output_paths,
-            "blocked_reason": "synthesized repair bundle for final verification failures",
+            "blocked_reason": "; ".join(blocked_reason_parts),
             "attempts": current_repair_task.attempts if current_repair_task is not None and current_repair_task.status != "verified" else 0,
         }
     )
@@ -266,65 +296,23 @@ def _ensure_final_repair_task(
                 insert_at = index
                 break
         updated.insert(insert_at, replacement)
-    return updated, repair_task_id
+    return updated, repair_task_id, False
 
 
 def _invalidate_prefinal_audit_after_repair(tasks: list[Task], repair_task_id: str | None) -> list[Task]:
     if not repair_task_id:
         return tasks
-    audit_task_ids = [task_id for task_id in (FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID) if any(task.id == task_id for task in tasks)]
-    if not audit_task_ids:
-        return tasks
-    dependencies_by_audit_id: dict[str, list[str]] = {}
-    if FRONTEND_API_AUDIT_TASK_ID in audit_task_ids:
-        dependencies_by_audit_id[FRONTEND_API_AUDIT_TASK_ID] = [
-            task.id
-            for task in tasks
-            if task.id not in {FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
-        ]
-    if PREFINAL_AUDIT_TASK_ID in audit_task_ids:
-        dependencies_by_audit_id[PREFINAL_AUDIT_TASK_ID] = [
-            task.id
-            for task in tasks
-            if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
-        ]
-    for dependencies in dependencies_by_audit_id.values():
-        if repair_task_id not in dependencies:
-            dependencies.append(repair_task_id)
-    reset_required_by_audit_id = {
-        task.id: task.status == "verified" or repair_task_id not in task.dependencies
-        for task in tasks
-        if task.id in audit_task_ids
-    }
-    if not any(reset_required_by_audit_id.values()):
-        return tasks
     updated: list[Task] = []
     for task in tasks:
-        if task.id not in audit_task_ids or not reset_required_by_audit_id.get(task.id):
-            updated.append(task)
+        if task.id == FINAL_VERIFY_TASK_ID:
+            data = task.to_dict()
+            dependencies = list(data.get("dependencies", []))
+            if repair_task_id not in dependencies:
+                dependencies.append(repair_task_id)
+            data["dependencies"] = dependencies
+            updated.append(Task.from_dict(data))
             continue
-        data = task.to_dict()
-        data.update(
-            {
-                "status": "pending",
-                "dependencies": dependencies_by_audit_id[task.id],
-                "git_commit": None,
-                "status_session_id": None,
-                "started_at": None,
-                "completed_at": None,
-                "review_status": None,
-                "review_artifact": None,
-                "reviewed_at": None,
-                "verified_at": None,
-                "blocked_reason": (
-                    "frontend/API audit must rerun after final verification repair"
-                    if task.id == FRONTEND_API_AUDIT_TASK_ID
-                    else "system audit must rerun after final verification repair"
-                ),
-                "attempts": 0,
-            }
-        )
-        updated.append(Task.from_dict(data))
+        updated.append(task)
     return updated
 
 
@@ -885,14 +873,15 @@ class DeliveryLoop:
         current_repair_task_id = str(normalize_task_runtime_state(load_task_runtime_state(self.project_root, FINAL_VERIFY_TASK_ID)).get("repair_task_id") or "").strip()
         current_repair_task = next((task for task in tasks if task.id == current_repair_task_id), None) if current_repair_task_id else None
         current_repair_is_environment = current_repair_task is not None and current_repair_task.title.startswith(ENVIRONMENT_REPAIR_TASK_PREFIX)
-        repair_path_exhausted = current_repair_task is not None and current_repair_task.status in {"verified", "exception"} and (
+        repair_path_exhausted = current_repair_task is not None and current_repair_task.status == "exception" and (
             current_repair_is_environment if environment_blocked else True
         )
         repair_required = (environment_blocked or bool(repair_candidates)) and not repair_path_exhausted
         repair_task_id = None
-        if environment_blocked and current_repair_is_environment and current_repair_task is not None and current_repair_task.status in {"verified", "exception"}:
+        final_repair_limit_reached = False
+        if environment_blocked and current_repair_is_environment and current_repair_task is not None and current_repair_task.status == "exception":
             repair_task_id = current_repair_task.id
-        elif repair_candidates and current_repair_task is not None and current_repair_task.status in {"verified", "exception"}:
+        elif repair_candidates and current_repair_task is not None and current_repair_task.status == "exception":
             repair_task_id = current_repair_task.id
         elif repair_required and environment_blocked:
             environment_plan = build_environment_repair_plan(
@@ -905,7 +894,7 @@ class DeliveryLoop:
             repair_candidates = environment_plan.repair_candidates
             tasks = _invalidate_prefinal_audit_after_repair(tasks, repair_task_id)
         elif repair_required:
-            tasks, repair_task_id = _ensure_final_repair_task(
+            tasks, repair_task_id, final_repair_limit_reached = _ensure_final_repair_task(
                 self.project_root,
                 tasks,
                 repair_candidates=repair_candidates,
@@ -913,7 +902,10 @@ class DeliveryLoop:
                 missing_test_types=missing_test_types,
                 non_verified_gates=non_verified_gates,
             )
-            tasks = _invalidate_prefinal_audit_after_repair(tasks, repair_task_id)
+            if final_repair_limit_reached:
+                repair_required = False
+            else:
+                tasks = _invalidate_prefinal_audit_after_repair(tasks, repair_task_id)
         repair_report_artifact = write_final_repair_report(
             self.project_root,
             results=results,
@@ -938,6 +930,7 @@ class DeliveryLoop:
                     }
                     for gate in non_verified_gates
                 ],
+                "final_repair_limit_reached": final_repair_limit_reached,
                 "final_verify_status": "pass" if final_pass else ("review_pending" if ready_for_final_review else ("environment_blocked" if environment_blocked and repair_required else ("repair_required" if repair_required else "blocked"))),
             },
         )
@@ -999,6 +992,9 @@ class DeliveryLoop:
                     review_artifact=None,
                     reviewed_at=None,
                     blocked_reason=(
+                        f"final verification reached maximum repair iterations ({MAX_FINAL_REPAIR_ITERATIONS}); remaining failures require manual escalation"
+                        if final_repair_limit_reached
+                        else (
                         f"repair task {repair_task_id} completed but final verification is still failing"
                         if repair_task_id and current_repair_task is not None and current_repair_task.status == "verified"
                         else (
@@ -1009,6 +1005,7 @@ class DeliveryLoop:
                                 if missing_test_types
                                 else "final verification requirements are not yet satisfied"
                             )
+                        )
                         )
                     ),
                 )

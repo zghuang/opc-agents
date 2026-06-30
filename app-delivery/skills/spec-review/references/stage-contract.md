@@ -13,6 +13,9 @@ requirements:
 - If an item has no explicit ID, create a stable one.
 - Keep summaries concise and implementation-neutral.
 - Do not invent requirements that are not grounded in the source.
+- Do not turn a broad aspiration into detailed product behavior unless that behavior is explicitly stated or clearly implied by the source.
+- A requirement is actionable enough for downstream architecture when it names or clearly implies: actor or external system, capability or workflow, key input/output or state change, and observable acceptance signal.
+- A requirement is too coarse when it is only a goal, slogan, module label, broad noun phrase, or generic capability bucket without enough behavior, boundaries, or acceptance evidence to guide architecture and task decomposition.
 - Preserve contradictions instead of smoothing them over.
 - If the source explicitly mandates technologies, runtimes, frameworks, packages, libraries, infrastructure components, or external contracts, preserve those constraints in the normalized requirements instead of dropping them.
 
@@ -27,6 +30,9 @@ clarifications:
 - Each item must include severity, question, rationale, affected_requirement_ids, blocking.
 - Severity should typically be C1, C2, or C3.
 - Mark blocking=true only when delivery should stop for clarification before architecture or implementation continues.
+- Use C1/blocking when unresolved coarse wording would force later stages to choose between materially different architecture, data model, integration contracts, security/permissions, task decomposition, or acceptance-test designs.
+- Use C2/non-blocking when a defensible default exists and the answer would refine but not redirect architecture or decomposition.
+- Use C3/non-blocking for naming, wording, display, copy, or prioritization details that can be safely decided later.
 
 technology_hints:
 - Optional array for explicit technology choices that later planning and implementation must preserve.
@@ -37,7 +43,9 @@ technology_hints:
 
 Judgment rules:
 - If the source has contradictions or unclear points, surface them in clarifications rather than guessing.
-- If the ambiguity can materially change architecture, scope, security, data model, or acceptance, make it blocking.
+- If unresolved ambiguity would force later stages to choose between materially different architecture, scope, security, data model, or acceptance-test designs, make it blocking.
+- If a coarse requirement can be normalized only by adding ungrounded workflows, data fields, roles, integrations, or acceptance criteria, do not invent those details; emit a clarification.
+- If the source is coarse but still names a coherent actor, behavior, boundary, and observable outcome, normalize it and keep any remaining details as C2/C3 clarifications.
 - If the source is clear enough to proceed, clarifications may be an empty array.
 - If a prior clarification-needed file or clarification-answers file exists for this project, treat those answers as part of the available source evidence and fold defensible resolved answers back into the normalized requirement output instead of preserving an already-resolved C1 blocker.
 

@@ -57,6 +57,22 @@ def test_weak_test_file_reason_flags_trivial_frontend_placeholder(tmp_path: Path
     assert "placeholder test file" in reason
 
 
+def test_weak_test_file_reason_flags_generated_playwright_placeholder(tmp_path: Path) -> None:
+    test_file = tmp_path / "frontend" / "e2e" / "case-workspace.spec.ts"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text(
+        "import { test } from '@playwright/test'\n\n"
+        "test('placeholder', async () => {\n"
+        "  throw new Error('placeholder test not implemented yet')\n"
+        "})\n",
+        encoding="utf-8",
+    )
+
+    reason = weak_test_file_reason(tmp_path, "frontend/e2e/case-workspace.spec.ts")
+
+    assert "placeholder test file" in reason
+
+
 def test_run_task_tests_supports_command_specs(tmp_path: Path) -> None:
     test_file = tmp_path / "tests" / "test_sample.py"
     test_file.parent.mkdir(parents=True, exist_ok=True)
@@ -309,6 +325,14 @@ def test_command_for_backend_test_directory_runs_in_backend_with_uv(tmp_path: Pa
     assert command[0:2] == ["/bin/zsh", "-lc"]
     assert "cd " in command[2]
     assert "uv run pytest tests/core --tb=short -q" in command[2]
+
+
+def test_command_for_mock_server_test_spec_runs_in_mock_server_with_uv(tmp_path: Path) -> None:
+    command = _command_for_test_spec(tmp_path, "mock-server/tests/all_mock_contracts.py")
+
+    assert command[:2] == ["/bin/zsh", "-lc"]
+    assert f"cd {tmp_path / 'mock-server'}" in command[2]
+    assert "uv run pytest tests/all_mock_contracts.py --tb=short -q" in command[2]
 
 
 def test_command_for_frontend_e2e_spec_runs_in_frontend(tmp_path: Path) -> None:

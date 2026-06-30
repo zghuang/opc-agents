@@ -34,7 +34,7 @@ services:
       - backend
 
   mocks:
-    build: ../{{PROJECT_NAME}}-mocks
+    build: ./mock-server
     ports:
       - "8888:8888"
 

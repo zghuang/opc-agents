@@ -4,6 +4,7 @@ import datetime as dt
 import os
 from pathlib import Path
 
+from delivery.builtin_tasks import PREFINAL_AUDIT_TASK_ID
 from delivery.runtime_liveness import classify_running_runtime, wrapper_should_interrupt
 from delivery.task import Task
 
@@ -63,3 +64,24 @@ def test_wrapper_should_interrupt_after_hard_stall_without_activity(tmp_path: Pa
 
     assert decision.suspected is True
     assert decision.kind == "silent_stall"
+
+
+def test_wrapper_uses_longer_hard_stall_for_audit_tasks(tmp_path: Path) -> None:
+    early = wrapper_should_interrupt(
+        tmp_path,
+        PREFINAL_AUDIT_TASK_ID,
+        {"read_only_streak": 0, "last_tool_at": "", "last_mutation_at": ""},
+        started_monotonic=0.0,
+        now_monotonic=901.0,
+    )
+    late = wrapper_should_interrupt(
+        tmp_path,
+        PREFINAL_AUDIT_TASK_ID,
+        {"read_only_streak": 0, "last_tool_at": "", "last_mutation_at": ""},
+        started_monotonic=0.0,
+        now_monotonic=1501.0,
+    )
+
+    assert early.suspected is False
+    assert late.suspected is True
+    assert late.kind == "silent_stall"

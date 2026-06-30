@@ -8,7 +8,7 @@ from delivery.loop import DeliveryLoop
 from delivery.loop import recover
 from delivery.loop_gitops import git_commit_task, task_scope_delta
 from delivery.loop_reporting import project_summary, status as runtime_status
-from delivery.loop_review import _parse_review_payload, build_code_review_request, code_review_request_path, write_code_review_request
+from delivery.loop_review import _parse_review_payload, _validate_pass_review_matrix, build_code_review_request, code_review_request_path, write_code_review_request
 from delivery.loop_task_prompt import build_fix_prompt, build_stalled_recovery_prompt, build_task_prompt
 from delivery.session import RuntimeErrorResponse, RuntimeSession, save_current_session
 from delivery.state import load_session_state, load_task_runtime_state, save_session_state, save_task_runtime_state, save_test_results, save_work_items
@@ -36,6 +36,31 @@ def test_build_code_review_prompt_includes_requirement_details(tmp_path: Path) -
     assert "For every declared acceptance scenario" in prompt
     assert "Passing task tests is necessary but not sufficient" in prompt
     assert "user-visible frontend acceptance scenario" not in prompt
+
+
+def test_review_payload_validation_reports_multiple_schema_errors() -> None:
+    from delivery.task import Task
+
+    task = Task("T002", "Login", "review_pending", ["REQ-001"], ["AS-001"], [], [], [])
+    payload = {
+        "status": "pass",
+        "summary": "Looks good.",
+        "findings": ["legacy string finding", {"severity": "critical", "message": ""}],
+        "requirement_assessment": [{"id": "REQ-001", "status": "done", "notes": ""}],
+        "acceptance_assessment": "missing array",
+    }
+
+    try:
+        _validate_pass_review_matrix(task, payload)
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected validation to fail")
+
+    assert "findings[0] must be an object" in message
+    assert "findings[1].severity must be one of" in message
+    assert "requirement_assessment status for REQ-001 must be one of" in message
+    assert "acceptance_assessment must be provided as an array" in message
 
 
 def test_write_code_review_request_preserves_timestamp_when_content_is_unchanged(tmp_path: Path) -> None:
@@ -200,6 +225,40 @@ def test_build_task_prompt_includes_requirement_and_acceptance_details(tmp_path:
     assert "frontend/package.json" not in prompt
 
 
+def test_build_task_prompt_includes_task_intent(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    prompt = build_task_prompt(
+        tmp_path,
+        Task.from_dict(
+            {
+                "id": "T002",
+                "title": "Case workspace",
+                "status": "pending",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": [],
+                "dependencies": [],
+                "output_tests": ["backend/tests/test_case.py"],
+                "output_paths": ["backend/src/case/"],
+                "intent": {
+                    "objective": "Enable users to review cases.",
+                    "journey": "User opens a case and sees status, evidence, and next action.",
+                    "done_when": ["Case state can be queried", "Task-local tests pass"],
+                    "non_goals": ["Do not implement reporting dashboards"],
+                },
+            }
+        ),
+    )
+
+    assert "Task intent:" in prompt
+    assert "Objective: Enable users to review cases." in prompt
+    assert "Journey: User opens a case" in prompt
+    assert "Done when:" in prompt
+    assert "Case state can be queried" in prompt
+    assert "Non-goals:" in prompt
+    assert "Do not implement reporting dashboards" in prompt
+
+
 def test_build_task_prompt_frontend_acceptance_requires_browser_guidance(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -257,18 +316,58 @@ def test_build_validation_task_prompt_explains_validation_role(tmp_path: Path) -
             "dependencies": ["T009"],
             "output_tests": ["backend/tests/test_acceptance/test_as001.py", "frontend/e2e/incident-happy-path.spec.ts"],
             "output_paths": ["backend/tests/test_acceptance/", "frontend/e2e/"],
+            "intent": {
+                "objective": "Prove the incident happy path.",
+                "journey": "Incident moves through backend and browser validation.",
+                "done_when": ["Acceptance test asserts the scenario"],
+            },
         }
     )
 
     prompt = build_task_prompt(tmp_path, task)
 
     assert "Validation task mission:" in prompt
+    assert "Task intent:" in prompt
+    assert "Prove the incident happy path." in prompt
     assert "This is a validation task." in prompt
     assert "app-delivery control loop will deterministically execute the declared Tests" in prompt
     assert "Prefer improving or adding acceptance tests, end-to-end tests, fixtures, scenario data, and test helpers before changing product code." in prompt
     assert "Do not turn this task into broad new product implementation" in prompt
     assert "Each declared acceptance scenario should map to at least one concrete validation path" in prompt
     assert "This task owns frontend-facing validation coverage." in prompt
+
+
+def test_build_repair_task_prompt_encourages_iterative_gap_repair(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    report_path = tmp_path / "docs" / "reviews" / "final-repair-report.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("# Final Repair Report\n\n## Missing Test Types\n\n- REQ-001: missing scenario\n", encoding="utf-8")
+
+    task = Task.from_dict(
+        {
+            "id": "T010",
+            "title": "Final Verification Repair Bundle (T007, T008)",
+            "status": "pending",
+            "task_kind": "repair",
+            "requirements": ["REQ-001", "REQ-002"],
+            "acceptance_scenarios": [],
+            "dependencies": ["T007", "T008"],
+            "output_tests": ["backend/tests/test_feature.py"],
+            "output_paths": ["backend/src/feature.py"],
+            "blocked_reason": "synthesized repair bundle for final verification failures",
+        }
+    )
+
+    prompt = build_task_prompt(tmp_path, task)
+
+    assert "Repair objective:" in prompt
+    assert "docs/reviews/final-repair-report.md" in prompt
+    assert "Requirement details:" not in prompt
+    assert "Requirement IDs potentially affected: REQ-001, REQ-002" in prompt
+    assert "If this bundle contains many gaps, enumerate them and repair in small verified batches" in prompt
+    assert "do not stop after only the first easy fix while declared failures remain" in prompt
+    assert "let the framework resume from the remaining evidence" in prompt
 
 
 def test_build_validation_code_review_prompt_reviews_validation_assets(tmp_path: Path) -> None:
@@ -296,6 +395,11 @@ def test_build_validation_code_review_prompt_reviews_validation_assets(tmp_path:
             "dependencies": ["T009"],
             "output_tests": ["backend/tests/test_acceptance/test_as001.py", "frontend/e2e/incident-happy-path.spec.ts"],
             "output_paths": ["backend/tests/test_acceptance/", "frontend/e2e/"],
+            "intent": {
+                "objective": "Prove the incident happy path.",
+                "journey": "Incident moves through backend and browser validation.",
+                "done_when": ["Acceptance test asserts the scenario"],
+            },
         }
     )
 
@@ -309,6 +413,8 @@ def test_build_validation_code_review_prompt_reviews_validation_assets(tmp_path:
     )
 
     assert "validation-task review" in prompt
+    assert "Task intent:" in prompt
+    assert "Prove the incident happy path." in prompt
     assert "declared output_tests as contractual validation entrypoints" in prompt
     assert "every declared acceptance scenario maps to concrete assertions" in prompt
     assert "placeholder tests, shallow smoke checks, missing scenario coverage" in prompt
@@ -318,6 +424,36 @@ def test_build_validation_code_review_prompt_reviews_validation_assets(tmp_path:
     assert "docs/test-results.json" not in prompt
     assert "requirement_assessment" in prompt
     assert "acceptance_assessment" in prompt
+
+
+def test_build_code_review_request_includes_task_intent(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    prompt = build_code_review_request(
+        tmp_path,
+        Task.from_dict(
+            {
+                "id": "T002",
+                "title": "Case workspace",
+                "status": "review_pending",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": [],
+                "dependencies": [],
+                "output_tests": ["backend/tests/test_case.py"],
+                "output_paths": ["backend/src/case/"],
+                "intent": {
+                    "objective": "Enable users to review cases.",
+                    "journey": "User opens a case and sees status, evidence, and next action.",
+                    "done_when": ["Case state can be queried"],
+                    "non_goals": ["Do not implement reporting dashboards"],
+                },
+            }
+        ),
+    )
+
+    assert "Task intent:" in prompt
+    assert "Objective: Enable users to review cases." in prompt
+    assert "Use the task intent as supporting context" in prompt
 
 
 def test_build_task_prompt_includes_dependency_hints(tmp_path: Path) -> None:
@@ -402,8 +538,9 @@ def test_build_code_review_prompt_includes_dependency_hints(tmp_path: Path) -> N
         ),
     )
 
-    assert "Project metadata declares technology constraints relevant to this task." in prompt
-    assert "FastAPI Users" not in prompt
+    assert "Project technology constraints to verify:" in prompt
+    assert "FastAPI Users" in prompt
+    assert "Verify concrete implementation evidence for each listed technology" in prompt
 
 
 def test_build_fix_prompt_reanchors_repairs_to_project_contract(tmp_path: Path) -> None:
@@ -577,7 +714,8 @@ def test_build_task_prompt_uses_project_context_reference_for_manifest_tasks(tmp
     )
 
     assert "Project dependency hints from requirements:" not in prompt
-    assert "LangGraph" not in prompt
+    assert "Project technology constraints for this task:" in prompt
+    assert "LangGraph" in prompt
     assert "Tech Design` section in AGENTS.md / CLAUDE.md" in prompt
     assert "resolve the exact package entry deliberately" in prompt
 
@@ -630,6 +768,18 @@ def test_parse_review_payload_rejects_unknown_status() -> None:
         assert "pass, changes_requested" in str(exc)
     else:
         raise AssertionError("expected invalid review status to be rejected")
+
+
+def test_review_validation_rejects_string_findings() -> None:
+    from delivery.task import Task
+
+    payload = _parse_review_payload('{"status":"changes_requested","summary":"Not ready","findings":["missing behavior"],"requirement_assessment":[],"acceptance_assessment":[]}')
+    try:
+        _validate_pass_review_matrix(Task("T002", "Login", "review_pending", [], [], [], [], []), payload)
+    except ValueError as exc:
+        assert "findings[0] must be an object" in str(exc)
+    else:
+        raise AssertionError("expected string findings to be rejected")
 
 
 def test_write_code_review_request_persists_prompt(tmp_path: Path) -> None:
@@ -1036,6 +1186,104 @@ def test_park_task_exception_changes_handles_staged_added_paths_not_in_head(tmp_
     ).stdout.strip() == ""
 
 
+def test_git_stage_task_snapshot_ignores_deleted_added_extra_paths(tmp_path: Path) -> None:
+    from delivery.loop_gitops import ensure_git_repo, git, git_stage_task_snapshot
+    from delivery.task import Task
+
+    ensure_git_repo(tmp_path)
+    service_path = tmp_path / "backend" / "src" / "auth" / "service.py"
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    service_path.write_text("VALUE = 'base'\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+
+    service_path.write_text("VALUE = 'changed'\n", encoding="utf-8")
+    stale_path = tmp_path / "frontend" / "src" / "pages" / "Dashboard.tsx"
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.write_text("export const Dashboard = () => null\n", encoding="utf-8")
+    git(["add", "--", "frontend/src/pages/Dashboard.tsx"], cwd=tmp_path)
+    stale_path.unlink()
+
+    task = Task(
+        "T017",
+        "Dashboard",
+        "pending",
+        ["REQ-001"],
+        [],
+        [],
+        ["backend/tests/test_auth.py"],
+        ["backend/src/auth/service.py"],
+    )
+
+    staged = git_stage_task_snapshot(tmp_path, task, extra_paths=["frontend/src/pages/Dashboard.tsx"])
+
+    assert staged == ["backend/src/auth/service.py"]
+    status = git(["status", "--porcelain"], cwd=tmp_path).stdout
+    assert "frontend/src/pages/Dashboard.tsx" not in status
+
+
+def test_git_commit_explicit_paths_ignores_deleted_added_paths(tmp_path: Path) -> None:
+    from delivery.loop_gitops import ensure_git_repo, git, git_commit_explicit_paths
+
+    ensure_git_repo(tmp_path)
+    (tmp_path / "README.md").write_text("init\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+
+    real_path = tmp_path / "docs" / "reviews" / "code-review-T017.md"
+    stale_path = tmp_path / "docs" / "reviews" / "code-review-T018.md"
+    real_path.parent.mkdir(parents=True, exist_ok=True)
+    real_path.write_text("status: pass\n", encoding="utf-8")
+    stale_path.write_text("status: pass\n", encoding="utf-8")
+    git(["add", "--", "docs/reviews/code-review-T018.md"], cwd=tmp_path)
+    stale_path.unlink()
+
+    commit_sha = git_commit_explicit_paths(
+        tmp_path,
+        ["docs/reviews/code-review-T017.md", "docs/reviews/code-review-T018.md"],
+        "feat(T017): review",
+    )
+
+    assert commit_sha
+    status = git(["status", "--porcelain"], cwd=tmp_path).stdout
+    assert "docs/reviews/code-review-T018.md" not in status
+    assert git(["ls-tree", "-r", "--name-only", "HEAD"], cwd=tmp_path).stdout.splitlines() == [
+        "README.md",
+        "docs/reviews/code-review-T017.md",
+    ]
+
+
+def test_git_commit_explicit_paths_restores_staged_framework_review_deletions(tmp_path: Path) -> None:
+    from delivery.loop_gitops import ensure_git_repo, git, git_commit_explicit_paths
+
+    ensure_git_repo(tmp_path)
+    old_review = tmp_path / "docs" / "reviews" / "code-review-T017.md"
+    new_review = tmp_path / "docs" / "reviews" / "code-review-T020.md"
+    old_review.parent.mkdir(parents=True, exist_ok=True)
+    old_review.write_text("status: pass\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+
+    old_review.unlink()
+    git(["add", "--", "docs/reviews/code-review-T017.md"], cwd=tmp_path)
+    new_review.write_text("status: pass\n", encoding="utf-8")
+
+    commit_sha = git_commit_explicit_paths(
+        tmp_path,
+        ["docs/reviews/code-review-T017.md", "docs/reviews/code-review-T020.md"],
+        "feat(T020): review",
+    )
+
+    assert commit_sha
+    assert old_review.exists()
+    assert new_review.exists()
+    assert git(["status", "--porcelain"], cwd=tmp_path).stdout.strip() == ""
+    assert git(["ls-tree", "-r", "--name-only", "HEAD"], cwd=tmp_path).stdout.splitlines() == [
+        "docs/reviews/code-review-T017.md",
+        "docs/reviews/code-review-T020.md",
+    ]
+
+
 def test_gate_report_paths_are_treated_as_framework_managed() -> None:
     from delivery.loop_gitops import _is_always_allowed_framework_path
 
@@ -1206,6 +1454,7 @@ def test_import_task_review_pass_commits_review_accepted_scope_paths(tmp_path: P
             "requirement_assessment": [
                 {"id": "REQ-001", "status": "pass", "notes": "The declared auth behavior is complete for this task."}
             ],
+            "acceptance_assessment": [],
         },
         input_path,
     )
@@ -1289,6 +1538,7 @@ def test_import_task_review_pass_ignores_unrelated_later_task_changes(tmp_path: 
             "requirement_assessment": [
                 {"id": "REQ-001", "status": "pass", "notes": "The declared OTIF behavior is complete for this task."}
             ],
+            "acceptance_assessment": [],
         },
         input_path,
     )
@@ -1359,7 +1609,22 @@ def test_import_task_review_changes_requested_retires_matching_active_session(tm
     exit_code = import_task_review(
         tmp_path,
         "T002",
-        {"status": "changes_requested", "summary": "Needs rework.", "findings": ["future task leakage"]},
+        {
+            "status": "changes_requested",
+            "summary": "Needs rework.",
+            "findings": [
+                {
+                    "severity": "blocking",
+                    "requirement_ids": ["REQ-001"],
+                    "acceptance_ids": [],
+                    "message": "future task leakage",
+                }
+            ],
+            "requirement_assessment": [
+                {"id": "REQ-001", "status": "changes_requested", "notes": "Needs rework."}
+            ],
+            "acceptance_assessment": [],
+        },
         input_path,
     )
 
@@ -1405,12 +1670,19 @@ def test_import_task_review_pass_requires_explicit_passing_requirement_assessmen
         import_task_review(
             tmp_path,
             "T002",
-            {"status": "pass", "summary": "Looks good.", "findings": []},
+            {
+                "status": "pass",
+                "summary": "Looks good.",
+                "findings": [],
+                "requirement_assessment": [],
+                "acceptance_assessment": [],
+            },
             tmp_path / "review-input.json",
         )
 
     assert exc_info.value.code == "review_assessment_invalid"
-    assert "status=pass requires explicit passing review assessments" in exc_info.value.message
+    assert "status=pass requires no blocking findings" in exc_info.value.message
+    assert "explicit passing review assessments" in exc_info.value.message
 
 
 def test_import_task_review_pass_rejects_non_passing_acceptance_assessment(tmp_path: Path) -> None:
@@ -1461,6 +1733,115 @@ def test_import_task_review_pass_rejects_non_passing_acceptance_assessment(tmp_p
 
     assert exc_info.value.code == "review_assessment_invalid"
     assert "non-passing acceptance assessments: AS-001" in exc_info.value.message
+
+
+def test_import_task_review_pass_rejects_blocking_finding(tmp_path: Path) -> None:
+    import pytest
+
+    from delivery.errors import DeliveryError
+    from delivery.loop_review import import_task_review
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Case workspace",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["frontend/e2e/case.spec.ts"],
+                    "output_paths": ["frontend/src/case/CaseWorkspace.tsx"],
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        import_task_review(
+            tmp_path,
+            "T002",
+            {
+                "status": "pass",
+                "summary": "Mostly complete, but one behavior is missing.",
+                "findings": [
+                    {
+                        "severity": "blocking",
+                        "requirement_ids": ["REQ-001"],
+                        "message": "AI chat is still a placeholder.",
+                    }
+                ],
+                "requirement_assessment": [
+                    {"id": "REQ-001", "status": "pass", "notes": "The reviewer incorrectly marked this as pass."}
+                ],
+                "acceptance_assessment": [],
+            },
+            tmp_path / "review-input.json",
+        )
+
+    assert exc_info.value.code == "review_assessment_invalid"
+    assert "blocking findings present" in exc_info.value.message
+
+
+def test_import_task_review_pass_rejects_non_passing_intent_assessment(tmp_path: Path) -> None:
+    import pytest
+
+    from delivery.errors import DeliveryError
+    from delivery.loop_review import import_task_review
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Case workspace",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["frontend/e2e/case.spec.ts"],
+                    "output_paths": ["frontend/src/case/CaseWorkspace.tsx"],
+                    "intent": {"objective": "Build case workspace", "done_when": ["AI chat streams agent output"]},
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        import_task_review(
+            tmp_path,
+            "T002",
+            {
+                "status": "pass",
+                "summary": "Looks good except intent is incomplete.",
+                "findings": [],
+                "requirement_assessment": [
+                    {"id": "REQ-001", "status": "pass", "notes": "Requirement assessment says pass."}
+                ],
+                "acceptance_assessment": [],
+                "intent_assessment": {
+                    "status": "changes_requested",
+                    "missing_done_when": ["AI chat streams agent output"],
+                    "violated_non_goals": [],
+                    "notes": "AI chat is a local placeholder.",
+                },
+            },
+            tmp_path / "review-input.json",
+        )
+
+    assert exc_info.value.code == "review_assessment_invalid"
+    assert "intent_assessment is changes_requested" in exc_info.value.message
 
 
 def test_build_code_review_prompt_frontend_acceptance_demands_browser_judgement(tmp_path: Path) -> None:
@@ -3568,7 +3949,7 @@ def test_final_verify_reuses_exception_repair_task_without_creating_another(tmp_
     assert runtime_state["repair_task_id"] == "T003"
 
 
-def test_final_verify_does_not_create_second_repair_task_after_verified_repair_task(tmp_path: Path, monkeypatch) -> None:
+def test_final_verify_creates_next_repair_task_after_verified_repair_task_when_failures_remain(tmp_path: Path, monkeypatch) -> None:
     from delivery.task import all_tasks
     from delivery.verify import TestResult
 
@@ -3621,10 +4002,79 @@ def test_final_verify_does_not_create_second_repair_task_after_verified_repair_t
 
     tasks = all_tasks(tmp_path)
     repair_tasks = [task for task in tasks if task.task_kind == "repair"]
+    assert result["status"] == "repair_required"
+    assert result["repair_task_id"] == "T004"
+    assert [task.id for task in repair_tasks] == ["T003", "T004"]
+    next_repair = next(task for task in repair_tasks if task.id == "T004")
+    assert next_repair.status == "pending"
+    assert next_repair.dependencies == ["T002", "T003"]
+    runtime_state = load_task_runtime_state(tmp_path, "T-FINAL")
+    assert runtime_state["repair_task_id"] == "T004"
+
+
+def test_final_verify_stops_creating_repair_tasks_after_iteration_limit(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import all_tasks
+    from delivery.verify import TestResult
+
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "requirements.json").write_text(
+        json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}),
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Auth", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/auth.spec.ts"], "output_paths": ["frontend/src/auth/"], "review_status": "pass", "git_commit": "abc123"},
+                {"id": "T003", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": ["frontend/e2e/auth.spec.ts"], "output_paths": ["frontend/src/auth/"], "review_status": "pass", "git_commit": "def456"},
+                {"id": "T004", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T002", "T003"], "output_tests": ["frontend/e2e/auth.spec.ts"], "output_paths": ["frontend/src/auth/"], "review_status": "pass", "git_commit": "ghi789"},
+                {"id": "T005", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T002", "T003", "T004"], "output_tests": ["frontend/e2e/auth.spec.ts"], "output_paths": ["frontend/src/auth/"], "review_status": "pass", "git_commit": "jkl012"},
+                {"id": "T-FINAL", "title": "最终验证", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002", "T003", "T004", "T005"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T-FINAL",
+        {"task_id": "T-FINAL", "repair_candidates": ["T002"], "repair_task_id": "T005", "final_verify_status": "repair_required"},
+    )
+    loop = DeliveryLoop(tmp_path)
+
+    monkeypatch.setattr(
+        "delivery.loop.run_full_suite",
+        lambda project_root, mode="all": [
+            TestResult(
+                task_id="T002",
+                timestamp="2026-06-24T00:00:00Z",
+                test_files=["frontend/e2e/auth.spec.ts"],
+                test_types=["browser"],
+                requirement_ids=["REQ-001"],
+                passed=False,
+                passed_count=0,
+                failed_count=1,
+                failures=[],
+                attempt=1,
+            )
+        ],
+    )
+    monkeypatch.setattr("delivery.loop.check_test_type_coverage", lambda project_root: [])
+
+    result = loop.final_verify()
+
+    tasks = all_tasks(tmp_path)
+    repair_tasks = [task for task in tasks if task.task_kind == "repair"]
     assert result["status"] == "blocked"
-    assert result["repair_task_id"] == "T003"
-    assert len(repair_tasks) == 1
-    assert repair_tasks[0].id == "T003"
+    assert result["repair_task_id"] == "T005"
+    assert [task.id for task in repair_tasks] == ["T003", "T004", "T005"]
+    final_task = next(task for task in tasks if task.id == "T-FINAL")
+    assert "maximum repair iterations (3)" in str(final_task.blocked_reason)
+    runtime_state = load_task_runtime_state(tmp_path, "T-FINAL")
+    assert runtime_state["final_verify_status"] == "blocked"
+    assert runtime_state["final_repair_limit_reached"] is True
 
 
 

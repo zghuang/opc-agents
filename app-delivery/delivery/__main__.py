@@ -43,6 +43,7 @@ from .task import all_tasks, reset_task, save_tasks
 
 
 CONTROL_STEP_LIMIT = 128
+EXECUTION_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def _terminate_pid(pid: int) -> None:
@@ -243,7 +244,11 @@ def _project_execution_guard(project_root: Path, *, already_locked: bool) -> Any
         return
     lock_path = project_root / ".app-delivery-runtime" / "locks" / "execution.lock"
     try:
-        with acquire_lock(project_root, name="execution", timeout=0):
+        timeout = float(os.environ.get("APP_DELIVERY_EXECUTION_LOCK_TIMEOUT_SECONDS") or EXECUTION_LOCK_TIMEOUT_SECONDS)
+    except ValueError:
+        timeout = EXECUTION_LOCK_TIMEOUT_SECONDS
+    try:
+        with acquire_lock(project_root, name="execution", timeout=max(0.0, timeout)):
             yield lock_path
     except TimeoutError as exc:
         lock_details = read_lock_metadata(lock_path)
@@ -685,7 +690,18 @@ def _execute_host_control_step(step: dict[str, Any], project_root: Path) -> dict
     result = _execute_host_control_step_if_ready(step, project_root)
     if result is not None:
         return result
-    host_execution = _run_host_skill_for_control_step(step, project_root)
+    try:
+        host_execution = _run_host_skill_for_control_step(step, project_root)
+    except DeliveryError as exc:
+        result = _execute_host_control_step_if_ready(step, project_root)
+        if result is not None:
+            result["host_execution"] = {
+                "status": "failed_but_existing_artifact_imported",
+                "code": exc.code,
+                "message": exc.message,
+            }
+            return result
+        raise
     if host_execution is None:
         return None
     result = _execute_host_control_step_if_ready(step, project_root)

@@ -973,9 +973,10 @@ def status(project_root: Path | str) -> dict[str, Any]:
         repair_task = next((task for task in display_tasks if task.id == repair_task_id), None) if repair_task_id else None
         repair_task_status = repair_task.status if repair_task is not None else None
         final_verify_status = str(final_runtime_state.get("final_verify_status") or "").strip()
+        final_repair_limit_reached = bool(final_runtime_state.get("final_repair_limit_reached"))
         if not all_actionable_verified and final_task is not None and final_task.status == "blocked":
             final_verify_status = "deferred"
-        elif final_task is not None and final_task.status == "blocked" and repair_candidates and final_verify_status in {"", "blocked"}:
+        elif final_task is not None and final_task.status == "blocked" and repair_candidates and final_verify_status in {"", "blocked"} and not final_repair_limit_reached:
             final_verify_status = "repair_required"
         blocked_reason = getattr(final_task, "blocked_reason", None) if final_task is not None else None
         if final_verify_status == "deferred":
@@ -994,7 +995,7 @@ def status(project_root: Path | str) -> dict[str, Any]:
                 if isinstance(item, (list, tuple)) and item
             ],
             "gate_statuses": final_runtime_state.get("final_verify_gate_statuses", []),
-            "will_continue": bool(repair_candidates) and repair_task_status != "exception" and final_verify_status != "deferred",
+            "will_continue": bool(repair_candidates) and repair_task_status != "exception" and final_verify_status not in {"blocked", "deferred"} and not final_repair_limit_reached,
         }
     return {
         "project": str(project_dir),

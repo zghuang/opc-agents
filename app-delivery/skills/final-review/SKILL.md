@@ -14,7 +14,7 @@ Procedure:
 3. Produce raw JSON with fields:
    - `status`: `pass` or `changes_requested`
    - `summary`: short release verdict
-   - `findings`: array of strings
+   - `findings`: array of finding objects
 4. Write that JSON to `{project}/.app-delivery-runtime/review-inputs/final-review.json`.
 5. Import it through the core:
 
@@ -33,3 +33,15 @@ Rules:
 - Treat this as an independent release gate, not as implementation continuation.
 - Do not edit ledger files directly.
 - If the review fails, let the core keep `T-FINAL` blocked/review-driven; do not bypass the gate manually.
+
+Finding object shape:
+```json
+{
+   "severity": "blocking" | "non_blocking",
+   "requirement_ids": ["REQ-001"],
+   "acceptance_ids": ["AS-001"],
+   "message": "Concrete release finding."
+}
+```
+
+Use an empty `findings` array when there are no findings. `requirement_ids` and `acceptance_ids` may be empty arrays when a finding is not tied to a specific ID.

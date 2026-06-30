@@ -146,6 +146,22 @@ def _compact_requirement_ids(values: list[Any]) -> str:
     return f"{preview}, ... {WORK_ITEMS_JSON_REFERENCE}"
 
 
+def _compact_session_ids(values: list[Any], current_session_id: str | None = None) -> str:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in [*(values if isinstance(values, list) else []), current_session_id or ""]:
+        session_id = str(value or "").strip()
+        if not session_id or session_id in seen:
+            continue
+        seen.add(session_id)
+        normalized.append(session_id)
+    if not normalized:
+        return "-"
+    if len(normalized) <= 2:
+        return ", ".join(normalized)
+    return f"{normalized[0]}, ... {normalized[-1]} ({len(normalized)} total; see docs/work-items.json)"
+
+
 def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -713,7 +729,7 @@ def render_work_items_markdown(project_root: Path | str, payload: dict[str, Any]
         "",
         f"Generated: {data.get('generated_at', utc_now_iso())}",
         "",
-        "| ID | Title | Status | Depends | Session | Requirements | Commit |",
+        "| ID | Title | Status | Depends | Sessions | Requirements | Commit |",
         "|----|-------|--------|---------|---------|--------------|--------|",
     ]
     for item in items:
@@ -722,7 +738,7 @@ def render_work_items_markdown(project_root: Path | str, payload: dict[str, Any]
         requirements = _compact_requirement_ids(item.get("requirements", []))
         dependencies = ", ".join(str(value) for value in item.get("dependencies", [])) or "-"
         commit = str(item.get("git_commit") or "-")
-        session_id = str(item.get("status_session_id") or "-")
+        session_id = _compact_session_ids(item.get("session_ids", []), str(item.get("status_session_id") or "").strip() or None)
         lines.append(
             f"| {item.get('id', '-') } | {str(item.get('title', '-')).replace('|', '/')} | {item.get('status', '-')} | {dependencies} | {session_id} | {requirements} | {commit} |"
         )

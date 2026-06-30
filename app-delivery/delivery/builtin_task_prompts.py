@@ -9,15 +9,16 @@ from .builtin_tasks import FRONTEND_API_AUDIT_REPORT_PATH, PREFINAL_AUDIT_REPORT
 def render_frontend_api_audit_prompt(project_root: Path | str, task: Any) -> str:
     project_dir = Path(project_root).expanduser().resolve()
     lines = [
-        f"## Task {task.id}: {task.title}",
+        f"## Task {task.id}: Pre-final frontend/API integration repair pass",
         "",
         f"Project path: {project_dir}",
         "",
-        "You are running a pre-final frontend/API integration audit for the current repository state.",
+        "You are running a pre-final frontend/API integration scan-and-fix pass for the current repository state.",
+        "Do not treat this as a report-only audit. Find concrete release-relevant integration gaps, fix the responsibly fixable ones in this task, validate those fixes, and document both fixes and remaining blockers.",
         "This is a new runtime session: base conclusions on the files, tests, logs, and runnable behavior present in this project directory.",
         "",
         "Mission:",
-        "- Determine whether the frontend user journeys use real backend APIs instead of placeholders, static fixtures, hardcoded demo data, or Playwright route mocks as the only proof.",
+        "- Determine whether the frontend user journeys use real backend APIs instead of placeholders, static fixtures, hardcoded demo data, or Playwright route mocks as the only proof, then fix actionable integration gaps directly.",
         "- Map frontend API clients, query/mutation hooks, route loaders, and user actions to backend HTTP/MCP/mock-server endpoints and their request/response contracts.",
         "- Inspect browser/e2e tests and classify each as real-backend E2E, browser-UI-with-mocked-API, smoke-only, or placeholder.",
         "- Prepare or repair realistic test data, seed/reset helpers, and environment commands needed for real backend browser E2E where the project stack supports it.",
@@ -34,6 +35,7 @@ def render_frontend_api_audit_prompt(project_root: Path | str, task: Any) -> str
         "",
         "Audit rules:",
         "- Treat `page.route(...)`, `route.fulfill(...)`, static JSON fixtures, hardcoded fake API responses, and component-only tests as useful UI evidence but not as real backend E2E evidence.",
+        "- Treat generated placeholder specs, skipped placeholder suites, and tests whose only behavior is `throw new Error('placeholder test not implemented yet')` as blockers, not planned coverage.",
         "- A user-visible flow is not real E2E unless the browser drives the UI and the application reaches the project-owned backend/API layer without Playwright fulfilling the core application endpoints.",
         "- If the frontend has API clients but pages bypass them, use hardcoded data, or only render mock payloads, fix the integration or document the blocker.",
         "- If the backend cannot support real E2E because test data, seed/reset helpers, dev server commands, CORS/proxy config, or health checks are missing, add the smallest project-native support needed or document the blocker.",
@@ -44,6 +46,7 @@ def render_frontend_api_audit_prompt(project_root: Path | str, task: Any) -> str
         "- Run focused checks for any fixes made in this task.",
         "- Prefer a real-backend Playwright or equivalent browser test for at least one critical user journey when feasible.",
         "- Preserve mocked browser tests when they are useful for UI states, but label them clearly in the report and do not present them as full E2E coverage.",
+        "- In the report, include a concise count/list of placeholder, smoke-only, mocked-browser, and real-backend browser/API specs so later audits can see coverage quality without reclassifying every file.",
         "- Record every validation command and result in the report. If a real-backend test cannot be created safely, record the exact blocker and required follow-up.",
         "",
         f"Required report: `{FRONTEND_API_AUDIT_REPORT_PATH}`",
@@ -70,11 +73,12 @@ def render_frontend_api_audit_prompt(project_root: Path | str, task: Any) -> str
 def render_prefinal_audit_prompt(project_root: Path | str, task: Any) -> str:
     project_dir = Path(project_root).expanduser().resolve()
     lines = [
-        f"## Task {task.id}: {task.title}",
+        f"## Task {task.id}: Pre-final full-system repair pass",
         "",
         f"Project path: {project_dir}",
         "",
-        "You are running a final pre-release system audit for the current repository state.",
+        "You are running a final pre-release scan-and-fix pass for the current repository state.",
+        "Do not treat this as a report-only audit. Find concrete release-relevant gaps, fix the responsibly fixable ones in this task, validate those fixes, and document both fixes and remaining blockers.",
         "This is a new runtime session: do not rely on hidden conversation history. Base conclusions on the files and evidence present in this project directory.",
         "",
         "Mission:",
@@ -162,7 +166,7 @@ def render_prefinal_audit_review_request(project_root: Path | str, task: Any, *,
         [
             "",
             "Inspect the current repository state and staged diff for this audit task.",
-            "Reply in raw JSON with fields: status, summary, findings (array of strings), requirement_assessment (array), acceptance_assessment (array). Use empty arrays for the assessment fields if there are no per-ID rows.",
+            "Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array). Use empty arrays for findings and assessment fields if there are no rows.",
         ]
     )
     return "\n".join(lines)
@@ -179,12 +183,13 @@ def render_frontend_api_audit_review_request(project_root: Path | str, task: Any
         "Required checks:",
         f"- `{FRONTEND_API_AUDIT_REPORT_PATH}` exists and contains all required sections.",
         "- The report maps frontend API clients/hooks/loaders/actions to backend routes, schemas, mock-server tools, or documented non-HTTP integrations.",
+        "- The report explicitly lists placeholder specs separately and does not count them as planned, mocked, or real E2E coverage.",
         "- The report classifies browser tests that use Playwright route mocks separately from real-backend E2E tests.",
         "- The report identifies whether critical user-facing acceptance flows have at least one real-backend browser/API integration path when the stack supports it.",
         "- The report covers test data, seed/reset support, health checks, proxy/CORS/dev-server setup, and other environment requirements needed for real E2E.",
         "- Fixes made by this task are scoped to closing real integration gaps or preparing credible test data/environment support.",
         "",
-        "Return status=changes_requested if mocked browser tests are presented as full E2E proof, frontend pages still bypass real API clients, core backend routes are unreachable from the UI, the report omits obvious API integration gaps, or high-severity blockers are minimized as non-blocking.",
+        "Return status=changes_requested if placeholder specs are minimized as acceptable coverage, mocked browser tests are presented as full E2E proof, frontend pages still bypass real API clients, core backend routes are unreachable from the UI, the report omits obvious API integration gaps, or high-severity blockers are minimized as non-blocking.",
         "Return status=pass only when the audit report and any fixes are credible enough for the broader system audit to rely on.",
     ]
     _append_scope_observations(lines, scope_report, broad_scope_reason="this audit has broad frontend/backend integration scope", reject_guidance="these edits are unrelated to credible real integration evidence")
@@ -192,7 +197,7 @@ def render_frontend_api_audit_review_request(project_root: Path | str, task: Any
         [
             "",
             "Inspect the current repository state and staged diff for this audit task.",
-            "Reply in raw JSON with fields: status, summary, findings (array of strings), requirement_assessment (array), acceptance_assessment (array). Use empty arrays for the assessment fields if there are no per-ID rows.",
+            "Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array). Use empty arrays for findings and assessment fields if there are no rows.",
         ]
     )
     return "\n".join(lines)

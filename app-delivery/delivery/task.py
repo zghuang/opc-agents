@@ -20,7 +20,7 @@ from .builtin_tasks import (
     SHARED_FOUNDATION_TASK_ID,
     needs_frontend_api_audit,
 )
-from .state import load_test_plan, load_work_items, project_paths, save_work_items, utc_now_iso
+from .state import load_gates, load_test_plan, load_work_items, project_paths, save_work_items, utc_now_iso
 
 
 REQ_ID_RE = re.compile(r"\b((?:REQ|NFR)-\d{3,})\b")
@@ -97,6 +97,7 @@ SCAFFOLD_OUTPUT_PATHS = [
 FINAL_VERIFY_REQUIREMENT_PREFIXES = (
     "NFR-",
 )
+RELEASE_ADVISORY_TEST_TYPES = {"accessibility", "performance"}
 
 
 def _is_final_verify_requirement(requirement_id: str) -> bool:
@@ -124,6 +125,32 @@ def _dedupe_preserve(values: list[str]) -> list[str]:
         seen.add(normalized)
         ordered.append(normalized)
     return ordered
+
+
+def _normalize_intent(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key in ("objective", "journey"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            normalized[key] = value
+    for key in ("done_when", "non_goals"):
+        values = [str(value).strip() for value in payload.get(key, []) if str(value).strip()]
+        deduped = _dedupe_preserve(values)
+        if deduped:
+            normalized[key] = deduped
+    return normalized
+
+
+def _normalize_session_ids(values: Any, current_session_id: str | None = None) -> list[str]:
+    raw_values = values if isinstance(values, list) else []
+    return _dedupe_preserve(
+        [
+            *[str(value).strip() for value in raw_values if str(value).strip()],
+            str(current_session_id or "").strip(),
+        ]
+    )
 
 
 def _normalize_contract_path(value: Any) -> str:
@@ -236,7 +263,7 @@ def _normalize_builtin_task_contract(task: "Task") -> "Task":
         data["output_tests"] = _normalize_shared_foundation_output_tests(task.output_tests)
         return Task.from_dict(data)
     if task.id == FRONTEND_API_AUDIT_TASK_ID:
-        data["title"] = task.title or "Frontend API integration audit"
+        data["title"] = "Pre-final frontend/API integration repair pass"
         data["task_kind"] = "audit"
         data["requirements"] = []
         data["acceptance_scenarios"] = []
@@ -244,7 +271,7 @@ def _normalize_builtin_task_contract(task: "Task") -> "Task":
         data["output_tests"] = _dedupe_preserve([*FRONTEND_API_AUDIT_OUTPUT_TESTS, *task.output_tests])
         return Task.from_dict(data)
     if task.id == PREFINAL_AUDIT_TASK_ID:
-        data["title"] = task.title or "Pre-final full-system audit"
+        data["title"] = "Pre-final full-system repair pass"
         data["task_kind"] = "audit"
         data["requirements"] = []
         data["acceptance_scenarios"] = []
@@ -265,8 +292,10 @@ class Task:
     output_tests: list[str]
     output_paths: list[str]
     task_kind: str = "feature"
+    intent: dict[str, Any] | None = None
     git_commit: str | None = None
     status_session_id: str | None = None
+    session_ids: list[str] | None = None
     started_at: str | None = None
     completed_at: str | None = None
     review_status: str | None = None
@@ -288,8 +317,10 @@ class Task:
             output_tests=[_normalize_contract_path(value) for value in payload.get("output_tests", []) if _normalize_contract_path(value)],
             output_paths=[_normalize_contract_path(value) for value in payload.get("output_paths", []) if _normalize_contract_path(value)],
             task_kind=str(payload.get("task_kind") or "feature").strip() or "feature",
+            intent=_normalize_intent(payload.get("intent")) or None,
             git_commit=str(payload.get("git_commit") or "").strip() or None,
             status_session_id=str(payload.get("status_session_id") or "").strip() or None,
+            session_ids=_normalize_session_ids(payload.get("session_ids"), str(payload.get("status_session_id") or "").strip() or None),
             started_at=str(payload.get("started_at") or "").strip() or None,
             completed_at=str(payload.get("completed_at") or "").strip() or None,
             review_status=str(payload.get("review_status") or "").strip() or None,
@@ -308,6 +339,7 @@ class Task:
             "task_kind": self.task_kind,
             "git_commit": self.git_commit,
             "status_session_id": self.status_session_id,
+            "session_ids": self.session_ids or [],
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "review_status": self.review_status,
@@ -319,6 +351,7 @@ class Task:
             "dependencies": self.dependencies,
             "output_tests": self.output_tests,
             "output_paths": self.output_paths,
+            "intent": self.intent or None,
             "blocked_reason": self.blocked_reason,
             "attempts": self.attempts,
         }
@@ -459,6 +492,7 @@ def mark_task(tasks: list[Task], task_id: str, status: str, **updates: Any) -> l
         data = task.to_dict()
         data["status"] = status
         data.update(updates)
+        data["session_ids"] = _normalize_session_ids(data.get("session_ids"), data.get("status_session_id"))
         if status == "active" and not data.get("started_at"):
             data["started_at"] = utc_now_iso()
         if status == "done" and not data.get("completed_at"):
@@ -575,6 +609,15 @@ def _validate_task_shape(tasks: list[Task]) -> None:
     for task in tasks:
         if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
+        invalid_mock_paths = [
+            path
+            for path in [*task.output_paths, *task.output_tests]
+            if path == "companion/mock-server" or path.startswith("companion/mock-server/")
+        ]
+        if invalid_mock_paths:
+            oversized.append(
+                f"{task.id} uses non-canonical mock-server paths: {', '.join(invalid_mock_paths)}; use project-root mock-server/..."
+            )
         if len(task.output_paths) > 20 or len(task.output_tests) > 10:
             oversized.append(
                 f"{task.id} (paths={len(task.output_paths)}, tests={len(task.output_tests)}; expected roughly paths<=20 tests<=10)"
@@ -654,9 +697,23 @@ def check_test_type_coverage(project_root: Path | str) -> list[tuple[str, str]]:
 
     results_payload = load_test_results(project_root)
     results = results_payload.get("results") if isinstance(results_payload.get("results"), list) else []
+    gates_payload = load_gates(project_root)
+    gates = gates_payload.get("gates") if isinstance(gates_payload.get("gates"), list) else []
     tasks = all_tasks(project_root)
     missing: list[tuple[str, str]] = []
     missing_set: set[tuple[str, str]] = set()
+
+    def verified_gate_has_type(requirement_id: str, test_type: str) -> bool:
+        for gate in gates:
+            if not isinstance(gate, dict):
+                continue
+            if str(gate.get("status") or "").strip() != "verified":
+                continue
+            scope_requirements = {str(value).strip() for value in gate.get("scope_requirements", []) if str(value).strip()}
+            observed_test_types = {str(value).strip() for value in gate.get("observed_test_types", []) if str(value).strip()}
+            if requirement_id in scope_requirements and test_type in observed_test_types:
+                return True
+        return False
 
     def record_missing(reference_id: str, test_type: str) -> None:
         normalized = (str(reference_id or "").strip(), str(test_type or "").strip())
@@ -700,6 +757,10 @@ def check_test_type_coverage(project_root: Path | str) -> list[tuple[str, str]]:
                 and test_type in result.get("test_types", [])
                 for result in results
             )
+            if not matched:
+                matched = verified_gate_has_type(requirement_id, test_type)
+            if not matched and test_type in RELEASE_ADVISORY_TEST_TYPES:
+                continue
             if not matched:
                 record_missing(requirement_id, test_type)
 
@@ -799,6 +860,7 @@ def decompose_tasks(
                 "dependencies": dependencies,
                 "output_tests": raw_item.get("output_tests", []),
                 "output_paths": raw_item.get("output_paths", []),
+                "intent": raw_item.get("intent") or {},
             }
         )
         normalized_items.append(task)
@@ -835,7 +897,7 @@ def decompose_tasks(
         normalized_items.append(
             Task(
                 id=FRONTEND_API_AUDIT_TASK_ID,
-                title="Frontend API integration audit",
+                    title="Pre-final frontend/API integration repair pass",
                 status="pending",
                 requirements=[],
                 acceptance_scenarios=[],
@@ -849,7 +911,7 @@ def decompose_tasks(
     normalized_items.append(
         Task(
             id=PREFINAL_AUDIT_TASK_ID,
-            title="Pre-final full-system audit",
+            title="Pre-final full-system repair pass",
             status="pending",
             requirements=[],
             acceptance_scenarios=[],

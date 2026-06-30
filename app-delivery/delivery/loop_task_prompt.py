@@ -13,6 +13,11 @@ from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from .task import Task, lint_task_contract
 
 
+FINAL_REPAIR_REPORT_PATH = "docs/reviews/final-repair-report.md"
+FINAL_VERIFICATION_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
+FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
+
+
 def _prompt_dir(project_root: Path | str) -> Path:
     paths = project_paths(project_root)
     prompt_dir = paths.runtime_dir / "prompts"
@@ -184,6 +189,76 @@ def _append_dependency_hint_section(lines: list[str], dependency_hints: list[dic
     lines.append("")
 
 
+def _append_task_intent_section(lines: list[str], task: Task) -> None:
+    intent = task.intent if isinstance(task.intent, dict) else {}
+    objective = str(intent.get("objective") or "").strip()
+    journey = str(intent.get("journey") or "").strip()
+    done_when = [str(value).strip() for value in intent.get("done_when", []) if str(value).strip()]
+    non_goals = [str(value).strip() for value in intent.get("non_goals", []) if str(value).strip()]
+    if not any([objective, journey, done_when, non_goals]):
+        return
+    lines.append("Task intent:")
+    if objective:
+        lines.append(f"- Objective: {objective}")
+    if journey:
+        lines.append(f"- Journey: {journey}")
+    if done_when:
+        lines.append("- Done when:")
+        lines.extend(f"  - {value}" for value in done_when)
+    if non_goals:
+        lines.append("- Non-goals:")
+        lines.extend(f"  - {value}" for value in non_goals)
+    lines.append("")
+
+
+def _format_id_summary(values: list[str], *, limit: int = 20) -> str:
+    normalized = [str(value).strip() for value in values if str(value).strip()]
+    if not normalized:
+        return "none"
+    if len(normalized) <= limit:
+        return ", ".join(normalized)
+    return f"{', '.join(normalized[:limit])}, ... ({len(normalized)} total)"
+
+
+def _is_final_repair_task(task: Task) -> bool:
+    title = str(task.title or "").strip()
+    return task.task_kind == "repair" and (
+        title.startswith(FINAL_VERIFICATION_REPAIR_TASK_PREFIX)
+        or title.startswith(FINAL_REVIEW_REPAIR_TASK_PREFIX)
+    )
+
+
+def _repair_evidence_paths(project_root: Path | str, task: Task) -> list[str]:
+    project_dir = Path(project_root).expanduser().resolve()
+    evidence: list[str] = []
+    title = str(task.title or "").strip()
+    if title.startswith(FINAL_VERIFICATION_REPAIR_TASK_PREFIX) and (project_dir / FINAL_REPAIR_REPORT_PATH).exists():
+        evidence.append(FINAL_REPAIR_REPORT_PATH)
+    for path in task.output_paths:
+        normalized = _normalize_path(path)
+        if normalized.startswith("docs/reviews/") and normalized.endswith(".md") and normalized not in evidence:
+            evidence.append(normalized)
+    return evidence[:5]
+
+
+def _append_repair_focus_section(lines: list[str], project_root: Path | str, task: Task) -> None:
+    if task.task_kind != "repair":
+        return
+    lines.append("Repair objective:")
+    lines.append("- This is a focused repair task, not a fresh feature build. Do not re-derive the whole product from every requirement before fixing the concrete failure.")
+    lines.append("- Start with the repair evidence, failed tests, blocked gates, declared tests, and declared paths in this prompt.")
+    lines.append("- Read requirement details from docs/requirements.json only for requirement IDs directly tied to the failing evidence you are repairing.")
+    evidence_paths = _repair_evidence_paths(project_root, task)
+    if evidence_paths:
+        lines.append("- Read these repair evidence artifacts first:")
+        lines.extend(f"  - {path}" for path in evidence_paths)
+    if task.blocked_reason:
+        lines.append(f"- Repair summary: {task.blocked_reason}")
+    if _is_final_repair_task(task):
+        lines.append("- For final repair bundles, close the listed final verification or final review failures; do not attempt a broad second implementation pass.")
+    lines.append("")
+
+
 def build_task_prompt(project_root: Path | str, task: Task) -> str:
     if task.id == FRONTEND_API_AUDIT_TASK_ID:
         prompt = render_frontend_api_audit_prompt(project_root, task)
@@ -208,21 +283,31 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         f"Project path: {project_dir}",
         "",
     ]
+    _append_task_intent_section(lines, task)
+    _append_repair_focus_section(lines, project_root, task)
     if task.requirements:
-        lines.append(f"Requirements: {', '.join(task.requirements)}")
-        lines.append("")
-        lines.append("Requirement details:")
-        requirement_context = format_requirement_context(project_root, task.requirements) or []
-        lines.extend(requirement_context or ["- none"]) 
+        if task.task_kind == "repair":
+            lines.append(f"Requirement IDs potentially affected: {_format_id_summary(task.requirements)}")
+            requirement_context = []
+        else:
+            lines.append(f"Requirements: {', '.join(task.requirements)}")
+            lines.append("")
+            lines.append("Requirement details:")
+            requirement_context = format_requirement_context(project_root, task.requirements) or []
+            lines.extend(requirement_context or ["- none"])
         lines.append("")
     else:
         requirement_context = []
     if task.acceptance_scenarios:
-        lines.append(f"Acceptance scenarios: {', '.join(task.acceptance_scenarios)}")
-        lines.append("")
-        lines.append("Acceptance scenario details:")
-        acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
-        lines.extend(acceptance_context or ["- none"])
+        if task.task_kind == "repair":
+            lines.append(f"Acceptance scenario IDs potentially affected: {_format_id_summary(task.acceptance_scenarios)}")
+            acceptance_context = []
+        else:
+            lines.append(f"Acceptance scenarios: {', '.join(task.acceptance_scenarios)}")
+            lines.append("")
+            lines.append("Acceptance scenario details:")
+            acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
+            lines.extend(acceptance_context or ["- none"])
         lines.append("")
     else:
         acceptance_context = []
@@ -273,6 +358,8 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         lines.append("Repair context:")
         lines.append(f"- {task.blocked_reason}")
         lines.append("- Start from the failed validation evidence and the declared tests below; do not broaden into unrelated product work.")
+        lines.append("- If this bundle contains many gaps, enumerate them and repair in small verified batches; do not stop after only the first easy fix while declared failures remain.")
+        lines.append("- If context pressure or runtime interruption stops this session, leave progress on disk and let the framework resume from the remaining evidence.")
         lines.append("")
     has_backend_specs = any(spec.startswith("backend/") for spec in task.output_tests)
     has_frontend_specs = any(spec.startswith("frontend/") for spec in task.output_tests)
@@ -315,6 +402,7 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
         f"Project path: {project_dir}",
         "",
     ]
+    _append_task_intent_section(lines, task)
     if task.requirements:
         lines.append(f"Requirements: {', '.join(task.requirements)}")
         lines.append("")

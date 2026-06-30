@@ -45,7 +45,7 @@ def test_work_items_round_trip(tmp_path: Path) -> None:
     assert loaded["items"][0]["id"] == "T000"
     assert (tmp_path / "docs" / "work-items.md").exists()
     work_items_md = (tmp_path / "docs" / "work-items.md").read_text(encoding="utf-8")
-    assert "| ID | Title | Status | Depends | Session | Requirements | Commit |" in work_items_md
+    assert "| ID | Title | Status | Depends | Sessions | Requirements | Commit |" in work_items_md
 
 
 def test_work_items_markdown_compacts_long_requirement_lists(tmp_path: Path) -> None:
@@ -67,6 +67,29 @@ def test_work_items_markdown_compacts_long_requirement_lists(tmp_path: Path) -> 
     save_work_items(tmp_path, payload)
     work_items_md = (tmp_path / "docs" / "work-items.md").read_text(encoding="utf-8")
     assert "REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, ... See docs/work-items.json for details" in work_items_md
+
+
+def test_work_items_markdown_compacts_session_history(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "2",
+        "project": "demo",
+        "generated_at": "2026-06-24T00:00:00Z",
+        "last_updated_commit": "abc",
+        "items": [
+            {
+                "id": "T100",
+                "title": "Many sessions",
+                "status": "verified",
+                "status_session_id": "session-4",
+                "session_ids": ["session-1", "session-2", "session-3", "session-4"],
+                "requirements": [],
+                "dependencies": [],
+            }
+        ],
+    }
+    save_work_items(tmp_path, payload)
+    work_items_md = (tmp_path / "docs" / "work-items.md").read_text(encoding="utf-8")
+    assert "session-1, ... session-4 (4 total; see docs/work-items.json)" in work_items_md
 
 
 def test_test_results_round_trip(tmp_path: Path) -> None:
