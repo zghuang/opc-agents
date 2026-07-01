@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,73 @@ def _host_skill_step(
     return payload
 
 
+def _blocking_clarifications(project_root: Path) -> list[dict[str, Any]]:
+    input_path = stage_input_path(project_root, "spec-review")
+    if not input_path.exists():
+        return []
+    try:
+        payload = json.loads(input_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    clarifications = payload.get("clarifications") if isinstance(payload, dict) else []
+    if not isinstance(clarifications, list):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for item in clarifications:
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity") or "").strip().upper()
+        blocking = bool(item.get("blocking")) or severity == "C1"
+        if not blocking:
+            continue
+        options = [str(value).strip() for value in item.get("answer_options", []) if str(value).strip()]
+        rows.append(
+            {
+                "severity": severity or "C1",
+                "question": str(item.get("question") or "").strip(),
+                "rationale": str(item.get("rationale") or "").strip(),
+                "affected_requirement_ids": [str(value).strip() for value in item.get("affected_requirement_ids", []) if str(value).strip()],
+                "recommended_answer": str(item.get("recommended_answer") or "").strip() or None,
+                "answer_options": options,
+            }
+        )
+    return rows
+
+
+def _clarification_answers_template(clarifications: list[dict[str, Any]]) -> str:
+    lines = ["# Clarification Answers", ""]
+    for item in clarifications:
+        question = str(item.get("question") or "").strip() or "Unspecified clarification"
+        rationale = str(item.get("rationale") or "").strip()
+        recommended = str(item.get("recommended_answer") or "").strip()
+        options = [str(value).strip() for value in item.get("answer_options", []) if str(value).strip()]
+        lines.append(f"## {question}")
+        lines.append("")
+        if rationale:
+            lines.append(f"Context: {rationale}")
+            lines.append("")
+        if recommended:
+            lines.append(f"Recommended answer: {recommended}")
+            lines.append("")
+        if options:
+            lines.append("Suggested options:")
+            lines.extend(f"- {value}" for value in options)
+            lines.append("")
+        lines.append("Answer: ")
+        lines.append("")
+        lines.append("Decision notes: ")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _clarification_answers_ready(project_root: Path) -> bool:
+    path = project_root / "docs" / "clarification-answers.md"
+    if not path.exists():
+        return False
+    return bool(path.read_text(encoding="utf-8").strip())
+
+
 def build_planning_host_step(
     *,
     code: str,
@@ -74,19 +142,41 @@ def build_planning_host_step(
         )
     if code == "clarification_blocking":
         req_path = requirements_path or ""
-        return _host_skill_step(
-            project_root=project_root,
-            skill="spec-review",
-            action="repair_spec_review",
-            message="Blocking clarifications remain; regenerate the canonical spec-review output so the clarified interpretation is embedded in the imported JSON.",
-            expected_input_path=str(stage_input_path(project_root, "spec-review")),
-            import_command=stage_import_command(project_root, "spec-review"),
-            prompt=_generate_only_prompt(
-                f"Use the spec-review skill for project {project_root} with requirements_path {req_path}. The project currently has blocking clarifications in docs/clarification-needed.md. Regenerate a corrected spec-review.json using the current project evidence.",
+        clarifications = _blocking_clarifications(project_root)
+        if _clarification_answers_ready(project_root):
+            return _host_skill_step(
+                project_root=project_root,
+                skill="spec-review",
+                action="repair_spec_review",
+                message="Blocking clarifications have user answers; regenerate the canonical spec-review output so the clarified interpretation is embedded in the imported JSON.",
+                expected_input_path=str(stage_input_path(project_root, "spec-review")),
+                import_command=stage_import_command(project_root, "spec-review"),
+                prompt=_generate_only_prompt(
+                    f"Use the spec-review skill for project {project_root} with requirements_path {req_path}. The project currently has blocking clarifications in docs/clarification-needed.md, and the user has answered them in docs/clarification-answers.md. Treat that file as source evidence, fold the answered clarifications back into the normalized requirements, and only keep a clarification blocking when it still genuinely requires a new external decision from the user. Regenerate a corrected spec-review.json using the current project evidence.",
+                    str(stage_input_path(project_root, "spec-review")),
+                ),
+                extra={"requirements_path": req_path},
+            )
+        return {
+            "kind": "host_interaction",
+            "owner": "host",
+            "action": "collect_clarification_answers",
+            "message": "Blocking clarifications require user answers before spec-review can continue.",
+            "project": str(project_root),
+            "blocking": True,
+            "requires_user_input": True,
+            "requirements_path": req_path,
+            "clarification_path": str(project_root / "docs" / "clarification-needed.md"),
+            "answers_path": str(project_root / "docs" / "clarification-answers.md"),
+            "expected_input_path": str(stage_input_path(project_root, "spec-review")),
+            "import_command": stage_import_command(project_root, "spec-review"),
+            "clarifications": clarifications,
+            "answers_markdown_template": _clarification_answers_template(clarifications),
+            "resume_prompt": _generate_only_prompt(
+                f"Use the spec-review skill for project {project_root} with requirements_path {req_path}. The project currently has blocking clarifications in docs/clarification-needed.md. Read docs/clarification-answers.md after the user answers the blocking questions, treat that file as source evidence, and fold the answered clarifications back into the normalized requirements. Only keep a clarification blocking when it still genuinely requires a new external decision from the user. Regenerate a corrected spec-review.json using the current project evidence.",
                 str(stage_input_path(project_root, "spec-review")),
             ),
-            extra={"requirements_path": req_path},
-        )
+        }
     if code == "architecture_missing":
         return _host_skill_step(
             project_root=project_root,

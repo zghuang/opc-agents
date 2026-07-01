@@ -29,16 +29,20 @@ ${OPC_HOME:-$HOME/opc}/bin/app-delivery-preflight.sh --project {project} --requi
 	- `technology_hints` should preserve the named technology choice and rationale; do not fabricate exact package names when the source only names a framework family.
 	- Set `source_requirements_path` to the same absolute raw requirements path provided to this skill.
 	- If the project already has clarification answers from an earlier spec-review pass, fold those resolved answers back into the canonical requirement interpretation instead of treating clarification resolution as a separate external planning stage.
-4. Write that JSON to `${project}/.app-delivery-runtime/stage-inputs/spec-review.json`.
-5. Import the stage result through the harness:
+	- When a clarification still genuinely requires a user decision, include a concise `recommended_answer` and a small `answer_options` list when defensible so the host can offer suggested choices without blocking freeform user input.
+5. If `docs/clarification-needed.md` contains blocking questions from an earlier pass, inspect whether the current source requirements, existing project artifacts, or framework-selected defaults already support defensible answers.
+	- When they do, write or update `docs/clarification-answers.md` with concise answers before regenerating the canonical JSON.
+	- Do not invent answers that require a genuinely new product, security, architecture, or scope decision from the user.
+6. Write that JSON to `${project}/.app-delivery-runtime/stage-inputs/spec-review.json`.
+7. Import the stage result through the harness:
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery spec-review --project {project} --input {project}/.app-delivery-runtime/stage-inputs/spec-review.json
 ```
-6. Verify the output exists:
+8. Verify the output exists:
 ```bash
 test -f {project}/docs/requirements.json
 ```
-7. If `{project}/docs/clarification-needed.md` is written and contains blocking questions that are still genuinely unresolved, stop before arch-design.
+9. If `{project}/docs/clarification-needed.md` is written and contains blocking questions that are still genuinely unresolved, stop before arch-design.
 
 Outputs:
 - `{project}/docs/requirements.json`

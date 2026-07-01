@@ -48,8 +48,9 @@ Constraints:
 - output_tests should be concrete paths that can be executed later.
 - output_paths should be the main source paths the task is expected to touch.
 - All file paths must be project-root-relative. Use `backend/...`, `frontend/...`, `mock-server/...`, or `docs/...` paths, not backend-root-relative shortcuts like `src/...` or `tests/...`.
-- The canonical mock server location is project-root `mock-server/`. Do not generate `companion/mock-server/...`, sibling `*-mocks/...`, or any other mock-server path shape.
-- For backend code paths, use `backend/src/...` and backend test paths such as `backend/src/tests/...` or `backend/tests/...`.
+- The canonical mock server location is project-root `mock-server/`. Do not invent alternative mock-service roots unless the selected stack/template explicitly supports them.
+- For backend code paths in the python-react stack, use `backend/src/...`; for backend tests use `backend/src/tests/...` or `backend/tests/...`.
+- For MCP/FastMCP in python-react projects, put production code under `backend/src/...`; put simulated tool-service fixtures or mock-only helpers under project-root `mock-server/...`. Do not invent additional service roots unless the selected stack/template explicitly supports them.
 - For frontend code paths, use `frontend/src/...`; for browser/e2e tests use `frontend/e2e/...` when the test is file-based.
 - Add dependency edges only for real prerequisites: technical/shared foundation needs or product workflow/domain ordering. If feature B only makes sense after feature A, make B depend on A.
 - Ensure every requirement is covered by at least one feature task.
@@ -59,6 +60,7 @@ Constraints:
 - Before finalizing `items`, self-check every `feature` task with this question: after this task alone and its dependencies complete, what user, operator, or external system capability works end-to-end enough to be tested?
 - If the answer is only "shared setup exists", "a page shell exists", "models exist", "API routes exist", or "tests exist", revise the task boundary unless the task is a necessary dependency task with narrowly scoped requirements.
 - Each acceptance_scenario should have corresponding output tests that exercise it.
+- Assign an acceptance_scenario to the task that makes the scenario's observable journey, decision, or action executable; do not attach it only to a prerequisite data, adapter, model, or signal-producing slice.
 - If a task owns a user-visible acceptance scenario and includes `frontend/src/...` output paths, its `output_tests` should normally include at least one browser/e2e test for that flow. Do not defer all browser evidence to a later validation task unless that downstream validation task explicitly owns the same scenario.
 - Validation tasks may deepen browser coverage, but they should not be the first and only browser evidence for a user-visible frontend feature slice.
 - Do not create a generic end-to-end verification suite task. The framework already provides T-FINAL for cross-project verification.

@@ -105,7 +105,7 @@ def test_decompose_tasks_inserts_builtin_foundations(tmp_path: Path) -> None:
     assert payload["items"][1]["title"] == "Shared foundation"
     assert ids[-2:] == [PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID]
     by_id = {item["id"]: item for item in payload["items"]}
-    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"][:3] == ["T000", "T001", "T002"]
     assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == [PREFINAL_AUDIT_TASK_ID]
     assert payload["items"][1]["output_paths"] == [
         "backend/pyproject.toml",
@@ -123,6 +123,8 @@ def test_decompose_tasks_inserts_builtin_foundations(tmp_path: Path) -> None:
         "frontend/src/App.test.tsx",
         "frontend/e2e/",
     ]
+    assert payload["items"][1]["intent"]["objective"].startswith("Create the minimal shared")
+    assert "Do not preinstall project-wide technology packages" in payload["items"][1]["intent"]["non_goals"][-1]
 
 
 def test_decompose_tasks_preserves_normalized_task_intent(tmp_path: Path) -> None:
@@ -267,8 +269,80 @@ def test_decompose_tasks_inserts_frontend_api_audit_for_frontend_with_backend_ap
     assert by_id[FRONTEND_API_AUDIT_TASK_ID]["task_kind"] == "audit"
     assert by_id[FRONTEND_API_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
     assert by_id[FRONTEND_API_AUDIT_TASK_ID]["output_paths"][-1] == FRONTEND_API_AUDIT_REPORT_PATH
-    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002", FRONTEND_API_AUDIT_TASK_ID]
+    production_gate_ids = [item["id"] for item in payload["items"] if str(item["title"]).startswith("Production Gate:")]
+    assert production_gate_ids
+    assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002", FRONTEND_API_AUDIT_TASK_ID, *production_gate_ids]
     assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == [PREFINAL_AUDIT_TASK_ID]
+
+
+def test_decompose_tasks_adds_dynamic_production_gates_for_matching_project(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [
+                    {"id": "REQ-001", "title": "RBAC", "summary": "Users require role permissions and site data isolation."},
+                    {"id": "REQ-002", "title": "Agent", "summary": "AI agent orchestrator must call model tools."},
+                    {"id": "REQ-003", "title": "Execution", "summary": "Approved actions dispatch to external systems with rollback."},
+                ],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "frontend").mkdir(parents=True)
+    (tmp_path / "frontend" / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "backend" / "src" / "api").mkdir(parents=True)
+
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Full-stack workflow",
+                "requirements": ["REQ-001", "REQ-002", "REQ-003"],
+                "acceptance_scenarios": [],
+                "output_tests": ["backend/tests/test_workflow.py", "frontend/e2e/workflow.spec.ts"],
+                "output_paths": ["backend/src/api/workflow.py", "backend/src/agents/workflow.py", "frontend/src/pages/Workflow.tsx"],
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    titles = [item["title"] for item in payload["items"]]
+    assert "Production Gate: Real backend E2E validation" in titles
+    assert "Production Gate: Security and RBAC enforcement" in titles
+    assert "Production Gate: Real agent integration" in titles
+    assert "Production Gate: Approval and execution loop" in titles
+    assert payload["items"][-2]["id"] == PREFINAL_AUDIT_TASK_ID
+    assert payload["items"][-1]["id"] == FINAL_VERIFY_TASK_ID
+
+
+def test_decompose_tasks_does_not_add_agent_gate_without_agent_requirements(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps({"requirements": [{"id": "REQ-001", "title": "Orders", "summary": "Users manage orders."}], "acceptance_scenarios": []}),
+        encoding="utf-8",
+    )
+    (tmp_path / "backend" / "src" / "api").mkdir(parents=True)
+
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Order API",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": [],
+                "output_tests": ["backend/tests/test_orders.py"],
+                "output_paths": ["backend/src/api/orders.py"],
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    titles = [item["title"] for item in payload["items"]]
+    assert "Production Gate: Real agent integration" not in titles
 
 
 def test_decompose_tasks_normalizes_backend_app_contract_paths(tmp_path: Path) -> None:
@@ -344,6 +418,42 @@ def test_decompose_tasks_rejects_companion_mock_server_contract_paths(tmp_path: 
         assert "use project-root mock-server/..." in str(exc)
     else:
         raise AssertionError("expected companion/mock-server paths to be rejected")
+
+
+def test_decompose_tasks_rejects_top_level_mcp_server_contract_paths(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        decompose_tasks(
+            tmp_path,
+            [
+                {
+                    "title": "MCP tools",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T001"],
+                    "output_tests": ["mcp-server/tests/test_tools.py"],
+                    "output_paths": ["mcp-server/server.py", "mcp-server/tools/rules.py"],
+                }
+            ],
+            include_shared_foundation=True,
+        )
+    except ValueError as exc:
+        assert "top-level mcp-server paths" in str(exc)
+        assert "backend/src/..." in str(exc)
+        assert "mock-server/..." in str(exc)
+    else:
+        raise AssertionError("expected top-level mcp-server paths to be rejected")
 
 
 def test_normalize_complexity_override_requires_task_decompose_metadata() -> None:

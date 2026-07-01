@@ -253,6 +253,9 @@ def write_final_repair_report(
             lines.append(f"- {requirement_id}: missing {test_type}")
     else:
         lines.append("- none")
+    semantic_report_path = Path(project_root).expanduser().resolve() / "docs" / "reviews" / "production-semantic-scan.md"
+    if semantic_report_path.exists():
+        lines.extend(["", "## Production Semantic Scan", "", "- docs/reviews/production-semantic-scan.md"])
     lines.extend(["", "## Suggested Repair Targets", ""])
     if repair_candidates:
         for task_id in repair_candidates:

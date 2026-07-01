@@ -14,6 +14,7 @@ from delivery.errors import DeliveryError
 from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
 from delivery.loop_review import code_review_request_path
 from delivery.loop import status as loop_status
+from delivery.control_plane_host import build_planning_host_step
 from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt
 from delivery.stage_harness import stage_import_command, stage_input_path
@@ -117,6 +118,53 @@ def test_task_and_review_prompts_inline_relevant_technology_constraints(tmp_path
     assert "dependency entries, imports/usages, adapters, configuration" in review_prompt
     assert "status=changes_requested" in review_prompt
     assert "PostgreSQL" not in review_prompt
+
+
+def test_shared_foundation_prompt_has_intent_and_manifest_boundary(tmp_path: Path) -> None:
+    from delivery.loop_task_prompt import build_task_prompt
+    from delivery.task import Task
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(
+        json.dumps(
+            {
+                "dependency_hints": [
+                    {
+                        "ecosystem": "backend",
+                        "name": "LangGraph",
+                        "source": "requirements-analysis",
+                        "reason": "Agent orchestration framework.",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    task = Task.from_dict(
+        {
+            "id": "T001",
+            "title": "Shared foundation",
+            "status": "pending",
+            "requirements": [],
+            "acceptance_scenarios": [],
+            "dependencies": ["T000"],
+            "output_tests": ["backend/src/tests/test_health.py"],
+            "output_paths": ["backend/pyproject.toml", "backend/uv.lock", "backend/src/runtime/"],
+            "intent": {
+                "objective": "Create the minimal shared foundation.",
+                "done_when": ["Foundation smoke tests pass"],
+                "non_goals": ["Do not implement agent graphs"],
+            },
+        }
+    )
+
+    prompt = build_task_prompt(tmp_path, task)
+
+    assert "Task intent:" in prompt
+    assert "Foundation smoke tests pass" in prompt
+    assert "For shared foundation, install only dependencies directly used" in prompt
+    assert "LangGraph (backend)" not in prompt
 
 
 def test_build_prefinal_audit_prompt_is_self_contained(tmp_path: Path) -> None:
@@ -282,6 +330,64 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
     assert persisted["items"][0]["title"] == "Feature"
     gates = load_gates(tmp_path)
     assert any(gate["id"] == "GATE-RELEASE" for gate in gates["gates"])
+
+
+def test_cmd_decompose_rejects_backend_root_package_paths(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    input_path = tmp_path / "decompose.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "delivery_complexity": {"tier": "S", "rationale": "Small", "signals": {}},
+                "validation_gates": [],
+                "items": [
+                    {"title": "Feature", "task_kind": "feature", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/api/feature.py"]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert exc_info.value.code == "stage_output_invalid"
+    assert "backend-root package paths" in exc_info.value.message
+
+
+def test_cmd_decompose_rejects_top_level_mcp_server_paths(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    input_path = tmp_path / "decompose.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "delivery_complexity": {"tier": "S", "rationale": "Small", "signals": {}},
+                "validation_gates": [],
+                "items": [
+                    {
+                        "title": "MCP tools",
+                        "task_kind": "feature",
+                        "requirements": ["REQ-001"],
+                        "acceptance_scenarios": [],
+                        "dependencies": [],
+                        "output_tests": ["mcp-server/tests/test_tools.py"],
+                        "output_paths": ["mcp-server/server.py", "mcp-server/tools/rules.py"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert exc_info.value.code == "stage_output_invalid"
+    assert "top-level mcp-server paths" in exc_info.value.message
 
 
 def test_cmd_decompose_imports_complexity_and_validation_gates_from_object_payload(tmp_path: Path) -> None:
@@ -465,6 +571,245 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
     assert payload["items"][0]["git_commit"] == "abc123"
     assert payload["items"][0]["review_status"] == "pass"
     assert payload["items"][0]["review_artifact"] == "docs/reviews/code-review-T002.md"
+
+
+def test_cmd_code_review_task_contract_repair_moves_acceptance_to_later_task(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": [{"id": "AS-001", "title": "Scenario", "summary": "Needs a later workflow.", "source_requirement_ids": ["REQ-001"]}]}), encoding="utf-8")
+    (docs_dir / "architecture.md").write_text("architecture\n", encoding="utf-8")
+    (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
+    save_architecture_meta(tmp_path, {"schema_version": "1", "ui_required": False})
+    tmp_path.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
+    save_test_plan(tmp_path, {"schema_version": "1", "coverage": []})
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": ["AS-001"],
+                    "dependencies": ["T000"],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/src/feature.py"],
+                    "status_session_id": "ses-1",
+                    "completed_at": "2026-06-24T01:00:00Z",
+                    "attempts": 1,
+                },
+                {"id": "T003", "title": "Later Workflow", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": ["backend/tests/test_workflow.py"], "output_paths": ["backend/src/workflow.py"]},
+                {"id": FINAL_VERIFY_TASK_ID, "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T003"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    input_path = tmp_path / "code-review.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "status": "changes_requested",
+                "summary": "Declared acceptance scenario belongs to a later workflow task.",
+                "findings": [
+                    {
+                        "severity": "blocking",
+                        "requirement_ids": [],
+                        "acceptance_ids": ["AS-001"],
+                        "message": "AS-001 cannot be completed inside this task contract.",
+                    }
+                ],
+                "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "Task-local requirement behavior is complete."}],
+                "acceptance_assessment": [{"id": "AS-001", "status": "changes_requested", "notes": "Scenario requires a later workflow task."}],
+                "task_contract_assessment": {
+                    "status": "changes_requested",
+                    "issue_type": "task_contract",
+                    "recommended_action": "task_contract_repair",
+                    "operations": [
+                        {
+                            "op": "move_acceptance_scenario",
+                            "id": "AS-001",
+                            "from_task": "T002",
+                            "to_task_id": "T003",
+                            "rationale": "AS-001 belongs to the later workflow task.",
+                        }
+                    ],
+                    "affected_requirement_ids": [],
+                    "affected_acceptance_ids": ["AS-001"],
+                    "notes": "Move AS-001 to the task that owns the workflow implementation.",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
+
+    assert result == 2
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    by_id = {item["id"]: item for item in payload["items"]}
+    assert by_id["T002"]["status"] == "pending"
+    assert by_id["T002"]["review_status"] is None
+    assert by_id["T002"]["acceptance_scenarios"] == []
+    assert by_id["T003"]["acceptance_scenarios"] == ["AS-001"]
+    assert by_id["T003"]["requirements"] == ["REQ-001"]
+    assert by_id["T003"]["status"] == "pending"
+    runtime_state = load_task_runtime_state(tmp_path, "T002")
+    assert runtime_state["task_contract_repair"]["applied_operations"][0]["mode"] == "moved_to_existing_task"
+
+
+def test_cmd_code_review_task_contract_repair_creates_followup_when_no_target_exists(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": [{"id": "AS-001", "title": "Scenario", "summary": "Needs a later workflow.", "source_requirement_ids": ["REQ-001"]}]}), encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "Feature", "status": "review_pending", "requirements": ["REQ-001"], "acceptance_scenarios": ["AS-001"], "dependencies": ["T000"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "status_session_id": "ses-1", "completed_at": "2026-06-24T01:00:00Z", "attempts": 1},
+                {"id": FINAL_VERIFY_TASK_ID, "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    input_path = tmp_path / "code-review.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "status": "changes_requested",
+                "summary": "Declared acceptance scenario needs its own follow-up task.",
+                "findings": [{"severity": "blocking", "requirement_ids": [], "acceptance_ids": ["AS-001"], "message": "AS-001 cannot be completed inside this task contract."}],
+                "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "Task-local requirement behavior is complete."}],
+                "acceptance_assessment": [{"id": "AS-001", "status": "changes_requested", "notes": "Scenario requires a separate follow-up task."}],
+                "task_contract_assessment": {
+                    "status": "changes_requested",
+                    "issue_type": "task_contract",
+                    "recommended_action": "task_contract_repair",
+                    "operations": [
+                        {
+                            "op": "move_acceptance_scenario",
+                            "id": "AS-001",
+                            "from_task": "T002",
+                            "to_task_hint": "workflow implementation",
+                            "followup_task": {
+                                "title": "Acceptance Scenario Follow-up: AS-001 workflow",
+                                "requirements": ["REQ-001"],
+                                "output_tests": ["backend/tests/test_as_001_workflow.py"],
+                                "output_paths": ["backend/src/workflow/as_001.py"],
+                            },
+                        }
+                    ],
+                    "affected_requirement_ids": [],
+                    "affected_acceptance_ids": ["AS-001"],
+                    "notes": "Create a follow-up task for AS-001.",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
+
+    assert result == 2
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    by_id = {item["id"]: item for item in payload["items"]}
+    followup = next(item for item in payload["items"] if item["title"] == "Acceptance Scenario Follow-up: AS-001 workflow")
+    assert by_id["T002"]["acceptance_scenarios"] == []
+    assert followup["acceptance_scenarios"] == ["AS-001"]
+    assert followup["dependencies"] == ["T002"]
+    assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == ["T002", followup["id"]]
+    runtime_state = load_task_runtime_state(tmp_path, "T002")
+    assert runtime_state["task_contract_repair"]["applied_operations"][0]["mode"] == "created_followup_task"
+
+
+def test_cmd_code_review_task_contract_repair_defers_acceptance_when_local_repair_is_unsafe(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": [{"id": "AS-001", "title": "Scenario", "summary": "Needs a later workflow."}]}), encoding="utf-8")
+    (docs_dir / "architecture.md").write_text("architecture\n", encoding="utf-8")
+    (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
+    save_architecture_meta(tmp_path, {"schema_version": "1", "ui_required": False})
+    tmp_path.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
+    save_test_plan(tmp_path, {"schema_version": "1", "coverage": []})
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "Feature", "status": "review_pending", "requirements": ["REQ-001"], "acceptance_scenarios": ["AS-001"], "dependencies": ["T000"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "status_session_id": "ses-1", "completed_at": "2026-06-24T01:00:00Z", "attempts": 1},
+                {"id": FINAL_VERIFY_TASK_ID, "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    input_path = tmp_path / "code-review.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "status": "changes_requested",
+                "summary": "Declared acceptance scenario belongs elsewhere but no safe target was identified.",
+                "findings": [{"severity": "blocking", "requirement_ids": [], "acceptance_ids": ["AS-001"], "message": "AS-001 cannot be completed inside this task contract."}],
+                "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "Task-local requirement behavior is complete."}],
+                "acceptance_assessment": [{"id": "AS-001", "status": "changes_requested", "notes": "Scenario requires a later workflow task."}],
+                "task_contract_assessment": {
+                    "status": "changes_requested",
+                    "issue_type": "task_contract",
+                    "recommended_action": "task_contract_repair",
+                    "operations": [{"op": "move_acceptance_scenario", "id": "AS-001", "from_task": "T002", "to_task_hint": "unknown workflow"}],
+                    "affected_requirement_ids": [],
+                    "affected_acceptance_ids": ["AS-001"],
+                    "notes": "Move AS-001 when a safe target is available.",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("delivery.loop_review.git_commit_explicit_paths", lambda project_root, paths, message: "abc123")
+
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
+
+    assert result == 0
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    by_id = {item["id"]: item for item in payload["items"]}
+    assert by_id["T002"]["status"] == "verified"
+    assert by_id["T002"]["review_status"] == "pass"
+    assert by_id["T002"]["acceptance_scenarios"] == []
+    assert "verified with deferred acceptance" in by_id["T002"]["blocked_reason"]
+    runtime_state = load_task_runtime_state(tmp_path, "T002")
+    assert runtime_state["task_contract_deferred_acceptance"]["deferred_acceptance_scenarios"][0]["id"] == "AS-001"
+    assert runtime_state["task_contract_blocker"] is None
+    deferrals = json.loads((tmp_path / "docs" / "reviews" / "task-contract-deferrals.json").read_text(encoding="utf-8"))
+    assert deferrals["deferred_acceptance_scenarios"][0]["policy"] == "delivery_continue"
+    review_md = (tmp_path / "docs" / "reviews" / "code-review-T002.md").read_text(encoding="utf-8")
+    assert "Deferred acceptance scenario assignment" in review_md
+
+    monkeypatch.setattr("delivery.control_plane.needs_scaffold", lambda project_root: False)
+    control_result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    routed = json.loads(capsys.readouterr().out)
+    assert control_result == 0
+    assert routed["planning_blocker_code"] is None
+    assert routed["next_step"]["action"] == "run_final_verify"
 
 
 def test_cmd_code_review_rejects_pass_when_latest_task_tests_failed(tmp_path: Path, monkeypatch) -> None:
@@ -1032,6 +1377,39 @@ def test_cmd_spec_review_archives_source_requirements_when_payload_includes_path
     assert (tmp_path / "docs" / "requirements-source.md").read_text(encoding="utf-8") == "# Raw requirements\n"
 
 
+def test_cmd_spec_review_preserves_blocking_clarifications(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    input_path = tmp_path / "spec-review.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+                "clarifications": [
+                    {
+                        "severity": "C1",
+                        "question": "持久化存储方案未指定",
+                        "rationale": "数据库选型未指定。",
+                        "affected_requirement_ids": ["REQ-001"],
+                        "blocking": True,
+                    }
+                ],
+                "source_requirements_path": str(tmp_path / "raw.md"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "raw.md").write_text("# Raw requirements\n", encoding="utf-8")
+
+    result = cli.cmd_spec_review(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert result == 2
+    clarification_text = (docs_dir / "clarification-needed.md").read_text(encoding="utf-8")
+    assert "blocking_count: 1" in clarification_text
+    assert "## C1 - 持久化存储方案未指定" in clarification_text
+
+
 def test_cmd_start_bare_project_name_uses_opc_projects_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("OPC_HOME", str(tmp_path))
     requirements = tmp_path / "req.md"
@@ -1224,6 +1602,58 @@ def test_cmd_control_status_reports_planning_next_step(tmp_path: Path, capsys: p
     assert payload["must_continue"] is True
     assert payload["control_status"] == "in_progress"
     assert payload["next_step"]["skill"] == "spec-review"
+
+
+def test_cmd_control_status_surfaces_blocking_clarification_questions(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    spec_input_path = tmp_path / ".app-delivery-runtime" / "stage-inputs" / "spec-review.json"
+    spec_input_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_input_path.write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+                "clarifications": [
+                    {
+                        "severity": "C1",
+                        "question": "Need storage decision",
+                        "rationale": "This changes the persistence design.",
+                        "affected_requirement_ids": ["REQ-001"],
+                        "blocking": True,
+                        "recommended_answer": "Use PostgreSQL.",
+                        "answer_options": ["Use PostgreSQL", "Use SQLite"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (docs_dir / "clarification-needed.md").write_text("blocking_count: 1\n## C1 - Need storage decision\n", encoding="utf-8")
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["planning_blocker_code"] == "clarification_blocking"
+    assert payload["must_continue"] is False
+    assert payload["control_status"] == "blocked"
+    assert payload["next_step"]["action"] == "collect_clarification_answers"
+    assert payload["next_step"]["requires_user_input"] is True
+    assert payload["next_step"]["clarifications"][0]["recommended_answer"] == "Use PostgreSQL."
+    assert payload["next_step"]["clarifications"][0]["answer_options"] == ["Use PostgreSQL", "Use SQLite"]
 
 
 def test_cmd_control_status_routes_blocked_final_verify_to_repair_task(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -3054,6 +3484,127 @@ def test_cmd_start_does_not_autoresolve_blocking_clarifications(tmp_path: Path, 
     assert exc_info.value.code == "clarification_blocking"
 
 
+def test_build_planning_host_step_clarification_blocking_requests_user_answers(tmp_path: Path) -> None:
+    input_path = tmp_path / ".app-delivery-runtime" / "stage-inputs" / "spec-review.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+                "clarifications": [
+                    {
+                        "severity": "C1",
+                        "question": "Need storage decision",
+                        "rationale": "This changes persistence architecture.",
+                        "affected_requirement_ids": ["REQ-001"],
+                        "blocking": True,
+                        "recommended_answer": "Use PostgreSQL.",
+                        "answer_options": ["Use PostgreSQL", "Use SQLite"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    step = build_planning_host_step(
+        code="clarification_blocking",
+        project_root=tmp_path,
+        requirements_path=str(tmp_path / "req.md"),
+    )
+
+    assert step is not None
+    assert step["kind"] == "host_interaction"
+    assert step["action"] == "collect_clarification_answers"
+    assert step["requires_user_input"] is True
+    assert step["answers_path"].endswith("/docs/clarification-answers.md")
+    assert step["clarifications"][0]["question"] == "Need storage decision"
+    assert step["clarifications"][0]["recommended_answer"] == "Use PostgreSQL."
+    assert "Answer: " in step["answers_markdown_template"]
+    assert "docs/clarification-answers.md" in step["resume_prompt"]
+
+
+def test_build_planning_host_step_clarification_blocking_uses_answers_to_resume_spec_review(tmp_path: Path) -> None:
+    input_path = tmp_path / ".app-delivery-runtime" / "stage-inputs" / "spec-review.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+                "clarifications": [
+                    {
+                        "severity": "C1",
+                        "question": "Need storage decision",
+                        "rationale": "This changes persistence architecture.",
+                        "affected_requirement_ids": ["REQ-001"],
+                        "blocking": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "clarification-answers.md").write_text("# Clarification Answers\n\n## Need storage decision\n\nAnswer: Use PostgreSQL.\n", encoding="utf-8")
+
+    step = build_planning_host_step(
+        code="clarification_blocking",
+        project_root=tmp_path,
+        requirements_path=str(tmp_path / "req.md"),
+    )
+
+    assert step is not None
+    assert step["kind"] == "host_skill"
+    assert step["skill"] == "spec-review"
+    assert step["action"] == "repair_spec_review"
+    assert "docs/clarification-answers.md" in step["prompt"]
+    assert "fold the answered clarifications back into the normalized requirements" in step["prompt"]
+
+
+def test_cmd_control_auto_defers_clarification_questions_to_outer_host(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    snapshots = [
+        {
+            "control_status": "blocked",
+            "must_continue": False,
+            "next_step": {
+                "kind": "host_interaction",
+                "owner": "host",
+                "action": "collect_clarification_answers",
+                "requires_user_input": True,
+                "clarifications": [{"question": "Need storage decision"}],
+            },
+        },
+    ]
+
+    def fake_run_control(project_root, *, goal, requirements_path=None, repair_task_id=None):
+        return dict(snapshots.pop(0))
+
+    monkeypatch.setattr(cli, "run_control", fake_run_control)
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="auto",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["control_status"] == "blocked"
+    assert payload["next_step"]["action"] == "collect_clarification_answers"
+    assert "executed_steps" not in payload
+
+
 def test_cmd_fix_retires_matching_active_session(tmp_path: Path) -> None:
     save_work_items(
         tmp_path,
@@ -3448,6 +3999,20 @@ def test_cmd_start_rejects_concurrent_execution(tmp_path: Path, monkeypatch) -> 
     assert exc_info.value.details["lock_owner"]["pid"] == 123
 
 
+def test_project_execution_guard_prunes_dead_pid_lock(tmp_path: Path, monkeypatch) -> None:
+    lock_dir = tmp_path / ".app-delivery-runtime" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "execution.lock"
+    lock_path.write_text('{"pid":999999,"heartbeat_at":"2026-06-24T00:00:00Z"}\n', encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_pid_is_running", lambda pid: False if pid == 999999 else True)
+
+    removed = cli._prune_stale_execution_lock(tmp_path)
+
+    assert removed is True
+    assert not lock_path.exists()
+
+
 def test_cmd_start_rejects_invalid_task_contracts(tmp_path: Path) -> None:
     project_root = tmp_path
     docs_dir = project_root / "docs"
@@ -3602,3 +4167,90 @@ def test_cmd_arch_design_requires_module_architecture_section(tmp_path: Path) ->
 
     assert exc_info.value.code == "input_invalid_shape"
     assert "Module Architecture" in exc_info.value.message
+
+
+def test_cmd_arch_design_rejects_backend_root_package_paths(tmp_path: Path) -> None:
+    input_path = tmp_path / "arch.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "architecture_md": "# Architecture\n\n## Module Architecture\n\n```text\nproject/\n├── backend/\n│   ├── api/\n│   └── agents/\n└── frontend/\n```\n",
+                "shared_components_md": "shared\n",
+                "ui_required": True,
+                "modules": [],
+                "adrs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert exc_info.value.code == "input_invalid_shape"
+    assert "backend/src" in exc_info.value.message
+
+
+def test_cmd_arch_design_rejects_top_level_mcp_server_paths(tmp_path: Path) -> None:
+    input_path = tmp_path / "arch.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "architecture_md": "# Architecture\n\n## Module Architecture\n\n```text\nproject/\n├── backend/\n│   └── src/\n├── mcp-server/\n│   └── tools/\n└── frontend/\n```\n",
+                "shared_components_md": "shared\n",
+                "ui_required": True,
+                "modules": [],
+                "adrs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert exc_info.value.code == "input_invalid_shape"
+    assert "unsupported extra service root" in exc_info.value.message
+
+
+def test_cmd_arch_design_ignores_backend_root_examples_outside_module_tree(tmp_path: Path) -> None:
+    input_path = tmp_path / "arch.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "architecture_md": "# Architecture\n\nThis prose mentions backend/api as legacy input text only.\n\n## Module Architecture\n\n```text\nproject/\n├── backend/\n│   └── src/\n│       └── api/\n└── frontend/\n```\n",
+                "shared_components_md": "shared\n",
+                "ui_required": True,
+                "modules": [],
+                "adrs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert result == 0
+
+
+def test_cmd_arch_design_rejects_implementation_file_inventory(tmp_path: Path) -> None:
+    file_rows = "\n".join(f"│       ├── generated_{idx}.py" for idx in range(25))
+    input_path = tmp_path / "arch.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "architecture_md": f"# Architecture\n\n## Module Architecture\n\n```text\nproject/\n├── backend/\n│   └── src/\n{file_rows}\n└── frontend/\n```\n",
+                "shared_components_md": "shared\n",
+                "ui_required": True,
+                "modules": [],
+                "adrs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert exc_info.value.code == "input_invalid_shape"
+    assert "scaffold skeleton" in exc_info.value.message

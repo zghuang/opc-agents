@@ -258,6 +258,13 @@ def _write_lock_metadata_to_handle(handle: Any, metadata: dict[str, Any]) -> Non
 
 def read_lock_metadata(lock_path: Path | str) -> dict[str, Any]:
     path = Path(lock_path)
+    for _ in range(3):
+        payload = load_json(path, {})
+        if isinstance(payload, dict) and payload:
+            return payload
+        if not path.exists():
+            return {}
+        time.sleep(0.01)
     payload = load_json(path, {})
     return payload if isinstance(payload, dict) else {}
 

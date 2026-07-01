@@ -8,7 +8,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-15432}:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "opc_user"]
       interval: 5s
@@ -18,7 +18,7 @@ services:
   backend:
     build: ./backend
     ports:
-      - "8000:8000"
+      - "${BACKEND_HOST_PORT:-18000}:8000"
     env_file: backend/.env
     environment:
       DATABASE_URL: postgresql+asyncpg://opc_user:${DB_PASSWORD:-password}@postgres:5432/app_db
@@ -29,14 +29,14 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "80:8080"
+      - "${FRONTEND_HOST_PORT:-15080}:8080"
     depends_on:
       - backend
 
   mocks:
     build: ./mock-server
     ports:
-      - "8888:8888"
+      - "${MOCK_SERVER_HOST_PORT:-18888}:8888"
 
 volumes:
   postgres_data:

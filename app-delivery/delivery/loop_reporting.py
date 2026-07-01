@@ -889,6 +889,15 @@ def render_project_summary(project_root: Path | str, payload: dict[str, Any]) ->
 def render_release_evidence(project_root: Path | str, results_summary: str, requirement_coverage: dict[str, Any], missing_test_types: list[tuple[str, str]]) -> Path:
     project_dir = resolve_project_root(project_root)
     release_path = project_dir / "docs" / "release-evidence.md"
+    deferral_path = project_dir / "docs" / "reviews" / "task-contract-deferrals.json"
+    deferred_acceptance: list[dict[str, Any]] = []
+    if deferral_path.exists():
+        try:
+            deferral_payload = json.loads(deferral_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            deferral_payload = {}
+        if isinstance(deferral_payload, dict) and isinstance(deferral_payload.get("deferred_acceptance_scenarios"), list):
+            deferred_acceptance = [row for row in deferral_payload["deferred_acceptance_scenarios"] if isinstance(row, dict)]
     lines = [
         "# Release Evidence",
         "",
@@ -908,6 +917,15 @@ def render_release_evidence(project_root: Path | str, results_summary: str, requ
     if missing_test_types:
         for requirement_id, test_type in missing_test_types:
             lines.append(f"- {requirement_id}: missing {test_type}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Deferred Acceptance Scenarios", ""])
+    if deferred_acceptance:
+        for row in deferred_acceptance:
+            lines.append(
+                f"- {row.get('id', '-')}: from {row.get('from_task', '-')} — {row.get('reason', '')} "
+                f"(policy={row.get('policy', '-')}; review={row.get('review_artifact', '-')})"
+            )
     else:
         lines.append("- none")
     release_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

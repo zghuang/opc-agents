@@ -68,6 +68,49 @@ def _copy_backend_env_from_example(project_root: Path) -> None:
     _copy_file(example, target)
 
 
+def _project_port_values(project_root: Path) -> dict[str, int]:
+    seed = sum((index + 1) * ord(char) for index, char in enumerate(project_root.name)) % 1000
+    return {
+        "POSTGRES_HOST_PORT": 15432 + seed,
+        "BACKEND_HOST_PORT": 18000 + seed,
+        "FRONTEND_HOST_PORT": 15080 + seed,
+        "MOCK_SERVER_HOST_PORT": 18888 + seed,
+    }
+
+
+def _upsert_env_values(path: Path, values: dict[str, str | int]) -> None:
+    existing_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    seen: set[str] = set()
+    output: list[str] = []
+    for line in existing_lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else ""
+        if key in values:
+            output.append(f"{key}={values[key]}")
+            seen.add(key)
+        else:
+            output.append(line)
+    for key, value in values.items():
+        if key not in seen:
+            output.append(f"{key}={value}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+
+def _configure_project_ports(project_root: Path) -> None:
+    ports = _project_port_values(project_root)
+    _upsert_env_values(project_root / ".env", ports)
+    backend_env = project_root / "backend" / ".env"
+    if backend_env.exists():
+        values: dict[str, str] = {}
+        text = backend_env.read_text(encoding="utf-8")
+        if "@localhost:5432/" in text:
+            values["DATABASE_URL"] = f"postgresql+asyncpg://opc_user:password@localhost:{ports['POSTGRES_HOST_PORT']}/app_db"
+        if "EXTERNAL_API_BASE_URL=http://localhost:8888" in text:
+            values["EXTERNAL_API_BASE_URL"] = f"http://localhost:{ports['MOCK_SERVER_HOST_PORT']}"
+        if values:
+            _upsert_env_values(backend_env, values)
+
+
 def _sync_runtime_support_files(src_dir: Path, dst_dir: Path) -> None:
     if not src_dir.exists():
         return
@@ -286,6 +329,7 @@ def scaffold_project(project_root: Path | str, *, template_root: Path | None = N
     (project_dir / "docs").mkdir(parents=True, exist_ok=True)
     _render_tree(project_dir, project_name)
     _copy_backend_env_from_example(project_dir)
+    _configure_project_ports(project_dir)
     _create_scaffold_from_module_architecture(project_dir)
     work_items_path = project_dir / "docs" / "work-items.json"
     if work_items_path.exists():

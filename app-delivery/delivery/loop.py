@@ -11,6 +11,7 @@ from .loop_gitops import ensure_git_repo, git_commit_task, git_commit_timestamp,
 from .loop_gitops import git_changed_paths, restore_paths_to_head, task_scope_delta
 from .loop_reporting import PAUSE_FILE, project_summary, render_release_evidence, status
 from .loop_review import write_code_review_request, write_final_review_request
+from .production_semantics import SemanticFinding, scan_production_semantics, write_semantic_scan_report
 from .runtime_config import resolve_runtime
 from .scaffold import scaffold_project
 from .session import RuntimeErrorResponse, RuntimeSession, current_session, execute_in_session, retire_session, save_current_session, start_task_session, touch_session
@@ -59,6 +60,25 @@ def _write_exception_report(project_root: Path | str, task: Task, summary: str, 
     review_dir = project_dir / "docs" / "reviews"
     review_dir.mkdir(parents=True, exist_ok=True)
     report_path = review_dir / f"exception-report-{task.id}.md"
+    runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_dir, task.id))
+    runtime_fields = {
+        "session_id": runtime_state.get("session_id") or task.status_session_id,
+        "status": runtime_state.get("status"),
+        "failure_kind": runtime_state.get("failure_kind"),
+        "failure_count": runtime_state.get("failure_count"),
+        "last_tool_name": runtime_state.get("last_tool_name"),
+        "last_tool_at": runtime_state.get("last_tool_at"),
+        "last_mutation_at": runtime_state.get("last_mutation_at"),
+        "stalled_recovery_count": runtime_state.get("stalled_recovery_count"),
+        "log_file": runtime_state.get("log_file"),
+    }
+    runtime_evidence = [
+        f"- {key}: {value}"
+        for key, value in runtime_fields.items()
+        if value is not None and value != "" and value != []
+    ]
+    failure_message = str(runtime_state.get("failure_message") or "").strip()
+    task_contract_blocker = runtime_state.get("task_contract_blocker") if isinstance(runtime_state.get("task_contract_blocker"), dict) else None
     lines = [
         "status: exception",
         "report_type: exception",
@@ -70,12 +90,43 @@ def _write_exception_report(project_root: Path | str, task: Task, summary: str, 
         "",
         summary or "No summary provided.",
         "",
-        "## Next Handling",
+        "## Runtime Evidence",
         "",
-        "- Inspect the task blocked_reason and runtime state.",
-        "- Reapply the exception patch through `app-delivery fix --task-id <id>` before attempting another repair turn.",
-        "- Determine whether the failure is task-local, framework-level, or a contract gap before resuming.",
+        *(runtime_evidence or ["- none recorded"]),
     ]
+    if failure_message:
+        lines.extend(["", "## Failure Message", "", failure_message])
+    if task.review_artifact or task.review_status:
+        lines.extend(
+            [
+                "",
+                "## Review State",
+                "",
+                f"- review_status: {task.review_status or 'none'}",
+                f"- review_artifact: {task.review_artifact or 'none'}",
+            ]
+        )
+    if task_contract_blocker:
+        lines.extend(
+            [
+                "",
+                "## Task Contract Blocker",
+                "",
+                f"- recommended_action: {task_contract_blocker.get('recommended_action', '-')}",
+                f"- issue_type: {task_contract_blocker.get('issue_type', '-')}",
+                f"- notes: {task_contract_blocker.get('notes', '')}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Next Handling",
+            "",
+            "- Inspect the task blocked_reason and runtime state.",
+            "- Reapply the exception patch through `app-delivery fix --task-id <id>` before attempting another repair turn.",
+            "- Determine whether the failure is task-local, framework-level, or a contract gap before resuming.",
+        ]
+    )
     if patch_relative_path:
         lines.extend(["", "## Exception Patch", "", f"- {patch_relative_path}"])
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -99,6 +150,23 @@ def _format_missing_test_types(missing_test_types: list[tuple[str, str]]) -> str
     if len(missing_test_types) > 5:
         values.append("...")
     return ", ".join(values) or "none"
+
+
+def _semantic_repair_candidates(tasks: list[Task], findings: list[SemanticFinding]) -> list[str]:
+    candidates: list[str] = []
+    for finding in findings:
+        path = str(finding.path or "").strip().rstrip("/")
+        if not path:
+            continue
+        for task in tasks:
+            if task.status != "verified" or task.task_kind == "repair" or task.id == FINAL_VERIFY_TASK_ID:
+                continue
+            for scope in task.output_paths:
+                normalized = str(scope or "").strip().rstrip("/")
+                if normalized and (path == normalized or path.startswith(normalized + "/") or normalized.startswith(path + "/")):
+                    candidates.append(task.id)
+                    break
+    return _dedupe_task_ids(candidates)
 
 
 def _collapse_repair_scope_paths(paths: list[str], *, limit: int = 20) -> list[str]:
@@ -847,6 +915,8 @@ class DeliveryLoop:
         requirements_payload = json.loads((self.project_root / "docs" / "requirements.json").read_text(encoding="utf-8"))
         requirement_coverage = check_requirements_coverage(self.project_root, requirements_payload)
         missing_test_types = check_test_type_coverage(self.project_root)
+        semantic_findings = scan_production_semantics(self.project_root)
+        semantic_report_artifact = write_semantic_scan_report(self.project_root, semantic_findings)
         release_path = render_release_evidence(self.project_root, summary, requirement_coverage, missing_test_types)
         final_review_path = self.project_root / "docs" / "reviews" / "final-review.md"
         final_review_status = None
@@ -856,7 +926,7 @@ class DeliveryLoop:
                 if line.lower().startswith("status:"):
                     final_review_status = line.split(":", 1)[1].strip()
                     break
-        ready_for_final_review = all(result.passed for result in results) and requirement_coverage["all_covered"] and not missing_test_types and not non_verified_gates
+        ready_for_final_review = all(result.passed for result in results) and requirement_coverage["all_covered"] and not missing_test_types and not non_verified_gates and not semantic_findings
         final_pass = ready_for_final_review and str(final_review_status or "").strip().casefold() == "pass"
         environment_blocked = has_environment_failures(results)
         if environment_blocked:
@@ -869,6 +939,7 @@ class DeliveryLoop:
                     for task_id in gate.get("repair_candidates", [])
                 ]
                 + infer_final_repair_candidates(self.project_root, results, missing_test_types)
+                + _semantic_repair_candidates(tasks, semantic_findings)
             )
         current_repair_task_id = str(normalize_task_runtime_state(load_task_runtime_state(self.project_root, FINAL_VERIFY_TASK_ID)).get("repair_task_id") or "").strip()
         current_repair_task = next((task for task in tasks if task.id == current_repair_task_id), None) if current_repair_task_id else None
@@ -930,6 +1001,8 @@ class DeliveryLoop:
                     }
                     for gate in non_verified_gates
                 ],
+                "final_verify_semantic_findings": [finding.__dict__ for finding in semantic_findings],
+                "semantic_report_artifact": semantic_report_artifact,
                 "final_repair_limit_reached": final_repair_limit_reached,
                 "final_verify_status": "pass" if final_pass else ("review_pending" if ready_for_final_review else ("environment_blocked" if environment_blocked and repair_required else ("repair_required" if repair_required else "blocked"))),
             },
@@ -1018,6 +1091,8 @@ class DeliveryLoop:
             "missing_test_types": missing_test_types,
             "gates": gates_payload,
             "blocked_gates": non_verified_gates,
+            "semantic_findings": [finding.__dict__ for finding in semantic_findings],
+            "semantic_report": semantic_report_artifact,
             "repair_candidates": repair_candidates,
             "repair_task_id": repair_task_id,
             "repair_report": repair_report_artifact,

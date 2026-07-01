@@ -16,6 +16,7 @@ from .runtime_config import resolve_project_root
 from .session import current_session, retire_session, save_current_session
 from .state import ensure_runtime_dirs, load_task_runtime_state, load_test_results, normalize_task_runtime_state, project_paths, save_task_runtime_state, utc_now_iso
 from .task import Task, all_tasks, mark_task, next_generated_task_id, save_tasks
+from .task_contract_repair import TaskContractRepairBlocked, TaskContractRepairError, apply_task_contract_repair, defer_acceptance_scenarios
 
 
 REVIEW_SCHEMA: dict[str, Any] = {
@@ -49,6 +50,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
             },
         },
         "intent_assessment": {"type": "object"},
+        "task_contract_assessment": {"type": "object"},
     },
     "required": ["status", "summary", "findings"],
 }
@@ -56,6 +58,10 @@ REVIEW_SCHEMA: dict[str, Any] = {
 ALLOWED_REVIEW_STATUSES = {"pass", "changes_requested"}
 ALLOWED_ASSESSMENT_STATUSES = {"pass", "changes_requested"}
 ALLOWED_FINDING_SEVERITIES = {"blocking", "non_blocking"}
+TASK_CONTRACT_REPAIR_ACTION = "task_contract_repair"
+TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION = "repair_task_decompose"
+ALLOWED_TASK_CONTRACT_ACTIONS = {"implementation_repair", TASK_CONTRACT_REPAIR_ACTION, TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION}
+ALLOWED_TASK_CONTRACT_ISSUE_TYPES = {"implementation", "task_contract"}
 REVIEW_PROMPT_NOISE_PATHS = {
     "docs/gates.json",
     "docs/test-results.json",
@@ -180,6 +186,54 @@ def _normalize_intent_assessment(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _normalize_task_contract_assessment(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("task_contract_assessment must be an object when provided")
+    status = str(value.get("status") or "pass").strip().casefold()
+    issue_type = str(value.get("issue_type") or "implementation").strip().casefold()
+    recommended_action = str(value.get("recommended_action") or "implementation_repair").strip().casefold()
+    notes = str(value.get("notes") or "").strip()
+    if status not in ALLOWED_ASSESSMENT_STATUSES:
+        raise ValueError("task_contract_assessment.status must be pass or changes_requested")
+    if issue_type not in ALLOWED_TASK_CONTRACT_ISSUE_TYPES:
+        raise ValueError("task_contract_assessment.issue_type must be implementation or task_contract")
+    if recommended_action not in ALLOWED_TASK_CONTRACT_ACTIONS:
+        raise ValueError("task_contract_assessment.recommended_action must be implementation_repair, task_contract_repair, or repair_task_decompose")
+    if recommended_action in {TASK_CONTRACT_REPAIR_ACTION, TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION} and (status != "changes_requested" or issue_type != "task_contract"):
+        raise ValueError("task_contract_assessment contract-repair actions require status=changes_requested and issue_type=task_contract")
+    if recommended_action in {TASK_CONTRACT_REPAIR_ACTION, TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION} and not notes:
+        raise ValueError("task_contract_assessment.notes must explain why task contract repair is required")
+    operations = value.get("operations") if isinstance(value.get("operations"), list) else []
+    normalized_operations = [dict(item) for item in operations if isinstance(item, dict)]
+    if recommended_action == TASK_CONTRACT_REPAIR_ACTION and not normalized_operations:
+        raise ValueError("task_contract_assessment.recommended_action=task_contract_repair requires operations[]")
+    return {
+        "status": status,
+        "issue_type": issue_type,
+        "recommended_action": recommended_action,
+        "operations": normalized_operations,
+        "affected_requirement_ids": [str(item).strip() for item in value.get("affected_requirement_ids", []) if str(item).strip()],
+        "affected_acceptance_ids": [str(item).strip() for item in value.get("affected_acceptance_ids", []) if str(item).strip()],
+        "notes": notes,
+    }
+
+
+def _review_requests_task_contract_repair(review_payload: dict[str, Any]) -> bool:
+    assessment = review_payload.get("task_contract_assessment") if isinstance(review_payload.get("task_contract_assessment"), dict) else None
+    if not assessment:
+        return False
+    return str(assessment.get("recommended_action") or "").strip().casefold() == TASK_CONTRACT_REPAIR_ACTION
+
+
+def _review_requests_task_decompose_repair(review_payload: dict[str, Any]) -> bool:
+    assessment = review_payload.get("task_contract_assessment") if isinstance(review_payload.get("task_contract_assessment"), dict) else None
+    if not assessment:
+        return False
+    return str(assessment.get("recommended_action") or "").strip().casefold() == TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION
+
+
 def _validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     try:
@@ -216,6 +270,11 @@ def _validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str
     except ValueError as exc:
         intent_assessment = None
         errors.append(str(exc))
+    try:
+        task_contract_assessment = _normalize_task_contract_assessment(parsed.get("task_contract_assessment"))
+    except ValueError as exc:
+        task_contract_assessment = None
+        errors.append(str(exc))
     if errors:
         raise ValueError("; ".join(error for error in errors if error))
     parsed["findings"] = findings
@@ -223,6 +282,8 @@ def _validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str
     parsed["acceptance_assessment"] = acceptance_assessment
     if intent_assessment is not None:
         parsed["intent_assessment"] = intent_assessment
+    if task_contract_assessment is not None:
+        parsed["task_contract_assessment"] = task_contract_assessment
 
     if str(parsed.get("status") or "").strip().casefold() != "pass":
         return parsed
@@ -234,6 +295,8 @@ def _validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str
     ]
     if intent_assessment is not None and str(intent_assessment.get("status") or "").strip().casefold() != "pass":
         blocking_findings.append("intent_assessment is changes_requested")
+    if task_contract_assessment is not None and str(task_contract_assessment.get("status") or "").strip().casefold() != "pass":
+        blocking_findings.append("task_contract_assessment is changes_requested")
 
     requirement_ids = {row["id"] for row in requirement_assessment}
     acceptance_ids = {row["id"] for row in acceptance_assessment}
@@ -628,13 +691,17 @@ def build_code_review_request(
     _append_dependency_hint_review_section(lines, dependency_hints)
     lines.append("Review scope guardrails:")
     lines.append("- Judge the task against its declared requirements, acceptance scenarios, output_paths, output_tests, and any necessary shared support edits that are directly required for this task.")
-    lines.append("- Do not fail the task solely because the broader architecture or future tasks mention additional technologies, adapters, mocks, or end-to-end flows that are not yet owned by this task's declared scope.")
-    lines.append("- If a missing test type is expected to be supplied by a downstream validation task rather than the current feature task, do not fail the current task for that gap alone.")
     lines.append("- Do not reject the task only because it touched files outside the original output_paths when those edits are necessary support work or regression fixes for the current task. Judge those edits on correctness and necessity.")
     lines.append("- Use the task intent as supporting context for purpose, completion signals, and non-goals, but keep requirement and acceptance assessments tied to the declared IDs.")
     lines.append("- If task intent is present, include `intent_assessment`. If any done_when item is missing or any non-goal is violated, set `intent_assessment.status=changes_requested` and top-level `status=changes_requested`.")
     lines.append("- Use finding objects with `severity=blocking` for missing behavior, placeholders/stubs presented as complete, unmet declared requirements, or unowned deferrals. Top-level status must be `changes_requested` when any blocking finding exists.")
+    lines.append("- If production-path code uses demo constants, hardcoded responses, in-memory state, placeholder tests, or mock-only browser proof for a production requirement, return `status=changes_requested` unless the requirement explicitly allows that mock behavior.")
+    lines.append("- For backend/API tasks, check that auth/RBAC and tenant/site/customer scoping are enforced on the route or service path when the requirements mention roles, permissions, or data isolation.")
+    lines.append("- For agent or workflow tasks, check that the implementation consumes real case/context/tool/service data instead of only static demo payloads.")
     lines.append("- Passing task tests is necessary but not sufficient. Review whether the declared requirements and acceptance scenarios are actually complete in behavior, not only whether the declared tests are green.")
+    lines.append("- If a declared acceptance scenario cannot be implemented correctly by this task because it belongs to another task or contradicts this task's non-goals, return `status=changes_requested` and set `task_contract_assessment.recommended_action=task_contract_repair` with concrete `operations` instead of asking the implementation worker to keep patching.")
+    lines.append("- Use `repair_task_decompose` only when the task graph is structurally invalid and cannot be repaired by a local operation such as moving an acceptance scenario or creating a follow-up task.")
+    lines.append("- Use `task_contract_assessment.recommended_action=implementation_repair` for ordinary missing code, missing tests, regressions, or fixable implementation defects within this task's rightful scope.")
     if task.requirements:
         lines.append("- For every declared requirement, include exactly one `requirement_assessment` row with `id`, `status`, and `notes`.")
     if task.acceptance_scenarios:
@@ -674,7 +741,7 @@ def build_code_review_request(
     lines.append("Inspect the current repository state and the task-scoped staged snapshot for this task only.")
     lines.append("Determine whether the task is ready to commit or requires more implementation changes.")
     lines.append("Use status=pass only when the task is ready to accept as-is. Otherwise use status=changes_requested.")
-    lines.append("Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array), and intent_assessment (object when task intent is present). Use empty arrays for findings and assessments when there are no rows.")
+    lines.append("Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array), task_contract_assessment (object), and intent_assessment (object when task intent is present). Use empty arrays for findings and assessments when there are no rows.")
     return "\n".join(lines)
 
 
@@ -724,8 +791,13 @@ def build_validation_code_review_request(
     lines.append("- Review the declared output_tests as contractual validation entrypoints, not optional examples.")
     lines.append("- Verify that the declared tests exist or commands are meaningful, runnable, and strong enough to prove the owned requirements and acceptance scenarios.")
     lines.append("- Check that every declared acceptance scenario maps to concrete assertions, fixtures, scenario data, or browser/e2e coverage in this task.")
+    lines.append("- Mocked browser tests using `page.route()` count as mocked-browser evidence, not real backend E2E evidence.")
+    lines.append("- Production gate tasks must treat production-path demo constants, hardcoded API responses, missing auth/RBAC enforcement, and log-only execution dispatch as blocking findings.")
     lines.append("- Return `status=changes_requested` for placeholder tests, shallow smoke checks, missing scenario coverage, weak assertions, or tests that cannot actually execute.")
     lines.append("- Passing tests are necessary but not sufficient. Judge whether the tests prove the behavior described by the requirements and acceptance scenarios.")
+    lines.append("- If the validation task cannot truthfully prove a declared acceptance scenario because that scenario was assigned to the wrong task, return `status=changes_requested` and set `task_contract_assessment.recommended_action=task_contract_repair` with concrete `operations`.")
+    lines.append("- Use `repair_task_decompose` only when the task graph is structurally invalid and cannot be repaired by a local operation such as moving an acceptance scenario or creating a follow-up task.")
+    lines.append("- Use `task_contract_assessment.recommended_action=implementation_repair` for ordinary missing validation files, weak assertions, broken fixtures, or other fixable validation defects within this task's rightful scope.")
     lines.append("- Minimal support code, mocks, fixtures, or wiring may be acceptable only when required to make validation truthful and executable.")
     lines.append("- Do not fail the task solely because it touched support files outside the original output_paths when those edits are necessary for credible validation.")
     lines.append("- Do fail the task if it expands into broad product implementation that belongs to upstream feature tasks rather than validation support.")
@@ -758,7 +830,7 @@ def build_validation_code_review_request(
     lines.append("Inspect the current repository state and the task-scoped staged snapshot for this validation task only.")
     lines.append("Determine whether the validation assets are ready to commit or require more implementation changes.")
     lines.append("Use status=pass only when the validation evidence is credible, executable, and appropriately scoped. Otherwise use status=changes_requested.")
-    lines.append("Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array). Use empty arrays for findings and assessments when there are no rows.")
+    lines.append("Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array), and task_contract_assessment (object). Use empty arrays for findings and assessments when there are no rows.")
     return "\n".join(lines)
 
 
@@ -840,6 +912,7 @@ def _write_review_artifact(project_root: Path | str, task: Task, review_payload:
     findings = review_payload.get("findings") if isinstance(review_payload.get("findings"), list) else []
     requirement_assessment = review_payload.get("requirement_assessment") if isinstance(review_payload.get("requirement_assessment"), list) else []
     acceptance_assessment = review_payload.get("acceptance_assessment") if isinstance(review_payload.get("acceptance_assessment"), list) else []
+    task_contract_assessment = review_payload.get("task_contract_assessment") if isinstance(review_payload.get("task_contract_assessment"), dict) else None
     lines = [
         f"status: {status}",
         "review_type: code",
@@ -866,6 +939,21 @@ def _write_review_artifact(project_root: Path | str, task: Task, review_payload:
                 lines.append(f"- {finding}")
     else:
         lines.append("- No blocking findings.")
+    if task_contract_assessment:
+        lines.extend(["", "## Task Contract Assessment", ""])
+        lines.append(f"- status: {task_contract_assessment.get('status', '-')}")
+        lines.append(f"- issue_type: {task_contract_assessment.get('issue_type', '-')}")
+        lines.append(f"- recommended_action: {task_contract_assessment.get('recommended_action', '-')}")
+        operations = task_contract_assessment.get("operations") if isinstance(task_contract_assessment.get("operations"), list) else []
+        if operations:
+            lines.append(f"- operations: {len(operations)}")
+        affected_requirements = ", ".join(task_contract_assessment.get("affected_requirement_ids", []) or []) or "none"
+        affected_acceptance = ", ".join(task_contract_assessment.get("affected_acceptance_ids", []) or []) or "none"
+        lines.append(f"- affected_requirements: {affected_requirements}")
+        lines.append(f"- affected_acceptance: {affected_acceptance}")
+        notes = str(task_contract_assessment.get("notes") or "").strip()
+        if notes:
+            lines.append(f"- notes: {notes}")
     if requirement_assessment:
         lines.extend(["", "## Requirement Assessment", ""])
         for row in requirement_assessment:
@@ -880,6 +968,84 @@ def _write_review_artifact(project_root: Path | str, task: Task, review_payload:
             lines.append(f"- {row.get('id', '-')}: {row.get('status', '-')} — {row.get('notes', '')}")
     review_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(review_path.relative_to(paths.project_root))
+
+
+def _write_task_contract_deferral_artifacts(project_root: Path | str, deferral_result: dict[str, Any]) -> tuple[str, str]:
+    paths = project_paths(project_root)
+    paths.reviews_dir.mkdir(parents=True, exist_ok=True)
+    json_path = paths.reviews_dir / "task-contract-deferrals.json"
+    md_path = paths.reviews_dir / "task-contract-deferrals.md"
+    existing_records: list[dict[str, Any]] = []
+    if json_path.exists():
+        try:
+            existing_payload = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_payload = {}
+        if isinstance(existing_payload, dict) and isinstance(existing_payload.get("deferred_acceptance_scenarios"), list):
+            existing_records = [record for record in existing_payload["deferred_acceptance_scenarios"] if isinstance(record, dict)]
+    new_records = [record for record in deferral_result.get("deferred_acceptance_scenarios", []) if isinstance(record, dict)]
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in [*existing_records, *new_records]:
+        key = (str(record.get("from_task") or "").strip(), str(record.get("id") or "").strip())
+        if not key[0] or not key[1]:
+            continue
+        by_key[key] = record
+    records = list(by_key.values())
+    json_path.write_text(json.dumps({"deferred_acceptance_scenarios": records}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    lines = ["# Task Contract Deferrals", ""]
+    if records:
+        for record in records:
+            lines.extend(
+                [
+                    f"## {record.get('id', '-')}",
+                    "",
+                    f"- From task: {record.get('from_task', '-')}",
+                    f"- Policy: {record.get('policy', '-')}",
+                    f"- Review artifact: {record.get('review_artifact', '-')}",
+                    f"- Reason: {record.get('reason', '')}",
+                    "",
+                ]
+            )
+    else:
+        lines.append("- none")
+    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return str(json_path.relative_to(paths.project_root)), str(md_path.relative_to(paths.project_root))
+
+
+def _deferred_review_payload(parsed: dict[str, Any], deferral_result: dict[str, Any], deferral_artifacts: tuple[str, str]) -> dict[str, Any]:
+    records = [record for record in deferral_result.get("deferred_acceptance_scenarios", []) if isinstance(record, dict)]
+    deferred_ids = [str(record.get("id") or "").strip() for record in records if str(record.get("id") or "").strip()]
+    existing_findings = parsed.get("findings") if isinstance(parsed.get("findings"), list) else []
+    non_deferred_findings = [
+        finding
+        for finding in existing_findings
+        if not isinstance(finding, dict) or not set(str(value).strip() for value in finding.get("acceptance_ids", []) if str(value).strip()).intersection(deferred_ids)
+    ]
+    non_deferred_acceptance = [
+        row
+        for row in parsed.get("acceptance_assessment", [])
+        if isinstance(row, dict) and str(row.get("id") or "").strip() not in set(deferred_ids)
+    ]
+    deferral_finding = {
+        "severity": "non_blocking",
+        "requirement_ids": [],
+        "acceptance_ids": deferred_ids,
+        "message": f"Deferred acceptance scenario assignment for delivery continuity; see {deferral_artifacts[1]}",
+    }
+    summary = str(parsed.get("summary") or "").strip()
+    deferred_summary = f"{summary} Framework accepted the current task with deferred acceptance scenario assignment recorded in {deferral_artifacts[1]}.".strip()
+    payload = {
+        key: value
+        for key, value in parsed.items()
+        if key != "task_contract_assessment"
+    }
+    return {
+        **payload,
+        "status": "pass",
+        "summary": deferred_summary,
+        "findings": [*non_deferred_findings, deferral_finding],
+        "acceptance_assessment": non_deferred_acceptance,
+    }
 
 
 def _write_final_review_artifact(project_root: Path | str, review_payload: dict[str, Any]) -> str:
@@ -1120,6 +1286,152 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
             save_current_session(project_dir, active_session)
         refresh_gates(project_dir)
         return 0
+
+    if _review_requests_task_contract_repair(parsed):
+        task_contract_assessment = parsed["task_contract_assessment"]
+        tasks_before_repair = all_tasks(project_dir)
+        try:
+            repaired_tasks, repair_result = apply_task_contract_repair(project_dir, tasks_before_repair, task, task_contract_assessment)
+        except TaskContractRepairError as exc:
+            raise DeliveryError(
+                code="task_contract_repair_invalid",
+                message=str(exc),
+                exit_code=2,
+                details={"project": str(project_dir), "task_id": task_id, "input_path": str(input_path)},
+            ) from exc
+        except RuntimeError as exc:
+            if exc.__class__.__name__ != "TaskContractRepairBlocked":
+                raise
+            notes = str(task_contract_assessment.get("notes") or parsed.get("summary") or str(exc)).strip()
+            deferred_tasks, deferral_result = defer_acceptance_scenarios(
+                tasks_before_repair,
+                task,
+                task_contract_assessment,
+                reason=f"{notes}; local repair could not assign a safe target or follow-up task: {exc}",
+                review_artifact=review_artifact,
+                created_at=reviewed_at,
+            )
+            deferral_artifacts = _write_task_contract_deferral_artifacts(project_dir, deferral_result)
+            deferred_parsed = _deferred_review_payload(parsed, deferral_result, deferral_artifacts)
+            review_artifact = _write_review_artifact(project_dir, task, deferred_parsed)
+            staged_paths = [*staged_scope_paths, *accepted_scope_paths, review_artifact, *deferral_artifacts]
+            if staged_paths:
+                commit_sha = git_commit_explicit_paths(
+                    project_dir,
+                    staged_paths,
+                    f"feat({task.id}): {task.title}",
+                )
+            else:
+                commit_sha = git_commit_task(
+                    project_dir,
+                    task,
+                    f"feat({task.id}): {task.title}",
+                    extra_paths=[review_artifact, *deferral_artifacts],
+                )
+            tasks = mark_task(
+                deferred_tasks,
+                task.id,
+                "verified",
+                git_commit=commit_sha,
+                status_session_id=task.status_session_id,
+                completed_at=task.completed_at or reviewed_at,
+                review_status="pass",
+                review_artifact=review_artifact,
+                reviewed_at=reviewed_at,
+                verified_at=reviewed_at,
+                blocked_reason=(
+                    "verified with deferred acceptance scenario assignment; "
+                    f"see {deferral_artifacts[1]}"
+                ),
+                attempts=max(task.attempts, 1),
+            )
+            save_tasks(project_dir, tasks)
+            active_session = current_session(project_dir)
+            if active_session is not None and active_session.id == task.status_session_id:
+                retire_session(project_dir, active_session)
+            save_task_runtime_state(
+                project_dir,
+                task_id,
+                {
+                    "review_requested_scope_paths": accepted_scope_paths,
+                    "task_contract_deferred_acceptance": deferral_result,
+                    "task_contract_deferred_artifacts": list(deferral_artifacts),
+                    "task_contract_deferred_at": reviewed_at,
+                    "task_contract_blocker": None,
+                    "pending_scope_report": None,
+                },
+            )
+            refresh_gates(project_dir)
+            return 0
+        repaired_current = next((row for row in repaired_tasks if row.id == task.id), None)
+        if repaired_current is not None:
+            repaired_tasks = mark_task(
+                repaired_tasks,
+                task.id,
+                "pending",
+                git_commit=None,
+                status_session_id=task.status_session_id,
+                started_at=None,
+                completed_at=None,
+                review_status=None,
+                review_artifact=review_artifact,
+                reviewed_at=reviewed_at,
+                verified_at=None,
+                blocked_reason=str(parsed.get("summary") or "task contract repaired; rerun review/validation for updated task contract").strip() or "task contract repaired; rerun review/validation for updated task contract",
+                attempts=max(task.attempts, 1),
+            )
+        save_tasks(project_dir, repaired_tasks)
+        active_session = current_session(project_dir)
+        if active_session is not None and active_session.id == task.status_session_id:
+            retire_session(project_dir, active_session)
+        save_task_runtime_state(
+            project_dir,
+            task_id,
+            {
+                "review_requested_scope_paths": accepted_scope_paths,
+                "task_contract_repair": repair_result,
+                "task_contract_repaired_at": reviewed_at,
+                "task_contract_blocker": None,
+                "pending_scope_report": None,
+            },
+        )
+        refresh_gates(project_dir)
+        return 2
+
+    if _review_requests_task_decompose_repair(parsed):
+        task_contract_assessment = parsed["task_contract_assessment"]
+        notes = str(task_contract_assessment.get("notes") or parsed.get("summary") or "task contract review requested task-decompose repair").strip()
+        blocked_reason = f"task contract requires task-decompose repair: {notes}"
+        tasks = mark_task(
+            all_tasks(project_dir),
+            task.id,
+            "blocked",
+            git_commit=None,
+            status_session_id=task.status_session_id,
+            started_at=None,
+            completed_at=None,
+            review_status=review_status,
+            review_artifact=review_artifact,
+            reviewed_at=reviewed_at,
+            verified_at=None,
+            blocked_reason=blocked_reason,
+            attempts=max(task.attempts, 1),
+        )
+        save_tasks(project_dir, tasks)
+        active_session = current_session(project_dir)
+        if active_session is not None and active_session.id == task.status_session_id:
+            retire_session(project_dir, active_session)
+        save_task_runtime_state(
+            project_dir,
+            task_id,
+            {
+                "review_requested_scope_paths": accepted_scope_paths,
+                "task_contract_blocker": task_contract_assessment,
+                "task_contract_blocked_at": reviewed_at,
+            },
+        )
+        refresh_gates(project_dir)
+        return 2
 
     tasks = mark_task(
         all_tasks(project_dir),

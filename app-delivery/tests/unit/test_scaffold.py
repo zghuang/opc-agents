@@ -24,12 +24,15 @@ def test_scaffold_project_preserves_existing_files(tmp_path: Path) -> None:
 def test_scaffold_project_copies_backend_env_from_example(tmp_path: Path) -> None:
     template_root = tmp_path / "template"
     (template_root / "backend").mkdir(parents=True)
-    (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql://demo\n", encoding="utf-8")
+    (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql+asyncpg://opc_user:password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n", encoding="utf-8")
     project_root = tmp_path / "project"
 
     scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
 
-    assert (project_root / "backend" / ".env").read_text(encoding="utf-8") == "DATABASE_URL=postgresql://demo\n"
+    backend_env = (project_root / "backend" / ".env").read_text(encoding="utf-8")
+    assert "localhost:5432" not in backend_env
+    assert "localhost:8888" not in backend_env
+    assert "POSTGRES_HOST_PORT=" in (project_root / ".env").read_text(encoding="utf-8")
 
 
 def test_scaffold_project_keeps_existing_backend_env(tmp_path: Path) -> None:
@@ -43,6 +46,49 @@ def test_scaffold_project_keeps_existing_backend_env(tmp_path: Path) -> None:
     scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
 
     assert (project_root / "backend" / ".env").read_text(encoding="utf-8") == "DATABASE_URL=postgresql://custom\n"
+
+
+def test_scaffold_project_writes_deterministic_host_ports(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    (template_root / "backend").mkdir(parents=True)
+    (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql+asyncpg://opc_user:password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n", encoding="utf-8")
+    (template_root / ".env").write_text("DB_PASSWORD=password\n", encoding="utf-8")
+    (template_root / "docker-compose.yml").write_text(
+        'services:\n  postgres:\n    ports:\n      - "${POSTGRES_HOST_PORT:-15432}:5432"\n',
+        encoding="utf-8",
+    )
+    project_root = tmp_path / "ma-02"
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    root_env = (project_root / ".env").read_text(encoding="utf-8")
+    backend_env = (project_root / "backend" / ".env").read_text(encoding="utf-8")
+    assert "POSTGRES_HOST_PORT=" in root_env
+    assert "BACKEND_HOST_PORT=" in root_env
+    assert "FRONTEND_HOST_PORT=" in root_env
+    assert "MOCK_SERVER_HOST_PORT=" in root_env
+    assert "localhost:5432" not in backend_env
+    assert "localhost:8888" not in backend_env
+
+
+def test_scaffold_project_generates_project_specific_host_ports(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    (template_root / "backend").mkdir(parents=True)
+    (template_root / "backend" / ".env.example").write_text(
+        "DATABASE_URL=postgresql+asyncpg://opc_user:password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n",
+        encoding="utf-8",
+    )
+    (template_root / ".env").write_text("DB_PASSWORD=password\n", encoding="utf-8")
+    project_root = tmp_path / "ma-02"
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    seed = sum((index + 1) * ord(char) for index, char in enumerate(project_root.name)) % 1000
+    root_env = (project_root / ".env").read_text(encoding="utf-8")
+    backend_env = (project_root / "backend" / ".env").read_text(encoding="utf-8")
+    assert f"POSTGRES_HOST_PORT={15432 + seed}" in root_env
+    assert f"DATABASE_URL=postgresql+asyncpg://opc_user:password@localhost:{15432 + seed}/app_db" in backend_env
+    assert f"EXTERNAL_API_BASE_URL=http://localhost:{18888 + seed}" in backend_env
 
 
 def test_scaffold_skips_command_style_output_tests(tmp_path: Path) -> None:

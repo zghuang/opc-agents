@@ -115,8 +115,9 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
             requirements_path=str(archived_requirements) if archived_requirements is not None else requirements_path,
             contract_errors=contract_errors,
         )
-        must_continue = next_step is not None
-        control_status = "in_progress" if must_continue else "blocked"
+        requires_user_input = bool(next_step.get("requires_user_input")) if isinstance(next_step, dict) else False
+        must_continue = bool(next_step is not None and not requires_user_input)
+        control_status = "blocked" if next_step is None or requires_user_input else "in_progress"
     elif isinstance(base.get("review_pending_task"), dict):
         task = base["review_pending_task"]
         next_step = build_review_host_step(

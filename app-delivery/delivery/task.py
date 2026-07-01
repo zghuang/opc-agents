@@ -20,6 +20,7 @@ from .builtin_tasks import (
     SHARED_FOUNDATION_TASK_ID,
     needs_frontend_api_audit,
 )
+from .production_gates import PRODUCTION_GATE_TITLE_PREFIX, next_production_gate_task_id, production_gate_task_dict, required_production_gates
 from .state import load_gates, load_test_plan, load_work_items, project_paths, save_work_items, utc_now_iso
 
 
@@ -30,6 +31,19 @@ REQ_RANGE_RE = re.compile(
 )
 TASK_ID_RE = re.compile(r"^T\d{3,}$")
 VALID_STATUSES = {"pending", "active", "review_pending", "done", "verified", "blocked", "exception", "cancelled"}
+NON_CANONICAL_BACKEND_ROOT_DIRS = {
+    "api",
+    "agents",
+    "orchestration",
+    "mcp",
+    "simulation",
+    "models",
+    "core",
+    "services",
+    "actions",
+    "infra",
+    "knowledge",
+}
 FOUNDATION_SCOPE_PREFIXES = (
     "backend/",
     "backend/pyproject.toml",
@@ -164,6 +178,17 @@ def _normalize_contract_path(value: Any) -> str:
     if normalized == "backend/app/":
         return "backend/src/"
     return normalized
+
+
+def _is_noncanonical_backend_root_path(path: str) -> bool:
+    normalized = _strip_current_dir_prefix(path).rstrip("/")
+    parts = normalized.split("/")
+    return len(parts) >= 2 and parts[0] == "backend" and parts[1] in NON_CANONICAL_BACKEND_ROOT_DIRS
+
+
+def _is_unsupported_top_level_mcp_server_path(path: str) -> bool:
+    normalized = _strip_current_dir_prefix(path).rstrip("/")
+    return normalized == "mcp-server" or normalized.startswith("mcp-server/")
 
 
 def _strip_current_dir_prefix(value: str) -> str:
@@ -618,6 +643,16 @@ def _validate_task_shape(tasks: list[Task]) -> None:
             oversized.append(
                 f"{task.id} uses non-canonical mock-server paths: {', '.join(invalid_mock_paths)}; use project-root mock-server/..."
             )
+        invalid_backend_paths = [path for path in [*task.output_paths, *task.output_tests] if _is_noncanonical_backend_root_path(path)]
+        if invalid_backend_paths:
+            oversized.append(
+                f"{task.id} uses backend-root package paths not supported by python-react: {', '.join(invalid_backend_paths)}; use backend/src/..."
+            )
+        invalid_mcp_server_paths = [path for path in [*task.output_paths, *task.output_tests] if _is_unsupported_top_level_mcp_server_path(path)]
+        if invalid_mcp_server_paths:
+            oversized.append(
+                f"{task.id} uses top-level mcp-server paths not supported by python-react: {', '.join(invalid_mcp_server_paths)}; use backend/src/... for production MCP code or mock-server/... for simulated tool services"
+            )
         if len(task.output_paths) > 20 or len(task.output_tests) > 10:
             oversized.append(
                 f"{task.id} (paths={len(task.output_paths)}, tests={len(task.output_tests)}; expected roughly paths<=20 tests<=10)"
@@ -830,6 +865,19 @@ def decompose_tasks(
                 output_paths=[
                     *SHARED_FOUNDATION_OUTPUT_PATHS,
                 ],
+                intent={
+                    "objective": "Create the minimal shared backend/frontend foundation and dependency manifest updates required before feature slices can run.",
+                    "journey": "Later feature tasks start from a working FastAPI/React scaffold with runtime settings, health checks, lockfiles, and shared test harnesses.",
+                    "done_when": [
+                        "Backend and frontend manifests and lockfiles are consistent for packages used by foundation code implemented in this task",
+                        "Backend health, database, and runtime smoke tests for the foundation pass",
+                        "Frontend app-shell smoke test passes when frontend foundation files are in scope",
+                    ],
+                    "non_goals": [
+                        "Do not implement domain workflows, agent graphs, mock contracts, or user-facing product features",
+                        "Do not preinstall project-wide technology packages unless this task implements or imports them",
+                    ],
+                },
             )
         )
         next_index = 2
@@ -905,6 +953,21 @@ def decompose_tasks(
                 output_tests=list(FRONTEND_API_AUDIT_OUTPUT_TESTS),
                 output_paths=list(FRONTEND_API_AUDIT_OUTPUT_PATHS),
                 task_kind="audit",
+            )
+        )
+    production_gate_dependencies = [task.id for task in normalized_items if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}]
+    existing_ids = {task.id for task in normalized_items}
+    for gate_spec in required_production_gates(project_root, normalized_items):
+        gate_task_id = next_production_gate_task_id(existing_ids)
+        existing_ids.add(gate_task_id)
+        normalized_items.append(
+            Task.from_dict(
+                production_gate_task_dict(
+                    project_root,
+                    gate_spec,
+                    task_id=gate_task_id,
+                    dependencies=production_gate_dependencies,
+                )
             )
         )
     audit_dependencies = [task.id for task in normalized_items if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}]

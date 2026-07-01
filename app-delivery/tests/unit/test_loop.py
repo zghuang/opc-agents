@@ -194,7 +194,7 @@ def test_build_code_review_prompt_includes_technology_hint_check_for_manifest_ta
     assert "Tech-design check:" in prompt
     assert "Tech Design` section in AGENTS.md / CLAUDE.md" in prompt
     assert "silently contradict project-wide mandated stack choices" in prompt
-    assert "Do not fail the task solely because the broader architecture or future tasks mention additional technologies" in prompt
+    assert "demo constants, hardcoded responses, in-memory state" in prompt
 
 
 def test_build_task_prompt_includes_requirement_and_acceptance_details(tmp_path: Path) -> None:
@@ -4393,8 +4393,63 @@ def test_final_verify_blocks_unattributed_missing_test_coverage_without_repair_t
     assert result["repair_task_id"] is None
     by_id = {task.id: task for task in all_tasks(tmp_path)}
     assert by_id["T-FINAL"].blocked_reason == "final verification has missing test coverage without a strongly attributed repair owner: NFR-002:integration"
+
+
+def test_final_verify_blocks_production_semantic_findings(tmp_path: Path, monkeypatch) -> None:
+    from delivery.verify import TestResult
+
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "requirements.json").write_text(
+        json.dumps({"requirements": [{"id": "REQ-001", "title": "Dashboard", "summary": "Dashboard uses real backend data."}], "acceptance_scenarios": []}),
+        encoding="utf-8",
+    )
+    api_path = tmp_path / "backend" / "src" / "api" / "v1" / "dashboard.py"
+    api_path.parent.mkdir(parents=True, exist_ok=True)
+    api_path.write_text(
+        "from fastapi import APIRouter\nrouter = APIRouter()\nMOCK_DASHBOARD = {}\n@router.get('/dashboard')\nasync def dashboard():\n    return MOCK_DASHBOARD\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Dashboard", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_dashboard.py"], "output_paths": ["backend/src/api/v1/dashboard.py"], "review_status": "pass", "git_commit": "abc123"},
+                {"id": "T-FINAL", "title": "最终验证", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    loop = DeliveryLoop(tmp_path)
+    monkeypatch.setattr(
+        "delivery.loop.run_full_suite",
+        lambda project_root, mode="all": [
+            TestResult(
+                task_id="T002",
+                timestamp="2026-06-24T00:00:00Z",
+                test_files=["backend/tests/test_dashboard.py"],
+                test_types=["unit"],
+                requirement_ids=["REQ-001"],
+                passed=True,
+                passed_count=1,
+                failed_count=0,
+                failures=[],
+                attempt=1,
+            )
+        ],
+    )
+    monkeypatch.setattr("delivery.loop.check_test_type_coverage", lambda project_root: [])
+
+    result = loop.final_verify()
+
+    assert result["status"] == "repair_required"
+    assert result["semantic_findings"]
+    assert result["semantic_report"] == "docs/reviews/production-semantic-scan.md"
     runtime_state = load_task_runtime_state(tmp_path, "T-FINAL")
-    assert runtime_state["final_verify_status"] == "blocked"
+    assert runtime_state["final_verify_semantic_findings"]
+    assert runtime_state["final_verify_status"] == "repair_required"
 
 
 def test_final_verify_defers_when_non_final_feature_tasks_are_incomplete(tmp_path: Path) -> None:

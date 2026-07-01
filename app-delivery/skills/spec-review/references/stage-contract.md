@@ -28,6 +28,7 @@ acceptance_scenarios:
 clarifications:
 - Use this array when the source contains contradictions, missing decisions, ambiguous ownership, vague acceptance rules, or architecture-blocking uncertainty.
 - Each item must include severity, question, rationale, affected_requirement_ids, blocking.
+- Each item may optionally include recommended_answer and answer_options when the model can offer defensible candidate answers for user confirmation without inventing a new external decision.
 - Severity should typically be C1, C2, or C3.
 - Mark blocking=true only when delivery should stop for clarification before architecture or implementation continues.
 - Use C1/blocking when unresolved coarse wording would force later stages to choose between materially different architecture, data model, integration contracts, security/permissions, task decomposition, or acceptance-test designs.
@@ -48,6 +49,9 @@ Judgment rules:
 - If the source is coarse but still names a coherent actor, behavior, boundary, and observable outcome, normalize it and keep any remaining details as C2/C3 clarifications.
 - If the source is clear enough to proceed, clarifications may be an empty array.
 - If a prior clarification-needed file or clarification-answers file exists for this project, treat those answers as part of the available source evidence and fold defensible resolved answers back into the normalized requirement output instead of preserving an already-resolved C1 blocker.
+- If a blocking clarification from an earlier pass can now be answered from the current source requirements, project artifacts, or framework-selected defaults already in evidence, write or update docs/clarification-answers.md first and then regenerate the normalized output using that answer.
+- Do not fabricate clarification answers that require a genuinely new external product, policy, security, or scope decision.
+- For a blocking clarification that still needs a user decision, prefer to provide a concise recommended_answer and 1-3 answer_options so the host can present suggested choices while still allowing freeform user input.
 
 Source document:
 {{source_document}}

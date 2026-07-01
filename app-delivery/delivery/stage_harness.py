@@ -53,7 +53,22 @@ STAGE_CLI_COMMANDS: dict[str, str] = {
 }
 
 MODULE_ARCHITECTURE_HEADING_RE = re.compile(r"^##+\s+(?:\d+\.\s*)?(?:Module Architecture|模块架构)\s*$", re.IGNORECASE | re.MULTILINE)
-
+FENCED_BLOCK_RE = re.compile(r"```(?:text|plaintext|txt)?\n(?P<body>.*?)\n```", re.DOTALL | re.IGNORECASE)
+NON_CANONICAL_BACKEND_PACKAGE_RE = re.compile(
+    r"\bbackend/(?:api|agents|orchestration|mcp|simulation|models|core|services|actions|infra|knowledge)(?:/|\b)",
+    re.IGNORECASE,
+)
+NON_CANONICAL_BACKEND_TREE_CHILD_RE = re.compile(
+    r"^(?:│   |    )(?:├──|└──)\s*(?:api|agents|orchestration|mcp|simulation|models|core|services|actions|infra|knowledge)/",
+    re.IGNORECASE | re.MULTILINE,
+)
+UNSUPPORTED_TOP_LEVEL_MCP_SERVER_RE = re.compile(r"\bmcp-server(?:/|\b)", re.IGNORECASE)
+TREE_FILE_ENTRY_RE = re.compile(
+    r"^(?:[│ ]+)?(?:├──|└──)\s*(?P<name>[^\s#]+\.(?:py|pyi|ts|tsx|js|jsx|sql|ya?ml|json|toml|ini|sh|md))(?:\s|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+ALLOWED_TREE_PLACEHOLDER_FILES = {"__init__.py", ".gitkeep"}
+MAX_MODULE_TREE_FILE_ENTRIES = 20
 
 def _runtime_context_baseline(runtime: str) -> str:
     context_name = "CLAUDE.md" if runtime == "claude" else "AGENTS.md"
@@ -117,11 +132,40 @@ def _validate_architecture_markdown(input_path: Path, architecture_md: str) -> N
             input_path,
             "arch-design architecture_md must include a 'Module Architecture' section with the intended repository/module structure",
         )
-    if "```" not in text[match.end():]:
+    section = text[match.end() :]
+    fenced = FENCED_BLOCK_RE.search(section)
+    if not fenced:
         raise _shape_error(
             "arch-design",
             input_path,
             "arch-design Module Architecture section must include a fenced code block showing the repository/module tree",
+        )
+    tree_body = str(fenced.group("body") or "")
+    invalid_backend_paths = sorted(set(NON_CANONICAL_BACKEND_PACKAGE_RE.findall(tree_body)))
+    invalid_backend_tree_children = NON_CANONICAL_BACKEND_TREE_CHILD_RE.findall(tree_body)
+    if invalid_backend_paths or invalid_backend_tree_children:
+        raise _shape_error(
+            "arch-design",
+            input_path,
+            "python-react architecture must place backend Python packages under backend/src/...; found unsupported backend package roots in the Module Architecture tree",
+        )
+    if UNSUPPORTED_TOP_LEVEL_MCP_SERVER_RE.search(tree_body):
+        raise _shape_error(
+            "arch-design",
+            input_path,
+            "python-react architecture must use the selected stack's canonical service roots; found an unsupported extra service root in the Module Architecture tree",
+        )
+    tree_files = [
+        match.group("name")
+        for match in TREE_FILE_ENTRY_RE.finditer(tree_body)
+        if match.group("name") not in ALLOWED_TREE_PLACEHOLDER_FILES
+    ]
+    if len(tree_files) > MAX_MODULE_TREE_FILE_ENTRIES:
+        raise _shape_error(
+            "arch-design",
+            input_path,
+            "arch-design Module Architecture tree must be a scaffold skeleton, not an implementation file inventory; too many concrete files were listed",
+            details={"max_file_entries": MAX_MODULE_TREE_FILE_ENTRIES, "file_entry_count": len(tree_files)},
         )
 
 
@@ -235,6 +279,7 @@ def import_spec_review(project_root: Path | str, payload: dict[str, Any], input_
     if not isinstance(requirements, list) or not isinstance(acceptance_scenarios, list):
         raise _shape_error("spec-review", input_path, "spec-review payload must contain requirements[] and acceptance_scenarios[] arrays")
     project_root = Path(project_root).expanduser().resolve()
+    clarifications = [item for item in clarifications if isinstance(item, dict)]
     _persist_stage_input(project_root, "spec-review", payload)
     docs_dir = project_root / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -261,10 +306,19 @@ def import_spec_review(project_root: Path | str, payload: dict[str, Any], input_
             question = str(item.get("question") or "").strip()
             rationale = str(item.get("rationale") or "").strip()
             affected = ", ".join(str(value).strip() for value in item.get("affected_requirement_ids", []) if str(value).strip()) or "none"
+            recommended = str(item.get("recommended_answer") or "").strip()
+            options = [str(value).strip() for value in item.get("answer_options", []) if str(value).strip()]
             lines.append(f"## {severity} - {question}")
             lines.append("")
             if rationale:
                 lines.append(rationale)
+                lines.append("")
+            if recommended:
+                lines.append(f"Recommended answer: {recommended}")
+                lines.append("")
+            if options:
+                lines.append("Suggested options:")
+                lines.extend(f"- {value}" for value in options)
                 lines.append("")
             lines.append(f"Affected requirements: {affected}")
             lines.append("")

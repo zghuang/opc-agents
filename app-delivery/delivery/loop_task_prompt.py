@@ -9,7 +9,7 @@ from .requirements_context import format_acceptance_context, format_requirement_
 from .runtime_config import load_project_metadata
 from .state import load_gates, load_test_results, project_paths
 from .builtin_task_prompts import render_frontend_api_audit_prompt, render_prefinal_audit_prompt
-from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
+from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, SHARED_FOUNDATION_TASK_ID
 from .task import Task, lint_task_contract
 
 
@@ -131,7 +131,7 @@ def _task_touches_manifest_for_ecosystem(task: Task, ecosystem: str) -> bool:
 
 def _dependency_hint_relevant(task: Task, hint: dict[str, str], context: str) -> bool:
     ecosystem = str(hint.get("ecosystem") or "project").strip().lower() or "project"
-    if _task_touches_manifest_for_ecosystem(task, ecosystem):
+    if task.id != SHARED_FOUNDATION_TASK_ID and _task_touches_manifest_for_ecosystem(task, ecosystem):
         return True
     name = str(hint.get("name") or "").strip()
     if not name:
@@ -381,6 +381,8 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
     if touches_dependency_manifest:
         lines.append("- This task touches dependency manifests. Consult the `Tech Design` section in AGENTS.md / CLAUDE.md plus `docs/architecture.md` before changing project-wide stack choices.")
         lines.append("- When a requirement mandates a technology family rather than a literal package name, resolve the exact package entry deliberately instead of dumping all possible dependencies into the manifest.")
+        if task.id == SHARED_FOUNDATION_TASK_ID:
+            lines.append("- For shared foundation, install only dependencies directly used by code implemented in this task. Defer feature-specific stack packages to the owning feature task that first imports or implements that capability; that later task may update manifests as necessary support work.")
     lines.append("- If previously passing tests outside this task's declared scope regress after your changes, determine whether the regression is caused by your implementation, stale tests, or both, then apply the minimal correct fix.")
     lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
     prompt = "\n".join(lines)

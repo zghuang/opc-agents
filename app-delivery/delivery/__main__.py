@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import shutil
@@ -44,6 +45,51 @@ from .task import all_tasks, reset_task, save_tasks
 
 CONTROL_STEP_LIMIT = 128
 EXECUTION_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _prune_stale_execution_lock(project_root: Path) -> bool:
+    lock_path = project_root / ".app-delivery-runtime" / "locks" / "execution.lock"
+    lock_details = read_lock_metadata(lock_path)
+    try:
+        owner_pid = int((lock_details or {}).get("pid") or 0)
+    except (TypeError, ValueError):
+        owner_pid = 0
+    if owner_pid <= 0 or _pid_is_running(owner_pid):
+        return False
+    try:
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            try:
+                refreshed = read_lock_metadata(lock_path)
+                try:
+                    refreshed_pid = int((refreshed or {}).get("pid") or 0)
+                except (TypeError, ValueError):
+                    refreshed_pid = 0
+                if refreshed_pid > 0 and not _pid_is_running(refreshed_pid):
+                    lock_path.unlink(missing_ok=True)
+                    return True
+                return False
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return False
 
 
 def _terminate_pid(pid: int) -> None:
@@ -243,6 +289,7 @@ def _project_execution_guard(project_root: Path, *, already_locked: bool) -> Any
         yield None
         return
     lock_path = project_root / ".app-delivery-runtime" / "locks" / "execution.lock"
+    _prune_stale_execution_lock(project_root)
     try:
         timeout = float(os.environ.get("APP_DELIVERY_EXECUTION_LOCK_TIMEOUT_SECONDS") or EXECUTION_LOCK_TIMEOUT_SECONDS)
     except ValueError:

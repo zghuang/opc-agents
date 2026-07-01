@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .runtime_config import load_project_runtime, root_context_filename
-from .state import load_architecture_meta
+from .state import load_architecture_meta, load_task_runtime_state, normalize_task_runtime_state
 from .task import SCAFFOLD_TASK_ID, all_tasks, lint_task_contracts
 
 
@@ -117,8 +117,25 @@ def discover_requirements_source(project_root: Path, explicit_path: str | None =
 def work_item_contract_errors(project_root: Path) -> dict[str, list[str]]:
     tasks = all_tasks(project_root)
     contracts = lint_task_contracts(tasks)
-    return {
+    errors = {
         task_id: payload["errors"]
         for task_id, payload in contracts.items()
         if payload["errors"]
     }
+    for task in tasks:
+        if task.status != "blocked":
+            continue
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
+        blocker = runtime_state.get("task_contract_blocker") if isinstance(runtime_state.get("task_contract_blocker"), dict) else None
+        if not blocker:
+            continue
+        if str(blocker.get("recommended_action") or "").strip() != "repair_task_decompose":
+            continue
+        notes = str(blocker.get("notes") or task.blocked_reason or "task contract review requested task-decompose repair").strip()
+        affected_requirements = ", ".join(str(value).strip() for value in blocker.get("affected_requirement_ids", []) if str(value).strip()) or "none"
+        affected_acceptance = ", ".join(str(value).strip() for value in blocker.get("affected_acceptance_ids", []) if str(value).strip()) or "none"
+        errors.setdefault(task.id, []).append(
+            "code review found a task contract mismatch requiring task-decompose repair: "
+            f"{notes}; affected_requirements={affected_requirements}; affected_acceptance={affected_acceptance}"
+        )
+    return errors

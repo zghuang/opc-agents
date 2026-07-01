@@ -199,6 +199,14 @@ cp "$FRAMEWORK_ROOT/CLAUDE.md" "$INSTALL_ROOT/"
 printf '%s\n' "$PYTHON_BIN" > "$INSTALL_ROOT/.python-bin"
 chmod +x "$INSTALL_ROOT/scripts"/*.sh "$INSTALL_ROOT/scripts"/*.py 2>/dev/null || true
 
+mkdir -p "$OPC_HOME/scripts"
+cat > "$OPC_HOME/scripts/opc-pre-tool-guard.py" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$PYTHON_BIN" "$INSTALL_ROOT/scripts/app_delivery_pre_tool_guard.py" "\$@"
+EOF
+chmod +x "$OPC_HOME/scripts/opc-pre-tool-guard.py"
+
 cat > "$BIN_DIR/app-delivery" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -230,6 +238,7 @@ rm -f "$BIN_DIR/app-delivery-start.sh" "$BIN_DIR/app-delivery-build-loop.sh"
 
 chmod +x "$BIN_DIR/app-delivery" "$BIN_DIR/new-project.sh" "$BIN_DIR/app-delivery-doctor.sh" "$BIN_DIR/app-delivery-preflight.sh"
 ok "Wrapper commands installed under $BIN_DIR"
+ok "Hermes pre-tool guard compatibility wrapper installed under $OPC_HOME/scripts"
 
 rm -rf "$SKILLS_DST"
 mkdir -p "$SKILLS_DST"
