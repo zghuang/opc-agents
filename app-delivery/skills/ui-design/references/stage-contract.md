@@ -8,8 +8,8 @@ Return JSON with these markdown fields:
 
 Constraints:
 - These documents are design references only, not implementation code.
-- The template source of truth is the template-pack library under `/Users/hzg/apps/agents/m-opc/temp/hermes-skills/ui-design/references/`.
-- Start by evaluating the available template packs there, especially `default`, `enterprise-console`, and `ai-workspace`, using each pack's `manifest.yaml`, `notes.md`, `style-contract.json`, and screenshot descriptions.
+- The template source of truth is this skill's local `references/` directory.
+- Evaluate available template packs, especially `default`, `enterprise-console`, and `ai-workspace`, using each pack's manifest, notes, style contract, and screenshot descriptions.
 - `template_selection_md` must name the selected template pack id exactly, explain why it fits, and state what it optimizes for.
 - `design_system_md` must stay consistent with the chosen pack's style contract and notes.
 - Choose a coherent UI direction that fits the product domain.

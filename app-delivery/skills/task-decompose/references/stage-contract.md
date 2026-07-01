@@ -20,7 +20,8 @@ The `intent` object must use this lightweight shape:
 	"objective": "short capability statement",
 	"journey": "user, external-system, or background workflow this task enables",
 	"done_when": ["concrete completion signal", "validation signal"],
-	"non_goals": ["optional scope boundary"]
+	"non_goals": ["optional scope boundary"],
+	"split_justification": "optional reason for keeping a large task whole"
 }
 ```
 
@@ -31,18 +32,22 @@ Intent rules:
 - `non_goals` is optional. Use it only when the task is likely to overlap neighboring tasks or invite scope creep.
 - Intent must be grounded in the same requirements and acceptance scenarios as the task. Do not add new product scope through intent.
 - If two generated tasks have nearly identical objectives or journeys, merge them, clarify their boundaries, or add an explicit dependency so they do not duplicate work.
+- The size checks apply only to non-built-in delivery tasks. Framework-inserted scaffold, shared foundation, audit, final, and production-gate tasks are not part of this limit.
+- If a task has more than 12 requirements, more than 5 acceptance scenarios, or more than 8 output tests, and two or more of those are true, reassess the boundary. Decide whether it is one coherent independently testable capability or should be split into vertical slices. Record the decision in `intent.split_justification`.
+- If the graph has more than 20 non-built-in delivery tasks, reassess whether the count is appropriate for the project size and module boundaries. Keep tasks separate when each is a coherent independently testable slice; merge only when the merged task remains focused. Record the decision in `intent.split_justification` for intentionally retained count-heavy boundaries.
 
 Constraints:
 - Do not emit T000, T001, or T-FINAL. The framework inserts built-in tasks itself.
 - Prefer complete user-visible slices over layer-by-layer tasks.
 - Decompose from overall product capability into executable vertical slices.
-- The LLM owns the decomposition judgment: choose the smallest coherent task that still delivers a meaningful product capability. The framework will only validate basic invariants, so do not rely on the harness to discover poor task boundaries.
+- Choose the smallest coherent task that still delivers a meaningful product capability.
+- Assign each explicit project-wide technology choice from requirements, architecture, or project technology constraints to at least one owning task.
 - A task may cross backend, frontend, mock-server, tests, and shared components when that is the smallest coherent slice.
 - Avoid horizontal or layer-only tasks such as "all DB models" or "all frontend pages".
 - Also avoid over-fragmenting one feature into separate model/API/UI/test fragments; too many handoff points can reduce delivery quality just as much as oversized tasks.
 - Keep dependency edges explicit and minimal so the resulting graph is a practical DAG, not a linear dump.
 - Keep each task small enough for one AI session to complete.
-- A good task usually has 3-15 source paths, 1-5 output tests, can be described in 1-2 sentences, and delivers one coherent feature outcome without needing another task to make that same outcome usable.
+- A good task usually has 3-15 source paths, 1-5 output tests, and one coherent feature outcome.
 - If a feature would exceed that size, split it into smaller vertical slices by user workflow, sub-capability, or bounded context.
 - If splitting a feature would leave tasks that are only plumbing, placeholder UI, generic contracts, or tests without a usable behavior, keep the slice together instead.
 - output_tests should be concrete paths that can be executed later.
@@ -127,6 +132,9 @@ Architecture metadata:
 
 Test plan coverage:
 {{test_plan_json}}
+
+Project technology constraints:
+{{dependency_hints_json}}
 
 Clarification answers:
 {{clarification_answers_md}}

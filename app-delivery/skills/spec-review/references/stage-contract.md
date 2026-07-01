@@ -17,7 +17,7 @@ requirements:
 - A requirement is actionable enough for downstream architecture when it names or clearly implies: actor or external system, capability or workflow, key input/output or state change, and observable acceptance signal.
 - A requirement is too coarse when it is only a goal, slogan, module label, broad noun phrase, or generic capability bucket without enough behavior, boundaries, or acceptance evidence to guide architecture and task decomposition.
 - Preserve contradictions instead of smoothing them over.
-- If the source explicitly mandates technologies, runtimes, frameworks, packages, libraries, infrastructure components, or external contracts, preserve those constraints in the normalized requirements instead of dropping them.
+- If the source mandates a technology, runtime, framework, package, library, infrastructure component, protocol, or external contract, preserve it as a requirement or constraint and emit a matching `technology_hints` entry.
 
 acceptance_scenarios:
 - Each item must include id, title, summary, source_requirement_ids.
@@ -36,11 +36,11 @@ clarifications:
 - Use C3/non-blocking for naming, wording, display, copy, or prioritization details that can be safely decided later.
 
 technology_hints:
-- Optional array for explicit technology choices that later planning and implementation must preserve.
-- Use this only when the source explicitly names a runtime, framework, package family, component library, SDK, protocol stack, or infrastructure choice that should guide dependency manifests and implementation direction.
-- Each item should include: name, ecosystem, reason, evidence.
+- Optional array for explicit technology choices later stages must preserve.
+- Use only for source-named runtime, framework, package family, component library, SDK, protocol stack, or infrastructure choices.
+- Each item should include name, ecosystem, reason, evidence.
 - `ecosystem` should usually be `backend`, `frontend`, `infra`, or `project`.
-- Do not guess package names from memory when the source only names a product or framework family; preserve the named technology choice and let later implementation verify the exact package coordinates.
+- Do not guess package coordinates when the source names only a product or framework family.
 
 Judgment rules:
 - If the source has contradictions or unclear points, surface them in clarifications rather than guessing.

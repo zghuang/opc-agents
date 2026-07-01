@@ -12,9 +12,7 @@ Procedure:
 1. Confirm architecture artifacts are present.
 2. If UI is required, ensure `docs/ui/*` has been generated first.
 3. Load the stage contract from [references/stage-contract.md](./references/stage-contract.md), replace placeholders with the actual project inputs, and produce a JSON object containing `claude_md`, `agents_md`, and `test_plan`.
-	- Keep `claude_md` / `agents_md` concise and project-specific.
-	- Include the project-level knowledge that every runtime session should know up front: product/domain summary, key working rules, code-organization guidance, testing expectations, and critical domain constraints.
-	- Do not spend tokens restating generic framework/runtime rules that are constant across projects; the harness injects that baseline automatically.
+	- Keep `claude_md` / `agents_md` concise, project-specific, and focused on stable architecture context.
 4. Write that JSON to `${project}/.app-delivery-runtime/stage-inputs/project-context-sync.json`.
 5. Import the stage result through the harness:
 ```bash

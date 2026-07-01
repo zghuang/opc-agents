@@ -112,6 +112,19 @@ FINAL_VERIFY_REQUIREMENT_PREFIXES = (
     "NFR-",
 )
 RELEASE_ADVISORY_TEST_TYPES = {"accessibility", "performance"}
+FRAMEWORK_BUILTIN_TASK_IDS = {
+    SCAFFOLD_TASK_ID,
+    SHARED_FOUNDATION_TASK_ID,
+    FRONTEND_API_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_TASK_ID,
+    FINAL_VERIFY_TASK_ID,
+}
+
+
+def _is_framework_generated_task(task: "Task") -> bool:
+    if task.id in FRAMEWORK_BUILTIN_TASK_IDS:
+        return True
+    return task.task_kind == "validation" and task.id.startswith("T9") and task.title.startswith(PRODUCTION_GATE_TITLE_PREFIX)
 
 
 def _is_final_verify_requirement(requirement_id: str) -> bool:
@@ -154,6 +167,9 @@ def _normalize_intent(payload: Any) -> dict[str, Any]:
         deduped = _dedupe_preserve(values)
         if deduped:
             normalized[key] = deduped
+    split_justification = str(payload.get("split_justification") or "").strip()
+    if split_justification:
+        normalized["split_justification"] = split_justification
     return normalized
 
 
@@ -631,8 +647,13 @@ def _validate_dependency_graph(tasks: list[Task]) -> None:
 
 def _validate_task_shape(tasks: list[Task]) -> None:
     oversized: list[str] = []
+    delivery_tasks = [task for task in tasks if not _is_framework_generated_task(task)]
+    if len(delivery_tasks) > 20:
+        oversized.append(
+            f"task graph has {len(delivery_tasks)} non-built-in tasks (>20); reassess whether this count is appropriate for the project size and module boundaries. Keep the tasks separate if each is a coherent independently testable slice; merge only where the merged task remains focused. Add intent.split_justification to any intentionally retained count-heavy boundary."
+        )
     for task in tasks:
-        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
+        if _is_framework_generated_task(task):
             continue
         invalid_mock_paths = [
             path
@@ -659,6 +680,19 @@ def _validate_task_shape(tasks: list[Task]) -> None:
             )
         if task.acceptance_scenarios and not task.output_tests:
             oversized.append(f"{task.id} (acceptance scenarios declared without output tests)")
+        signals = []
+        if len(task.requirements) > 12:
+            signals.append(f"requirements={len(task.requirements)} > 12")
+        if len(task.acceptance_scenarios) > 5:
+            signals.append(f"acceptance_scenarios={len(task.acceptance_scenarios)} > 5")
+        if len(task.output_tests) > 8:
+            signals.append(f"output_tests={len(task.output_tests)} > 8")
+        intent = task.intent if isinstance(task.intent, dict) else {}
+        split_justification = str(intent.get("split_justification") or "").strip()
+        if len(signals) >= 2 and not split_justification:
+            oversized.append(
+                f"{task.id} needs boundary review ({'; '.join(signals)}). Decide whether it is one coherent independently testable capability or should be split into vertical slices, then add intent.split_justification with the decision rationale."
+            )
     if oversized:
         raise ValueError("task decomposition produced oversized or under-specified tasks: " + ", ".join(oversized))
 
@@ -667,7 +701,7 @@ def lint_task_contract(task: Task) -> dict[str, list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
-    if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
+    if _is_framework_generated_task(task):
         return {"errors": errors, "warnings": warnings}
 
     if not task.output_paths:

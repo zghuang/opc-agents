@@ -400,17 +400,7 @@ def retire_session(project_root: Path | str, session: RuntimeSession) -> None:
 
 
 def session_context_for(session: RuntimeSession, task_title: str, prompt: str) -> str:
-    header = [
-        f"Session runtime: {session.runtime}",
-        f"Session id: {session.id}",
-        f"Task count in this session: {session.task_count}",
-        f"Current task: {task_title}",
-        "Session scope: this turn is for the current task only.",
-        "Do not begin another task or future work item in this session.",
-        "When the current task is complete, blocked, or ready for review, stop immediately.",
-        "",
-    ]
-    return "\n".join(header) + prompt
+    return prompt
 
 
 def execute_in_session(

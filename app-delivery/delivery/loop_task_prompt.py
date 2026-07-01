@@ -101,6 +101,22 @@ def _has_browser_style_test(task: Task) -> bool:
     return False
 
 
+def _has_python_package_output_dir(task: Task) -> bool:
+    return any(
+        str(path).strip().endswith("/")
+        and str(path).strip().startswith(("backend/", "mock-server/"))
+        for path in task.output_paths
+    )
+
+
+def _append_python_package_placement_rule(lines: list[str], task: Task) -> None:
+    if not _has_python_package_output_dir(task):
+        return
+    lines.append(
+        "- For Python package directories, put implementation in module files; keep `__init__.py` to exports or light initialization."
+    )
+
+
 def _dependency_hint_tokens(name: str) -> list[str]:
     return [token for token in re.split(r"[^A-Za-z0-9]+", str(name or "").casefold()) if len(token) >= 3]
 
@@ -185,7 +201,7 @@ def _append_dependency_hint_section(lines: list[str], dependency_hints: list[dic
             suffix = f" [{'; '.join(part for part in [source, evidence] if part)}]"
         reason = str(hint.get("reason") or "").strip() or "Required by project planning artifacts."
         lines.append(f"- {hint['name']} ({hint['ecosystem']}): {reason}{suffix}")
-    lines.append("- Treat the listed technologies as task requirements unless an existing ADR or clarification explicitly supersedes them; do not replace them with custom implementations silently.")
+    lines.append("- Use these technologies unless an ADR or clarification supersedes them.")
     lines.append("")
 
 
@@ -245,9 +261,9 @@ def _append_repair_focus_section(lines: list[str], project_root: Path | str, tas
     if task.task_kind != "repair":
         return
     lines.append("Repair objective:")
-    lines.append("- This is a focused repair task, not a fresh feature build. Do not re-derive the whole product from every requirement before fixing the concrete failure.")
-    lines.append("- Start with the repair evidence, failed tests, blocked gates, declared tests, and declared paths in this prompt.")
-    lines.append("- Read requirement details from docs/requirements.json only for requirement IDs directly tied to the failing evidence you are repairing.")
+    lines.append("- Fix the cited failure; do not restart the feature build.")
+    lines.append("- Start with repair evidence, failed tests, blocked gates, declared tests, and declared paths.")
+    lines.append("- Read requirement details only for IDs tied to the failure.")
     evidence_paths = _repair_evidence_paths(project_root, task)
     if evidence_paths:
         lines.append("- Read these repair evidence artifacts first:")
@@ -255,8 +271,124 @@ def _append_repair_focus_section(lines: list[str], project_root: Path | str, tas
     if task.blocked_reason:
         lines.append(f"- Repair summary: {task.blocked_reason}")
     if _is_final_repair_task(task):
-        lines.append("- For final repair bundles, close the listed final verification or final review failures; do not attempt a broad second implementation pass.")
+        lines.append("- For final repair bundles, close listed final failures only.")
     lines.append("")
+
+
+def _append_review_repair_context(
+    lines: list[str],
+    project_root: Path | str,
+    task: Task,
+    *,
+    requirement_context: list[str],
+    acceptance_context: list[str],
+    gate_rows: list[dict[str, object]],
+    failed_summary: list[str],
+) -> None:
+    lines.append("Review repair mode:")
+    lines.append("- Repair the review findings; do not re-derive the task.")
+    if task.blocked_reason:
+        lines.append(f"- Review summary: {task.blocked_reason}")
+    if task.review_artifact:
+        lines.append(f"- Review artifact: {task.review_artifact}")
+        lines.append("- Read the review artifact first and use it as the primary repair brief for this turn.")
+    if task.requirements:
+        lines.append(f"- Declared requirement IDs: {', '.join(task.requirements)}")
+    if task.acceptance_scenarios:
+        lines.append(f"- Declared acceptance IDs: {', '.join(task.acceptance_scenarios)}")
+    if task.output_paths:
+        lines.append(f"- Declared output paths: {', '.join(task.output_paths)}")
+    if task.output_tests:
+        lines.append(f"- Declared output tests: {', '.join(task.output_tests)}")
+    _append_python_package_placement_rule(lines, task)
+    if requirement_context:
+        lines.append("")
+        lines.append("Relevant requirement context:")
+        lines.extend(requirement_context)
+    if acceptance_context:
+        lines.append("")
+        lines.append("Relevant acceptance context:")
+        lines.extend(acceptance_context)
+    if failed_summary:
+        lines.append("")
+        lines.append("Current failing-test context:")
+        lines.extend(failed_summary)
+    if gate_rows:
+        lines.append("")
+        lines.append("Related gate requirements:")
+        for gate in gate_rows:
+            required = ", ".join(str(value).strip() for value in gate.get("required_test_types", []) if str(value).strip()) or "none"
+            observed = ", ".join(str(value).strip() for value in gate.get("observed_test_types", []) if str(value).strip()) or "none"
+            missing = ", ".join(str(value).strip() for value in gate.get("missing_test_types", []) if str(value).strip()) or "none"
+            reason = str(gate.get("blocked_reason") or "").strip() or str(gate.get("status") or "").strip() or "gate requirements outstanding"
+            report_artifact = str(gate.get("report_artifact") or "").strip() or "none"
+            lines.append(
+                f"- {str(gate.get('id') or '-').strip()}: status={str(gate.get('status') or '-').strip()} required={required} observed={observed} missing={missing} reason={reason} report={report_artifact}"
+            )
+    lines.append("")
+    lines.append("Repair priorities:")
+    lines.append("- Start from the affected behavior named by review.")
+    lines.append("- Keep the task boundary; edit adjacent support files only when needed for the fix.")
+    lines.append("- Re-run task-local validation, then stop for review.")
+    lines.append("")
+
+
+def build_review_repair_prompt(project_root: Path | str, task: Task) -> str:
+    project_dir = Path(project_root).expanduser().resolve()
+    test_results = load_test_results(project_dir)
+    failed_summary = []
+    for row in _relevant_failed_results(task, test_results):
+        failed_summary.append(f"- {row.get('task_id')}: {row.get('test_files')} -> {row.get('failed_count')} failed")
+    gate_rows = _relevant_gate_rows(project_root, task)
+    lines = [
+        f"## Task {task.id}: {task.title}",
+        "",
+        f"Project path: {project_dir}",
+        "",
+    ]
+    _append_task_intent_section(lines, task)
+    requirement_context = format_requirement_context(project_root, task.requirements) or []
+    acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
+    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
+    _append_dependency_hint_section(lines, dependency_hints)
+    _append_review_repair_context(
+        lines,
+        project_root,
+        task,
+        requirement_context=requirement_context,
+        acceptance_context=acceptance_context,
+        gate_rows=gate_rows,
+        failed_summary=failed_summary,
+    )
+    has_backend_specs = any(spec.startswith("backend/") for spec in task.output_tests)
+    has_frontend_specs = any(spec.startswith("frontend/") for spec in task.output_tests)
+    has_frontend_paths = any(path.startswith("frontend/") for path in task.output_paths)
+    has_browser_specs = _has_browser_style_test(task)
+    touches_dependency_manifest = any(
+        path in {"backend/pyproject.toml", "frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}
+        for path in task.output_paths
+    )
+    lines.append("Execution guidance:")
+    lines.append("- Continue from current code; the review artifact is the repair brief.")
+    lines.append("- Green tests are not enough; prove the review findings are fixed.")
+    lines.append("- Add or strengthen task-local tests when proof is missing.")
+    if has_frontend_paths and task.acceptance_scenarios:
+        lines.append("- If review affects frontend acceptance behavior, keep browser/e2e coverage here unless a declared downstream validation task owns the exact journey.")
+        if not has_browser_specs:
+            lines.append("- No browser/e2e test is currently declared for this frontend acceptance slice. Add one now unless the downstream validation owner is explicit in the task graph.")
+    lines.append("- Complete only the current task. Do not start the next task, pre-implement future work, or widen scope after the review issues are repaired.")
+    if has_backend_specs:
+        lines.append("- Backend validation: prefer package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`, using the repository environment rather than bare system python.")
+    if has_frontend_specs:
+        lines.append("- Frontend validation: prefer the scripts declared in `frontend/package.json` (`npm run test`, `typecheck`, `lint`, `build`, `e2e`) instead of custom one-off commands.")
+    if touches_dependency_manifest:
+        lines.append("- This task touches dependency manifests. Consult the `Tech Design` section in AGENTS.md / CLAUDE.md plus `docs/architecture.md` before changing project-wide stack choices.")
+        lines.append("- Resolve exact packages deliberately; do not dump unused stack dependencies into manifests.")
+    lines.append("- If your changes break nearby previously passing tests, apply the minimal correct fix.")
+    lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
+    prompt = "\n".join(lines)
+    write_task_prompt(project_root, task, prompt)
+    return prompt
 
 
 def build_task_prompt(project_root: Path | str, task: Task) -> str:
@@ -270,6 +402,8 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         return prompt
     if task.task_kind == "validation":
         return build_validation_task_prompt(project_root, task)
+    if str(task.review_status or "").strip().casefold() == "changes_requested":
+        return build_review_repair_prompt(project_root, task)
     project_dir = Path(project_root).expanduser().resolve()
     test_results = load_test_results(project_dir)
     failed_summary = []
@@ -316,6 +450,8 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
     if task.output_paths:
         lines.append(f"Paths: {', '.join(task.output_paths)}")
         lines.append("")
+        _append_python_package_placement_rule(lines, task)
+        lines.append("")
     if task.output_tests:
         lines.append(f"Tests: {', '.join(task.output_tests)}")
         lines.append("")
@@ -344,17 +480,7 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         path in {"backend/pyproject.toml", "frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}
         for path in task.output_paths
     )
-    if str(task.review_status or "").strip().casefold() == "changes_requested":
-        lines.append("Previous independent code review requested changes:")
-        if task.blocked_reason:
-            lines.append(f"- Review summary: {task.blocked_reason}")
-        if task.review_artifact:
-            lines.append(f"- Review artifact: {task.review_artifact}")
-            lines.append("- Read that artifact and repair the cited issues before re-running validation.")
-        else:
-            lines.append("- Repair the cited review issues before re-running validation.")
-        lines.append("")
-    elif task.task_kind == "repair" and task.blocked_reason:
+    if task.task_kind == "repair" and task.blocked_reason:
         lines.append("Repair context:")
         lines.append(f"- {task.blocked_reason}")
         lines.append("- Start from the failed validation evidence and the declared tests below; do not broaden into unrelated product work.")
@@ -366,11 +492,11 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
     has_frontend_paths = any(path.startswith("frontend/") for path in task.output_paths)
     has_browser_specs = _has_browser_style_test(task)
     lines.append("Follow the runtime baseline in AGENTS.md / CLAUDE.md. For this task:")
-    lines.append("- Prefer the declared output paths and output tests, but if completing the requirement or fixing regressions in the current task needs adjacent support-file edits, make them in this task and validate them here instead of stopping early on scope alone.")
-    lines.append("- Treat the declared output_tests as the minimum validation floor, not as proof by themselves that the requirement is done. Passing tests are necessary but not sufficient when the requirement or acceptance details describe stronger behavior.")
-    lines.append("- If the declared requirement or acceptance behavior is still not demonstrated inside this task's scope, add or strengthen task-local tests before stopping, then run the updated tests in the same task.")
+    lines.append("- Use declared output paths/tests as the main contract; make necessary adjacent support edits and validate them here.")
+    lines.append("- Green tests are not enough; prove the declared requirement and acceptance behavior.")
+    lines.append("- Add or strengthen task-local tests when behavior is not demonstrated.")
     if has_frontend_paths and task.acceptance_scenarios:
-        lines.append("- This task owns frontend-facing acceptance behavior. Include browser/e2e coverage for the user-visible flow in this task unless a declared downstream validation task explicitly owns that exact browser journey.")
+        lines.append("- Frontend acceptance behavior needs browser/e2e coverage here unless a declared downstream validation task owns the exact journey.")
         if not has_browser_specs:
             lines.append("- No browser/e2e test is currently declared for this frontend acceptance slice. Add one now unless the downstream validation owner is explicit in the task graph.")
     lines.append("- Complete only the current task. Do not start the next task, pre-implement future work, or widen scope after this task's declared tests pass.")
@@ -380,10 +506,10 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         lines.append("- Frontend validation: prefer the scripts declared in `frontend/package.json` (`npm run test`, `typecheck`, `lint`, `build`, `e2e`) instead of custom one-off commands.")
     if touches_dependency_manifest:
         lines.append("- This task touches dependency manifests. Consult the `Tech Design` section in AGENTS.md / CLAUDE.md plus `docs/architecture.md` before changing project-wide stack choices.")
-        lines.append("- When a requirement mandates a technology family rather than a literal package name, resolve the exact package entry deliberately instead of dumping all possible dependencies into the manifest.")
+        lines.append("- Resolve exact packages deliberately; do not dump unused stack dependencies into manifests.")
         if task.id == SHARED_FOUNDATION_TASK_ID:
-            lines.append("- For shared foundation, install only dependencies directly used by code implemented in this task. Defer feature-specific stack packages to the owning feature task that first imports or implements that capability; that later task may update manifests as necessary support work.")
-    lines.append("- If previously passing tests outside this task's declared scope regress after your changes, determine whether the regression is caused by your implementation, stale tests, or both, then apply the minimal correct fix.")
+            lines.append("- For shared foundation, install only dependencies used by this task; defer feature-specific packages to their owning task.")
+    lines.append("- If your changes break nearby previously passing tests, apply the minimal correct fix.")
     lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
     prompt = "\n".join(lines)
     write_task_prompt(project_root, task, prompt)
@@ -428,6 +554,8 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
     if task.output_paths:
         lines.append(f"Paths: {', '.join(task.output_paths)}")
         lines.append("")
+        _append_python_package_placement_rule(lines, task)
+        lines.append("")
     if task.output_tests:
         lines.append(f"Tests: {', '.join(task.output_tests)}")
         lines.append("")
@@ -453,14 +581,14 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
             )
         lines.append("")
     if str(task.review_status or "").strip().casefold() == "changes_requested":
-        lines.append("Previous independent code review requested changes:")
+        lines.append("Review repair context:")
         if task.blocked_reason:
             lines.append(f"- Review summary: {task.blocked_reason}")
         if task.review_artifact:
             lines.append(f"- Review artifact: {task.review_artifact}")
-            lines.append("- Read that artifact and repair the cited issues before re-running validation.")
+            lines.append("- Read it first, then repair and validate.")
         else:
-            lines.append("- Repair the cited review issues before re-running validation.")
+            lines.append("- Repair cited review issues, then validate.")
         lines.append("")
 
     has_backend_specs = any(spec.startswith("backend/") for spec in task.output_tests)
@@ -509,6 +637,7 @@ def build_fix_prompt(project_root: Path | str, task: Task, test_summary: str) ->
     ]
     if task.output_paths:
         lines.append(f"Declared output paths: {', '.join(task.output_paths)}")
+        _append_python_package_placement_rule(lines, task)
     if task.output_tests:
         lines.append(f"Declared output tests: {', '.join(task.output_tests)}")
     if task.output_paths or task.output_tests:
@@ -564,6 +693,9 @@ def build_stalled_recovery_prompt(
         lines.append("Current failed-test context:")
         lines.extend(failed_summary)
         lines.append("")
+    _append_python_package_placement_rule(lines, task)
+    if _has_python_package_output_dir(task):
+        lines.append("")
     lines.extend(
         [
             "Recovery instructions:",
@@ -579,9 +711,15 @@ def build_stalled_recovery_prompt(
 
 
 def build_scope_fix_prompt(task: Task, message: str) -> str:
-    return (
-        f"Task {task.id} produced changes outside its declared scope.\n"
-        f"Task: {task.title}\n\n"
-        f"Scope error:\n{message}\n\n"
-        "Move the implementation back into the declared output paths and declared test paths, or reduce unintended file edits, then stop."
-    )
+    lines = [
+        f"Task {task.id} produced changes outside its declared scope.",
+        f"Task: {task.title}",
+        "",
+        f"Scope error:\n{message}",
+        "",
+    ]
+    _append_python_package_placement_rule(lines, task)
+    if _has_python_package_output_dir(task):
+        lines.append("")
+    lines.append("Move the implementation back into the declared output paths and declared test paths, or reduce unintended file edits, then stop.")
+    return "\n".join(lines)

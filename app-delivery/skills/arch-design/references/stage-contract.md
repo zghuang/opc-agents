@@ -9,10 +9,13 @@ Return JSON with these fields:
 
 Constraints:
 - Choose a pragmatic, production-appropriate architecture.
-- Preserve explicit technology, framework, protocol, runtime, infrastructure, and component choices from the requirements. Treat template defaults as non-authoritative hints, not architecture decisions.
+- Adopt explicit technology, framework, protocol, runtime, infrastructure, and component choices from the requirements. If you replace one, record the reason in an ADR.
+- Adopt the project technology constraints below. Name required project-wide choices in `architecture_md` Tech Design; do not leave them only in requirements prose.
 - Keep module boundaries explicit.
-- architecture_md must include a dedicated `Module Architecture` section that contains a fenced repository/module tree and a concise explanation of the major code areas. This section is mandatory even when separate `docs/modules/*` files are also provided.
-- The fenced Module Architecture tree is also the T000 scaffold skeleton contract. Include the directories that should exist before implementation tasks run, plus only lightweight placeholders needed to make empty directories durable (`__init__.py` for Python packages, `.gitkeep` for non-Python leaf directories). Do not list implementation files merely to force a generic pattern such as CRUD modules, services, repositories, or ORM models; include those only when this project's requirements and architecture actually call for them.
+- `modules` must contain module design docs only: responsibilities, public interfaces, data ownership, integration points, and tests. Do not put ADRs in `modules`.
+- `adrs` must contain decision records only: context, decision, consequences, and alternatives.
+- `architecture_md` must include `Module Architecture`: a fenced repository tree plus concise responsibilities for major code areas.
+- The fenced tree is the T000 scaffold contract. List directories, durable empty-directory placeholders, and minimal scaffold/config files only. Do not inventory implementation source files; keep concrete source files to rare entrypoints that T000 must create.
 - For the python-react stack, backend Python packages live under `backend/src/...`. Put project-specific modules such as API routes, agents, orchestration, MCP adapters, simulation, models, and core code under that source root. Do not place Python packages outside that backend source root or invent additional service roots unless the selected stack/template explicitly supports them. Implement production FastMCP code under `backend/src/...` or simulated tool services under project-root `mock-server/...`.
 - Keep the skeleton project-specific and minimal. T000 owns this structural skeleton; T001 should only implement true shared foundation code that multiple feature slices need, not compensate for missing architecture structure.
 - If a UI is required, make that clear in the architecture and set ui_required=true.
@@ -20,6 +23,9 @@ Constraints:
 
 Requirements JSON:
 {{requirements_json}}
+
+Project technology constraints:
+{{dependency_hints_json}}
 
 Clarification answers:
 {{clarification_answers_md}}

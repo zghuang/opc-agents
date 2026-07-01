@@ -1,328 +1,46 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
 from .errors import DeliveryError
 from .gates import refresh_gates
 from .loop_gitops import git_commit_explicit_paths, git_commit_task
-from .requirements_context import format_acceptance_context, format_requirement_context
-from .builtin_task_prompts import render_frontend_api_audit_review_request, render_prefinal_audit_review_request
 from .builtin_tasks import FINAL_VERIFY_TASK_ID, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_REQUIRED_SECTIONS, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_REQUIRED_SECTIONS, PREFINAL_AUDIT_TASK_ID
-from .runtime_config import load_project_metadata
 from .runtime_config import resolve_project_root
+from .review_artifacts import (
+    _archive_review_round,
+    _deferred_review_payload,
+    _final_review_path,
+    _write_final_review_artifact,
+    _write_request_if_changed,
+    _write_review_artifact,
+    _write_review_repair_limit_report,
+    _write_task_contract_deferral_artifacts,
+    code_review_request_path,
+    final_review_input_path,
+    final_review_request_path,
+    review_input_path,
+)
+from .review_payload import (
+    REVIEW_SCHEMA,
+    _parse_review_payload,
+    _review_requests_task_contract_repair,
+    _review_requests_task_decompose_repair,
+    _validate_pass_review_matrix,
+)
+from .review_prompts import build_code_review_request, build_final_review_request, build_validation_code_review_request
 from .session import current_session, retire_session, save_current_session
 from .state import ensure_runtime_dirs, load_task_runtime_state, load_test_results, normalize_task_runtime_state, project_paths, save_task_runtime_state, utc_now_iso
 from .task import Task, all_tasks, mark_task, next_generated_task_id, save_tasks
 from .task_contract_repair import TaskContractRepairBlocked, TaskContractRepairError, apply_task_contract_repair, defer_acceptance_scenarios
 
 
-REVIEW_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string"},
-        "summary": {"type": "string"},
-        "findings": {"type": "array", "items": {"type": "object"}},
-        "requirement_assessment": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "status": {"type": "string"},
-                    "notes": {"type": "string"},
-                },
-                "required": ["id", "status", "notes"],
-            },
-        },
-        "acceptance_assessment": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "status": {"type": "string"},
-                    "notes": {"type": "string"},
-                },
-                "required": ["id", "status", "notes"],
-            },
-        },
-        "intent_assessment": {"type": "object"},
-        "task_contract_assessment": {"type": "object"},
-    },
-    "required": ["status", "summary", "findings"],
-}
-
-ALLOWED_REVIEW_STATUSES = {"pass", "changes_requested"}
-ALLOWED_ASSESSMENT_STATUSES = {"pass", "changes_requested"}
-ALLOWED_FINDING_SEVERITIES = {"blocking", "non_blocking"}
-TASK_CONTRACT_REPAIR_ACTION = "task_contract_repair"
-TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION = "repair_task_decompose"
-ALLOWED_TASK_CONTRACT_ACTIONS = {"implementation_repair", TASK_CONTRACT_REPAIR_ACTION, TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION}
-ALLOWED_TASK_CONTRACT_ISSUE_TYPES = {"implementation", "task_contract"}
-REVIEW_PROMPT_NOISE_PATHS = {
-    "docs/gates.json",
-    "docs/test-results.json",
-    "docs/work-items.json",
-    "docs/work-items.md",
-    "docs/project-summary.json",
-    "docs/project-summary.md",
-}
-
-REVIEW_PROMPT_NOISE_PREFIXES = (
-    ".app-delivery-runtime/",
-    "app-delivery-runtime/",
-    "docs/reviews/code-review-",
-    "docs/reviews/test-report-",
-    "docs/reviews/gate-report-",
-)
-
-REVIEW_PROMPT_CHANGED_PATH_LIMIT = 12
+MAX_CODE_REVIEW_REPAIR_ATTEMPTS = 4
 MAX_FINAL_REPAIR_ITERATIONS = 3
 FINAL_VERIFICATION_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
-
-
-def _requires_review_matrix(task: Task) -> bool:
-    if task.task_kind not in {"feature", "validation", "repair"}:
-        return False
-    return bool(task.requirements or task.acceptance_scenarios)
-
-
-def _normalize_review_matrix(
-    rows: Any,
-    *,
-    field_name: str,
-    allowed_ids: list[str],
-) -> list[dict[str, str]]:
-    if rows is None:
-        return []
-    if not isinstance(rows, list):
-        raise ValueError(f"{field_name} must be an array when provided")
-    normalized: list[dict[str, str]] = []
-    seen: set[str] = set()
-    allowed = set(allowed_ids)
-    errors: list[str] = []
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            errors.append(f"{field_name}[{index}] must be an object")
-            continue
-        row_errors: list[str] = []
-        item_id = str(row.get("id") or "").strip()
-        status = str(row.get("status") or "").strip().casefold()
-        notes = str(row.get("notes") or "").strip()
-        if not item_id or item_id not in allowed:
-            errors.append(f"{field_name} contains unknown id: {item_id or '<empty>'}")
-            continue
-        if item_id in seen:
-            errors.append(f"{field_name} contains duplicate id: {item_id}")
-            continue
-        if status not in ALLOWED_ASSESSMENT_STATUSES:
-            row_errors.append(f"{field_name} status for {item_id} must be one of: {', '.join(sorted(ALLOWED_ASSESSMENT_STATUSES))}")
-        if not notes:
-            row_errors.append(f"{field_name} notes must be non-empty for {item_id}")
-        if row_errors:
-            errors.extend(row_errors)
-            seen.add(item_id)
-            continue
-        normalized.append({"id": item_id, "status": status, "notes": notes})
-        seen.add(item_id)
-    if errors:
-        raise ValueError("; ".join(errors))
-    return normalized
-
-
-def _normalize_findings(value: Any) -> list[dict[str, Any]]:
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError("findings must be an array")
-    normalized: list[dict[str, Any]] = []
-    errors: list[str] = []
-    for index, row in enumerate(value):
-        if not isinstance(row, dict):
-            errors.append(f"findings[{index}] must be an object with fields severity, message, requirement_ids, and acceptance_ids")
-            continue
-        severity = str(row.get("severity") or "").strip().casefold()
-        message = str(row.get("message") or "").strip()
-        if severity not in ALLOWED_FINDING_SEVERITIES:
-            errors.append(f"findings[{index}].severity must be one of: {', '.join(sorted(ALLOWED_FINDING_SEVERITIES))}")
-        if not message:
-            errors.append(f"findings[{index}].message must be non-empty")
-        if severity not in ALLOWED_FINDING_SEVERITIES or not message:
-            continue
-        normalized.append(
-            {
-                "severity": severity,
-                "requirement_ids": [str(item).strip() for item in row.get("requirement_ids", []) if str(item).strip()],
-                "acceptance_ids": [str(item).strip() for item in row.get("acceptance_ids", []) if str(item).strip()],
-                "message": message,
-            }
-        )
-    if errors:
-        raise ValueError("; ".join(errors))
-    return normalized
-
-
-def _normalize_intent_assessment(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("intent_assessment must be an object when provided")
-    status = str(value.get("status") or "").strip().casefold()
-    if status not in ALLOWED_ASSESSMENT_STATUSES:
-        raise ValueError("intent_assessment.status must be pass or changes_requested")
-    missing_done_when = [str(item).strip() for item in value.get("missing_done_when", []) if str(item).strip()]
-    violated_non_goals = [str(item).strip() for item in value.get("violated_non_goals", []) if str(item).strip()]
-    if status == "pass" and (missing_done_when or violated_non_goals):
-        raise ValueError("intent_assessment.status=pass cannot include missing_done_when or violated_non_goals")
-    return {
-        "status": status,
-        "missing_done_when": missing_done_when,
-        "violated_non_goals": violated_non_goals,
-        "notes": str(value.get("notes") or "").strip(),
-    }
-
-
-def _normalize_task_contract_assessment(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("task_contract_assessment must be an object when provided")
-    status = str(value.get("status") or "pass").strip().casefold()
-    issue_type = str(value.get("issue_type") or "implementation").strip().casefold()
-    recommended_action = str(value.get("recommended_action") or "implementation_repair").strip().casefold()
-    notes = str(value.get("notes") or "").strip()
-    if status not in ALLOWED_ASSESSMENT_STATUSES:
-        raise ValueError("task_contract_assessment.status must be pass or changes_requested")
-    if issue_type not in ALLOWED_TASK_CONTRACT_ISSUE_TYPES:
-        raise ValueError("task_contract_assessment.issue_type must be implementation or task_contract")
-    if recommended_action not in ALLOWED_TASK_CONTRACT_ACTIONS:
-        raise ValueError("task_contract_assessment.recommended_action must be implementation_repair, task_contract_repair, or repair_task_decompose")
-    if recommended_action in {TASK_CONTRACT_REPAIR_ACTION, TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION} and (status != "changes_requested" or issue_type != "task_contract"):
-        raise ValueError("task_contract_assessment contract-repair actions require status=changes_requested and issue_type=task_contract")
-    if recommended_action in {TASK_CONTRACT_REPAIR_ACTION, TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION} and not notes:
-        raise ValueError("task_contract_assessment.notes must explain why task contract repair is required")
-    operations = value.get("operations") if isinstance(value.get("operations"), list) else []
-    normalized_operations = [dict(item) for item in operations if isinstance(item, dict)]
-    if recommended_action == TASK_CONTRACT_REPAIR_ACTION and not normalized_operations:
-        raise ValueError("task_contract_assessment.recommended_action=task_contract_repair requires operations[]")
-    return {
-        "status": status,
-        "issue_type": issue_type,
-        "recommended_action": recommended_action,
-        "operations": normalized_operations,
-        "affected_requirement_ids": [str(item).strip() for item in value.get("affected_requirement_ids", []) if str(item).strip()],
-        "affected_acceptance_ids": [str(item).strip() for item in value.get("affected_acceptance_ids", []) if str(item).strip()],
-        "notes": notes,
-    }
-
-
-def _review_requests_task_contract_repair(review_payload: dict[str, Any]) -> bool:
-    assessment = review_payload.get("task_contract_assessment") if isinstance(review_payload.get("task_contract_assessment"), dict) else None
-    if not assessment:
-        return False
-    return str(assessment.get("recommended_action") or "").strip().casefold() == TASK_CONTRACT_REPAIR_ACTION
-
-
-def _review_requests_task_decompose_repair(review_payload: dict[str, Any]) -> bool:
-    assessment = review_payload.get("task_contract_assessment") if isinstance(review_payload.get("task_contract_assessment"), dict) else None
-    if not assessment:
-        return False
-    return str(assessment.get("recommended_action") or "").strip().casefold() == TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION
-
-
-def _validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str, Any]:
-    errors: list[str] = []
-    try:
-        findings = _normalize_findings(parsed.get("findings"))
-    except ValueError as exc:
-        findings = []
-        errors.append(str(exc))
-    if not isinstance(parsed.get("requirement_assessment"), list):
-        errors.append("requirement_assessment must be provided as an array")
-    if not isinstance(parsed.get("acceptance_assessment"), list):
-        errors.append("acceptance_assessment must be provided as an array")
-    if task.intent and not isinstance(parsed.get("intent_assessment"), dict):
-        errors.append("intent_assessment must be provided when task intent is present")
-    try:
-        requirement_assessment = _normalize_review_matrix(
-            parsed.get("requirement_assessment"),
-            field_name="requirement_assessment",
-            allowed_ids=task.requirements,
-        )
-    except ValueError as exc:
-        requirement_assessment = []
-        errors.append(str(exc))
-    try:
-        acceptance_assessment = _normalize_review_matrix(
-            parsed.get("acceptance_assessment"),
-            field_name="acceptance_assessment",
-            allowed_ids=task.acceptance_scenarios,
-        )
-    except ValueError as exc:
-        acceptance_assessment = []
-        errors.append(str(exc))
-    try:
-        intent_assessment = _normalize_intent_assessment(parsed.get("intent_assessment"))
-    except ValueError as exc:
-        intent_assessment = None
-        errors.append(str(exc))
-    try:
-        task_contract_assessment = _normalize_task_contract_assessment(parsed.get("task_contract_assessment"))
-    except ValueError as exc:
-        task_contract_assessment = None
-        errors.append(str(exc))
-    if errors:
-        raise ValueError("; ".join(error for error in errors if error))
-    parsed["findings"] = findings
-    parsed["requirement_assessment"] = requirement_assessment
-    parsed["acceptance_assessment"] = acceptance_assessment
-    if intent_assessment is not None:
-        parsed["intent_assessment"] = intent_assessment
-    if task_contract_assessment is not None:
-        parsed["task_contract_assessment"] = task_contract_assessment
-
-    if str(parsed.get("status") or "").strip().casefold() != "pass":
-        return parsed
-
-    blocking_findings = [
-        str(row.get("message") or "").strip()
-        for row in findings
-        if isinstance(row, dict) and str(row.get("severity") or "").strip().casefold() == "blocking"
-    ]
-    if intent_assessment is not None and str(intent_assessment.get("status") or "").strip().casefold() != "pass":
-        blocking_findings.append("intent_assessment is changes_requested")
-    if task_contract_assessment is not None and str(task_contract_assessment.get("status") or "").strip().casefold() != "pass":
-        blocking_findings.append("task_contract_assessment is changes_requested")
-
-    requirement_ids = {row["id"] for row in requirement_assessment}
-    acceptance_ids = {row["id"] for row in acceptance_assessment}
-    missing_requirements = [requirement_id for requirement_id in task.requirements if requirement_id not in requirement_ids]
-    missing_acceptance = [scenario_id for scenario_id in task.acceptance_scenarios if scenario_id not in acceptance_ids]
-    non_passing_requirements = [row["id"] for row in requirement_assessment if row["status"] != "pass"]
-    non_passing_acceptance = [row["id"] for row in acceptance_assessment if row["status"] != "pass"]
-
-    problems: list[str] = []
-    if blocking_findings:
-        problems.append("blocking findings present: " + "; ".join(blocking_findings[:5]))
-    if _requires_review_matrix(task):
-        if missing_requirements:
-            problems.append(f"missing requirement assessments: {', '.join(missing_requirements)}")
-        if missing_acceptance:
-            problems.append(f"missing acceptance assessments: {', '.join(missing_acceptance)}")
-        if non_passing_requirements:
-            problems.append(f"non-passing requirement assessments: {', '.join(non_passing_requirements)}")
-        if non_passing_acceptance:
-            problems.append(f"non-passing acceptance assessments: {', '.join(non_passing_acceptance)}")
-    if problems:
-        raise ValueError(
-            "status=pass requires no blocking findings, passing intent assessment when provided, and explicit passing review assessments for every declared requirement and acceptance scenario; "
-            + "; ".join(problems)
-        )
-    return parsed
 
 
 def _latest_task_test_result(project_root: Path | str, task_id: str) -> dict[str, Any] | None:
@@ -431,409 +149,6 @@ def _enforce_review_pass_preconditions(project_root: Path | str, task: Task, inp
     )
 
 
-def _dependency_hint_tokens(name: str) -> list[str]:
-    return [token for token in re.split(r"[^A-Za-z0-9]+", str(name or "").casefold()) if len(token) >= 3]
-
-
-def _task_hint_context(task: Task, requirement_context: list[str], acceptance_context: list[str]) -> str:
-    parts = [
-        task.title,
-        " ".join(task.requirements),
-        " ".join(task.acceptance_scenarios),
-        " ".join(task.output_paths),
-        " ".join(task.output_tests),
-        " ".join(requirement_context),
-        " ".join(acceptance_context),
-    ]
-    return "\n".join(parts).casefold()
-
-
-def _task_touches_manifest_for_ecosystem(task: Task, ecosystem: str) -> bool:
-    paths = set(task.output_paths)
-    if ecosystem == "backend":
-        return bool(paths.intersection({"backend/pyproject.toml", "backend/uv.lock"}))
-    if ecosystem == "frontend":
-        return bool(paths.intersection({"frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}))
-    if ecosystem in {"infra", "project"}:
-        return any(path in paths for path in {"docker-compose.yml", "README.md"})
-    return False
-
-
-def _dependency_hint_relevant(task: Task, hint: dict[str, str], context: str) -> bool:
-    ecosystem = str(hint.get("ecosystem") or "project").strip().lower() or "project"
-    if _task_touches_manifest_for_ecosystem(task, ecosystem):
-        return True
-    name = str(hint.get("name") or "").strip()
-    if not name:
-        return False
-    if name.casefold() in context:
-        return True
-    tokens = _dependency_hint_tokens(name)
-    return bool(tokens) and any(token in context for token in tokens)
-
-
-def _relevant_dependency_hints(project_root: Path | str, task: Task, requirement_context: list[str] | None = None, acceptance_context: list[str] | None = None) -> list[dict[str, str]]:
-    metadata = load_project_metadata(project_root)
-    raw_hints = metadata.get("dependency_hints") if isinstance(metadata.get("dependency_hints"), list) else []
-    ecosystems = {"project"}
-    if any(path.startswith("backend/") for path in task.output_paths):
-        ecosystems.add("backend")
-    if any(path.startswith("frontend/") for path in task.output_paths):
-        ecosystems.add("frontend")
-    result: list[dict[str, str]] = []
-    for row in raw_hints:
-        if not isinstance(row, dict):
-            continue
-        ecosystem = str(row.get("ecosystem") or "project").strip().lower() or "project"
-        if ecosystem not in ecosystems:
-            continue
-        name = str(row.get("name") or "").strip()
-        if not name:
-            continue
-        hint = {
-            "ecosystem": ecosystem,
-            "name": name,
-            "reason": str(row.get("reason") or "").strip(),
-            "source": str(row.get("source") or "").strip(),
-            "evidence": str(row.get("evidence") or "").strip(),
-        }
-        context = _task_hint_context(task, requirement_context or [], acceptance_context or [])
-        if _dependency_hint_relevant(task, hint, context):
-            result.append(hint)
-    return result
-
-
-def _append_dependency_hint_review_section(lines: list[str], dependency_hints: list[dict[str, str]]) -> None:
-    if not dependency_hints:
-        return
-    lines.append("Project technology constraints to verify:")
-    for hint in dependency_hints:
-        suffix = ""
-        evidence = str(hint.get("evidence") or "").strip()
-        source = str(hint.get("source") or "").strip()
-        if evidence or source:
-            suffix = f" [{'; '.join(part for part in [source, evidence] if part)}]"
-        reason = str(hint.get("reason") or "").strip() or "Required by project planning artifacts."
-        lines.append(f"- {hint['name']} ({hint['ecosystem']}): {reason}{suffix}")
-    lines.append("- Verify concrete implementation evidence for each listed technology, such as dependency entries, imports/usages, adapters, configuration, or an explicit superseding ADR/clarification.")
-    lines.append("- Return `status=changes_requested` if a listed framework/library/service is replaced by custom code or omitted without an explicit project decision.")
-    lines.append("")
-
-
-def _is_review_prompt_noise_path(path: str) -> bool:
-    normalized = str(path or "").strip()
-    if not normalized:
-        return True
-    if normalized in REVIEW_PROMPT_NOISE_PATHS:
-        return True
-    return any(normalized.startswith(prefix) for prefix in REVIEW_PROMPT_NOISE_PREFIXES)
-
-
-def _review_prompt_changed_paths(scope_report: dict[str, Any]) -> tuple[list[str], int]:
-    raw_changed_paths = [str(path).strip() for path in scope_report.get("changed_paths", []) if str(path).strip()]
-    out_of_scope = {str(path).strip() for path in scope_report.get("out_of_scope", []) if str(path).strip()}
-    filtered: list[str] = []
-    seen: set[str] = set()
-    omitted = 0
-    for path in raw_changed_paths:
-        if path in seen:
-            continue
-        seen.add(path)
-        if path in out_of_scope:
-            continue
-        if _is_review_prompt_noise_path(path):
-            omitted += 1
-            continue
-        filtered.append(path)
-    return filtered[:REVIEW_PROMPT_CHANGED_PATH_LIMIT], omitted + max(0, len(filtered) - REVIEW_PROMPT_CHANGED_PATH_LIMIT)
-
-
-def _parse_review_payload(text: str) -> dict[str, Any]:
-    raw = str(text or "").strip()
-    if not raw:
-        raise ValueError("reviewer returned empty output")
-    candidates = [raw]
-    fenced_matches = re.findall(r"```(?:json)?\s*(.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
-    candidates.extend(match.strip() for match in fenced_matches if match.strip())
-    object_start = raw.find("{")
-    object_end = raw.rfind("}")
-    if object_start != -1 and object_end != -1 and object_end > object_start:
-        candidates.append(raw[object_start : object_end + 1].strip())
-    saw_invalid_status = False
-    for candidate in candidates:
-        try:
-            payload = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        status = str(payload.get("status") or "").strip()
-        summary = str(payload.get("summary") or "").strip()
-        if not status or not summary:
-            continue
-        normalized_status = status.casefold()
-        if normalized_status not in ALLOWED_REVIEW_STATUSES:
-            saw_invalid_status = True
-            continue
-        payload["status"] = status
-        payload["summary"] = summary
-        return payload
-    if saw_invalid_status:
-        raise ValueError("review status must be one of: pass, changes_requested")
-    raise ValueError(
-        "reviewer did not return parseable JSON object with required fields: "
-        "status (pass|changes_requested), summary (string), findings (array of objects with severity=blocking|non_blocking and message), "
-        "requirement_assessment (array), acceptance_assessment (array)"
-    )
-
-
-REVIEW_INPUT_DIRNAME = "review-inputs"
-REVIEW_REQUEST_DIRNAME = "review-requests"
-
-
-def _final_review_path(project_root: Path | str) -> Path:
-    return project_paths(project_root).reviews_dir / "final-review.md"
-
-
-def review_input_path(project_root: Path | str, task_id: str) -> Path:
-    project_dir = resolve_project_root(project_root)
-    paths = ensure_runtime_dirs(project_dir)
-    review_dir = paths.runtime_dir / REVIEW_INPUT_DIRNAME
-    review_dir.mkdir(parents=True, exist_ok=True)
-    return review_dir / f"code-review-{task_id}.json"
-
-
-def final_review_input_path(project_root: Path | str) -> Path:
-    project_dir = resolve_project_root(project_root)
-    paths = ensure_runtime_dirs(project_dir)
-    review_dir = paths.runtime_dir / REVIEW_INPUT_DIRNAME
-    review_dir.mkdir(parents=True, exist_ok=True)
-    return review_dir / "final-review.json"
-
-
-def code_review_request_path(project_root: Path | str, task_id: str) -> Path:
-    project_dir = resolve_project_root(project_root)
-    paths = ensure_runtime_dirs(project_dir)
-    request_dir = paths.runtime_dir / REVIEW_REQUEST_DIRNAME
-    request_dir.mkdir(parents=True, exist_ok=True)
-    return request_dir / f"code-review-{task_id}.md"
-
-
-def final_review_request_path(project_root: Path | str) -> Path:
-    project_dir = resolve_project_root(project_root)
-    paths = ensure_runtime_dirs(project_dir)
-    request_dir = paths.runtime_dir / REVIEW_REQUEST_DIRNAME
-    request_dir.mkdir(parents=True, exist_ok=True)
-    return request_dir / "final-review.md"
-
-
-def _write_request_if_changed(path: Path, content: str) -> None:
-    normalized = str(content or "")
-    if path.exists():
-        try:
-            existing = path.read_text(encoding="utf-8")
-        except OSError:
-            existing = None
-        if existing == normalized:
-            return
-    path.write_text(normalized, encoding="utf-8")
-
-
-def build_code_review_request(
-    project_root: Path | str,
-    task: Task,
-    *,
-    scope_report: dict[str, Any] | None = None,
-) -> str:
-    if task.id == FRONTEND_API_AUDIT_TASK_ID:
-        return render_frontend_api_audit_review_request(project_root, task, scope_report=scope_report)
-    if task.id == PREFINAL_AUDIT_TASK_ID:
-        return render_prefinal_audit_review_request(project_root, task, scope_report=scope_report)
-    if task.task_kind == "validation":
-        return build_validation_code_review_request(project_root, task, scope_report=scope_report)
-    touches_dependency_manifest = any(
-        path in {"backend/pyproject.toml", "frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}
-        for path in task.output_paths
-    )
-    lines = [
-        f"Perform an independent code review for task {task.id}.",
-        f"Project path: {Path(project_root).expanduser().resolve()}",
-        f"Task title: {task.title}",
-        "",
-    ]
-    intent = task.intent if isinstance(task.intent, dict) else {}
-    objective = str(intent.get("objective") or "").strip()
-    journey = str(intent.get("journey") or "").strip()
-    done_when = [str(value).strip() for value in intent.get("done_when", []) if str(value).strip()]
-    non_goals = [str(value).strip() for value in intent.get("non_goals", []) if str(value).strip()]
-    if any([objective, journey, done_when, non_goals]):
-        lines.append("Task intent:")
-        if objective:
-            lines.append(f"- Objective: {objective}")
-        if journey:
-            lines.append(f"- Journey: {journey}")
-        if done_when:
-            lines.append("- Done when:")
-            lines.extend(f"  - {value}" for value in done_when)
-        if non_goals:
-            lines.append("- Non-goals:")
-            lines.extend(f"  - {value}" for value in non_goals)
-        lines.append("")
-    lines.append("Requirement details:")
-    requirement_context = format_requirement_context(project_root, task.requirements) or []
-    lines.extend(requirement_context or ["- none"])
-    lines.append("")
-    lines.append("Acceptance scenario details:")
-    acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
-    lines.extend(acceptance_context or ["- none"])
-    lines.append("")
-    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
-    _append_dependency_hint_review_section(lines, dependency_hints)
-    lines.append("Review scope guardrails:")
-    lines.append("- Judge the task against its declared requirements, acceptance scenarios, output_paths, output_tests, and any necessary shared support edits that are directly required for this task.")
-    lines.append("- Do not reject the task only because it touched files outside the original output_paths when those edits are necessary support work or regression fixes for the current task. Judge those edits on correctness and necessity.")
-    lines.append("- Use the task intent as supporting context for purpose, completion signals, and non-goals, but keep requirement and acceptance assessments tied to the declared IDs.")
-    lines.append("- If task intent is present, include `intent_assessment`. If any done_when item is missing or any non-goal is violated, set `intent_assessment.status=changes_requested` and top-level `status=changes_requested`.")
-    lines.append("- Use finding objects with `severity=blocking` for missing behavior, placeholders/stubs presented as complete, unmet declared requirements, or unowned deferrals. Top-level status must be `changes_requested` when any blocking finding exists.")
-    lines.append("- If production-path code uses demo constants, hardcoded responses, in-memory state, placeholder tests, or mock-only browser proof for a production requirement, return `status=changes_requested` unless the requirement explicitly allows that mock behavior.")
-    lines.append("- For backend/API tasks, check that auth/RBAC and tenant/site/customer scoping are enforced on the route or service path when the requirements mention roles, permissions, or data isolation.")
-    lines.append("- For agent or workflow tasks, check that the implementation consumes real case/context/tool/service data instead of only static demo payloads.")
-    lines.append("- Passing task tests is necessary but not sufficient. Review whether the declared requirements and acceptance scenarios are actually complete in behavior, not only whether the declared tests are green.")
-    lines.append("- If a declared acceptance scenario cannot be implemented correctly by this task because it belongs to another task or contradicts this task's non-goals, return `status=changes_requested` and set `task_contract_assessment.recommended_action=task_contract_repair` with concrete `operations` instead of asking the implementation worker to keep patching.")
-    lines.append("- Use `repair_task_decompose` only when the task graph is structurally invalid and cannot be repaired by a local operation such as moving an acceptance scenario or creating a follow-up task.")
-    lines.append("- Use `task_contract_assessment.recommended_action=implementation_repair` for ordinary missing code, missing tests, regressions, or fixable implementation defects within this task's rightful scope.")
-    if task.requirements:
-        lines.append("- For every declared requirement, include exactly one `requirement_assessment` row with `id`, `status`, and `notes`.")
-    if task.acceptance_scenarios:
-        lines.append("- For every declared acceptance scenario, include exactly one `acceptance_assessment` row with `id`, `status`, and `notes`.")
-    if any(path.startswith("frontend/") for path in task.output_paths) and task.acceptance_scenarios:
-        lines.append("- When the task owns a user-visible frontend acceptance scenario, check for browser/e2e evidence in this task unless an explicitly declared downstream validation task owns that exact browser journey.")
-        lines.append("- If the user-visible frontend flow is effectively untested in the browser and there is no explicit downstream owner for that browser coverage, return `status=changes_requested`.")
-    lines.append("- If any declared requirement or acceptance scenario is incomplete, contradicted, only partially implemented, or only deferred without explicit scope allowance, return `status=changes_requested`.")
-    lines.append("")
-    if touches_dependency_manifest:
-        lines.append("Tech-design check:")
-        lines.append("- This task touches dependency manifests. Cross-check the implementation against the high-level `Tech Design` section in AGENTS.md / CLAUDE.md and `docs/architecture.md` rather than requiring a pasted list of all requirement-derived technology hints.")
-        lines.append("- Fail the review only when the manifest changes silently contradict project-wide mandated stack choices for this task surface, or when an intentional translation/deferral is unjustified.")
-        lines.append("")
-    if isinstance(scope_report, dict):
-        out_of_scope = [str(path).strip() for path in scope_report.get("out_of_scope", []) if str(path).strip()]
-        changed_paths, omitted_changed_path_count = _review_prompt_changed_paths(scope_report)
-        lines.append("Scope observations:")
-        if out_of_scope:
-            lines.append("- The framework detected task changes outside the planned contract scope.")
-            for path in out_of_scope:
-                lines.append(f"- out_of_scope: {path}")
-            lines.append("- Treat these paths as advisory, not an automatic failure.")
-            lines.append("- Evaluate whether these paths are necessary shared infrastructure or contract-aligned support for the current task, versus premature implementation of future tasks.")
-            lines.append("- If these paths are justified for the task, you may still return status=pass.")
-            lines.append("- Necessary shared fixes, wiring, or support code may be acceptable when they are required to complete the current task correctly.")
-            lines.append("- If they are not justified, return status=changes_requested and cite the offending paths in findings.")
-        else:
-            lines.append("- No out-of-scope paths were detected by the framework.")
-        if changed_paths:
-            lines.append("- Implementation-relevant changed paths seen by the framework:")
-            for path in changed_paths:
-                lines.append(f"  - {path}")
-        if omitted_changed_path_count:
-            lines.append(f"- Omitted {omitted_changed_path_count} framework-generated or low-signal changed paths from this summary.")
-        lines.append("")
-    lines.append("Inspect the current repository state and the task-scoped staged snapshot for this task only.")
-    lines.append("Determine whether the task is ready to commit or requires more implementation changes.")
-    lines.append("Use status=pass only when the task is ready to accept as-is. Otherwise use status=changes_requested.")
-    lines.append("Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array), task_contract_assessment (object), and intent_assessment (object when task intent is present). Use empty arrays for findings and assessments when there are no rows.")
-    return "\n".join(lines)
-
-
-def build_validation_code_review_request(
-    project_root: Path | str,
-    task: Task,
-    *,
-    scope_report: dict[str, Any] | None = None,
-) -> str:
-    lines = [
-        f"Perform an independent code review for validation task {task.id}.",
-        f"Project path: {Path(project_root).expanduser().resolve()}",
-        f"Task title: {task.title}",
-        "",
-        "This is a validation-task review. Judge whether the task delivered credible executable validation assets for its owned requirements and acceptance scenarios.",
-        "",
-    ]
-    intent = task.intent if isinstance(task.intent, dict) else {}
-    objective = str(intent.get("objective") or "").strip()
-    journey = str(intent.get("journey") or "").strip()
-    done_when = [str(value).strip() for value in intent.get("done_when", []) if str(value).strip()]
-    non_goals = [str(value).strip() for value in intent.get("non_goals", []) if str(value).strip()]
-    if any([objective, journey, done_when, non_goals]):
-        lines.append("Task intent:")
-        if objective:
-            lines.append(f"- Objective: {objective}")
-        if journey:
-            lines.append(f"- Journey: {journey}")
-        if done_when:
-            lines.append("- Done when:")
-            lines.extend(f"  - {value}" for value in done_when)
-        if non_goals:
-            lines.append("- Non-goals:")
-            lines.extend(f"  - {value}" for value in non_goals)
-        lines.append("")
-    lines.append("Requirement details:")
-    requirement_context = format_requirement_context(project_root, task.requirements) or []
-    lines.extend(requirement_context or ["- none"])
-    lines.append("")
-    lines.append("Acceptance scenario details:")
-    acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
-    lines.extend(acceptance_context or ["- none"])
-    lines.append("")
-    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
-    _append_dependency_hint_review_section(lines, dependency_hints)
-    lines.append("Validation review checks:")
-    lines.append("- Review the declared output_tests as contractual validation entrypoints, not optional examples.")
-    lines.append("- Verify that the declared tests exist or commands are meaningful, runnable, and strong enough to prove the owned requirements and acceptance scenarios.")
-    lines.append("- Check that every declared acceptance scenario maps to concrete assertions, fixtures, scenario data, or browser/e2e coverage in this task.")
-    lines.append("- Mocked browser tests using `page.route()` count as mocked-browser evidence, not real backend E2E evidence.")
-    lines.append("- Production gate tasks must treat production-path demo constants, hardcoded API responses, missing auth/RBAC enforcement, and log-only execution dispatch as blocking findings.")
-    lines.append("- Return `status=changes_requested` for placeholder tests, shallow smoke checks, missing scenario coverage, weak assertions, or tests that cannot actually execute.")
-    lines.append("- Passing tests are necessary but not sufficient. Judge whether the tests prove the behavior described by the requirements and acceptance scenarios.")
-    lines.append("- If the validation task cannot truthfully prove a declared acceptance scenario because that scenario was assigned to the wrong task, return `status=changes_requested` and set `task_contract_assessment.recommended_action=task_contract_repair` with concrete `operations`.")
-    lines.append("- Use `repair_task_decompose` only when the task graph is structurally invalid and cannot be repaired by a local operation such as moving an acceptance scenario or creating a follow-up task.")
-    lines.append("- Use `task_contract_assessment.recommended_action=implementation_repair` for ordinary missing validation files, weak assertions, broken fixtures, or other fixable validation defects within this task's rightful scope.")
-    lines.append("- Minimal support code, mocks, fixtures, or wiring may be acceptable only when required to make validation truthful and executable.")
-    lines.append("- Do not fail the task solely because it touched support files outside the original output_paths when those edits are necessary for credible validation.")
-    lines.append("- Do fail the task if it expands into broad product implementation that belongs to upstream feature tasks rather than validation support.")
-    if task.requirements:
-        lines.append("- For every declared requirement, include exactly one `requirement_assessment` row with `id`, `status`, and `notes`.")
-    if task.acceptance_scenarios:
-        lines.append("- For every declared acceptance scenario, include exactly one `acceptance_assessment` row with `id`, `status`, and `notes`.")
-    lines.append("")
-    if isinstance(scope_report, dict):
-        out_of_scope = [str(path).strip() for path in scope_report.get("out_of_scope", []) if str(path).strip()]
-        changed_paths, omitted_changed_path_count = _review_prompt_changed_paths(scope_report)
-        lines.append("Scope observations:")
-        if out_of_scope:
-            lines.append("- The framework detected validation-task changes outside the planned contract scope.")
-            for path in out_of_scope:
-                lines.append(f"- out_of_scope: {path}")
-            lines.append("- Treat these paths as advisory, not an automatic failure.")
-            lines.append("- Evaluate whether these paths are necessary fixtures, support wiring, scenario data, or test helpers for credible validation.")
-            lines.append("- If they are justified for validation, you may still return status=pass.")
-            lines.append("- If they are unrelated product implementation, return status=changes_requested and cite the offending paths in findings.")
-        else:
-            lines.append("- No out-of-scope paths were detected by the framework.")
-        if changed_paths:
-            lines.append("- Implementation-relevant changed paths seen by the framework:")
-            for path in changed_paths:
-                lines.append(f"  - {path}")
-        if omitted_changed_path_count:
-            lines.append(f"- Omitted {omitted_changed_path_count} framework-generated or low-signal changed paths from this summary.")
-        lines.append("")
-    lines.append("Inspect the current repository state and the task-scoped staged snapshot for this validation task only.")
-    lines.append("Determine whether the validation assets are ready to commit or require more implementation changes.")
-    lines.append("Use status=pass only when the validation evidence is credible, executable, and appropriately scoped. Otherwise use status=changes_requested.")
-    lines.append("Reply in raw JSON with fields: status, summary, findings (array of finding objects), requirement_assessment (array), acceptance_assessment (array), and task_contract_assessment (object). Use empty arrays for findings and assessments when there are no rows.")
-    return "\n".join(lines)
-
-
 def write_code_review_request(
     project_root: Path | str,
     task: Task,
@@ -846,40 +161,6 @@ def write_code_review_request(
         build_code_review_request(project_root, task, scope_report=scope_report) + "\n",
     )
     return str(request_path.relative_to(resolve_project_root(project_root)))
-
-
-def build_final_review_request(
-    project_root: Path | str,
-    *,
-    results_summary: str,
-    requirement_coverage: dict[str, Any],
-    missing_test_types: list[tuple[str, str]],
-) -> str:
-    lines = [
-        "Perform an independent final release review.",
-        f"Project path: {Path(project_root).expanduser().resolve()}",
-        "",
-        "Full suite summary:",
-        results_summary or "No test results were recorded.",
-        "",
-        f"Requirement coverage: total={requirement_coverage.get('total', 0)} covered={requirement_coverage.get('covered', 0)} uncovered={', '.join(requirement_coverage.get('uncovered', [])) or 'none'}",
-        "",
-        "Missing test-type coverage:",
-    ]
-    if missing_test_types:
-        for requirement_id, test_type in missing_test_types:
-            lines.append(f"- {requirement_id}: missing {test_type}")
-    else:
-        lines.append("- none")
-    lines.extend(
-        [
-            "",
-            "Inspect the repository state and release evidence.",
-            "Use status=pass only when the release is ready to accept as-is. Otherwise use status=changes_requested.",
-            "Reply in raw JSON with fields: status, summary, findings (array of finding objects). Use an empty findings array when there are no findings.",
-        ]
-    )
-    return "\n".join(lines)
 
 
 def write_final_review_request(
@@ -901,187 +182,6 @@ def write_final_review_request(
         + "\n",
     )
     return str(request_path.relative_to(resolve_project_root(project_root)))
-
-
-def _write_review_artifact(project_root: Path | str, task: Task, review_payload: dict[str, Any]) -> str:
-    paths = project_paths(project_root)
-    paths.reviews_dir.mkdir(parents=True, exist_ok=True)
-    review_path = paths.reviews_dir / f"code-review-{task.id}.md"
-    status = str(review_payload.get("status") or "changes_requested").strip()
-    summary = str(review_payload.get("summary") or "").strip()
-    findings = review_payload.get("findings") if isinstance(review_payload.get("findings"), list) else []
-    requirement_assessment = review_payload.get("requirement_assessment") if isinstance(review_payload.get("requirement_assessment"), list) else []
-    acceptance_assessment = review_payload.get("acceptance_assessment") if isinstance(review_payload.get("acceptance_assessment"), list) else []
-    task_contract_assessment = review_payload.get("task_contract_assessment") if isinstance(review_payload.get("task_contract_assessment"), dict) else None
-    lines = [
-        f"status: {status}",
-        "review_type: code",
-        f"work_item: {task.id}",
-        "",
-        "# Code Review",
-        "",
-        "## Summary",
-        "",
-        summary or "No summary provided.",
-        "",
-        "## Findings",
-        "",
-    ]
-    if findings:
-        for finding in findings:
-            if isinstance(finding, dict):
-                severity = str(finding.get("severity") or "").strip() or "finding"
-                message = str(finding.get("message") or "").strip()
-                refs = [*finding.get("requirement_ids", []), *finding.get("acceptance_ids", [])]
-                suffix = f" ({', '.join(refs)})" if refs else ""
-                lines.append(f"- [{severity}] {message}{suffix}")
-            else:
-                lines.append(f"- {finding}")
-    else:
-        lines.append("- No blocking findings.")
-    if task_contract_assessment:
-        lines.extend(["", "## Task Contract Assessment", ""])
-        lines.append(f"- status: {task_contract_assessment.get('status', '-')}")
-        lines.append(f"- issue_type: {task_contract_assessment.get('issue_type', '-')}")
-        lines.append(f"- recommended_action: {task_contract_assessment.get('recommended_action', '-')}")
-        operations = task_contract_assessment.get("operations") if isinstance(task_contract_assessment.get("operations"), list) else []
-        if operations:
-            lines.append(f"- operations: {len(operations)}")
-        affected_requirements = ", ".join(task_contract_assessment.get("affected_requirement_ids", []) or []) or "none"
-        affected_acceptance = ", ".join(task_contract_assessment.get("affected_acceptance_ids", []) or []) or "none"
-        lines.append(f"- affected_requirements: {affected_requirements}")
-        lines.append(f"- affected_acceptance: {affected_acceptance}")
-        notes = str(task_contract_assessment.get("notes") or "").strip()
-        if notes:
-            lines.append(f"- notes: {notes}")
-    if requirement_assessment:
-        lines.extend(["", "## Requirement Assessment", ""])
-        for row in requirement_assessment:
-            if not isinstance(row, dict):
-                continue
-            lines.append(f"- {row.get('id', '-')}: {row.get('status', '-')} — {row.get('notes', '')}")
-    if acceptance_assessment:
-        lines.extend(["", "## Acceptance Assessment", ""])
-        for row in acceptance_assessment:
-            if not isinstance(row, dict):
-                continue
-            lines.append(f"- {row.get('id', '-')}: {row.get('status', '-')} — {row.get('notes', '')}")
-    review_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return str(review_path.relative_to(paths.project_root))
-
-
-def _write_task_contract_deferral_artifacts(project_root: Path | str, deferral_result: dict[str, Any]) -> tuple[str, str]:
-    paths = project_paths(project_root)
-    paths.reviews_dir.mkdir(parents=True, exist_ok=True)
-    json_path = paths.reviews_dir / "task-contract-deferrals.json"
-    md_path = paths.reviews_dir / "task-contract-deferrals.md"
-    existing_records: list[dict[str, Any]] = []
-    if json_path.exists():
-        try:
-            existing_payload = json.loads(json_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            existing_payload = {}
-        if isinstance(existing_payload, dict) and isinstance(existing_payload.get("deferred_acceptance_scenarios"), list):
-            existing_records = [record for record in existing_payload["deferred_acceptance_scenarios"] if isinstance(record, dict)]
-    new_records = [record for record in deferral_result.get("deferred_acceptance_scenarios", []) if isinstance(record, dict)]
-    by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for record in [*existing_records, *new_records]:
-        key = (str(record.get("from_task") or "").strip(), str(record.get("id") or "").strip())
-        if not key[0] or not key[1]:
-            continue
-        by_key[key] = record
-    records = list(by_key.values())
-    json_path.write_text(json.dumps({"deferred_acceptance_scenarios": records}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    lines = ["# Task Contract Deferrals", ""]
-    if records:
-        for record in records:
-            lines.extend(
-                [
-                    f"## {record.get('id', '-')}",
-                    "",
-                    f"- From task: {record.get('from_task', '-')}",
-                    f"- Policy: {record.get('policy', '-')}",
-                    f"- Review artifact: {record.get('review_artifact', '-')}",
-                    f"- Reason: {record.get('reason', '')}",
-                    "",
-                ]
-            )
-    else:
-        lines.append("- none")
-    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    return str(json_path.relative_to(paths.project_root)), str(md_path.relative_to(paths.project_root))
-
-
-def _deferred_review_payload(parsed: dict[str, Any], deferral_result: dict[str, Any], deferral_artifacts: tuple[str, str]) -> dict[str, Any]:
-    records = [record for record in deferral_result.get("deferred_acceptance_scenarios", []) if isinstance(record, dict)]
-    deferred_ids = [str(record.get("id") or "").strip() for record in records if str(record.get("id") or "").strip()]
-    existing_findings = parsed.get("findings") if isinstance(parsed.get("findings"), list) else []
-    non_deferred_findings = [
-        finding
-        for finding in existing_findings
-        if not isinstance(finding, dict) or not set(str(value).strip() for value in finding.get("acceptance_ids", []) if str(value).strip()).intersection(deferred_ids)
-    ]
-    non_deferred_acceptance = [
-        row
-        for row in parsed.get("acceptance_assessment", [])
-        if isinstance(row, dict) and str(row.get("id") or "").strip() not in set(deferred_ids)
-    ]
-    deferral_finding = {
-        "severity": "non_blocking",
-        "requirement_ids": [],
-        "acceptance_ids": deferred_ids,
-        "message": f"Deferred acceptance scenario assignment for delivery continuity; see {deferral_artifacts[1]}",
-    }
-    summary = str(parsed.get("summary") or "").strip()
-    deferred_summary = f"{summary} Framework accepted the current task with deferred acceptance scenario assignment recorded in {deferral_artifacts[1]}.".strip()
-    payload = {
-        key: value
-        for key, value in parsed.items()
-        if key != "task_contract_assessment"
-    }
-    return {
-        **payload,
-        "status": "pass",
-        "summary": deferred_summary,
-        "findings": [*non_deferred_findings, deferral_finding],
-        "acceptance_assessment": non_deferred_acceptance,
-    }
-
-
-def _write_final_review_artifact(project_root: Path | str, review_payload: dict[str, Any]) -> str:
-    review_path = _final_review_path(project_root)
-    review_path.parent.mkdir(parents=True, exist_ok=True)
-    status = str(review_payload.get("status") or "changes_requested").strip()
-    summary = str(review_payload.get("summary") or "").strip()
-    findings = review_payload.get("findings") if isinstance(review_payload.get("findings"), list) else []
-    lines = [
-        f"status: {status}",
-        "review_type: final",
-        "work_item: T-FINAL",
-        "",
-        "# Final Review",
-        "",
-        "## Summary",
-        "",
-        summary or "No summary provided.",
-        "",
-        "## Findings",
-        "",
-    ]
-    if findings:
-        for finding in findings:
-            if isinstance(finding, dict):
-                severity = str(finding.get("severity") or "").strip() or "finding"
-                message = str(finding.get("message") or "").strip()
-                refs = [*finding.get("requirement_ids", []), *finding.get("acceptance_ids", [])]
-                suffix = f" ({', '.join(refs)})" if refs else ""
-                lines.append(f"- [{severity}] {message}{suffix}")
-            else:
-                lines.append(f"- {finding}")
-    else:
-        lines.append("- No blocking findings.")
-    review_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return str(review_path.relative_to(project_paths(project_root).project_root))
 
 
 def _dedupe_strings(values: list[str]) -> list[str]:
@@ -1226,10 +326,20 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
     review_status = str(parsed.get("status") or "changes_requested").strip()
     if review_status.casefold() == "pass":
         _enforce_review_pass_preconditions(project_dir, task, input_path)
-    persisted_input = review_input_path(project_dir, task_id)
-    persisted_input.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    review_artifact = _write_review_artifact(project_dir, task, parsed)
     reviewed_at = utc_now_iso()
+    persisted_input = review_input_path(project_dir, task_id)
+    persisted_input_content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    persisted_input.write_text(persisted_input_content, encoding="utf-8")
+    review_artifact = _write_review_artifact(project_dir, task, parsed)
+    _archive_review_round(
+        project_dir,
+        review_name=f"code-review-{task_id}",
+        request_path=code_review_request_path(project_dir, task_id),
+        input_extension=".json",
+        input_content=persisted_input_content,
+        artifact_path=project_paths(project_dir).project_root / review_artifact,
+        reviewed_at=reviewed_at,
+    )
     runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_dir, task_id))
     pending_scope_report = runtime_state.get("pending_scope_report") if isinstance(runtime_state.get("pending_scope_report"), dict) else {}
     accepted_scope_paths = [
@@ -1277,6 +387,8 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
             {
                 "accepted_scope_paths": accepted_scope_paths,
                 "pending_scope_report": None,
+                "review_changes_requested_count": 0,
+                "review_repair_limit_reached": False,
             },
         )
         active_session = current_session(project_dir)
@@ -1287,18 +399,103 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         refresh_gates(project_dir)
         return 0
 
+    review_changes_requested_count = int(runtime_state.get("review_changes_requested_count") or 0) + 1
+    review_repair_state = {
+        "review_changes_requested_count": review_changes_requested_count,
+        "review_repair_limit": MAX_CODE_REVIEW_REPAIR_ATTEMPTS,
+        "last_changes_requested_review_artifact": review_artifact,
+        "last_changes_requested_reviewed_at": reviewed_at,
+    }
+    if review_changes_requested_count >= MAX_CODE_REVIEW_REPAIR_ATTEMPTS:
+        exception_report = _write_review_repair_limit_report(
+            project_dir,
+            task,
+            review_payload=parsed,
+            review_artifact=review_artifact,
+            review_count=review_changes_requested_count,
+            review_limit=MAX_CODE_REVIEW_REPAIR_ATTEMPTS,
+        )
+        tasks = mark_task(
+            all_tasks(project_dir),
+            task.id,
+            "exception",
+            git_commit=None,
+            status_session_id=task.status_session_id,
+            started_at=None,
+            completed_at=None,
+            review_status=review_status,
+            review_artifact=exception_report,
+            reviewed_at=reviewed_at,
+            verified_at=None,
+            blocked_reason=(
+                f"code review requested changes {review_changes_requested_count} time(s), "
+                f"reaching the configured limit of {MAX_CODE_REVIEW_REPAIR_ATTEMPTS}; see {exception_report}"
+            ),
+            attempts=max(task.attempts, 1),
+        )
+        save_tasks(project_dir, tasks)
+        active_session = current_session(project_dir)
+        if active_session is not None and active_session.id == task.status_session_id:
+            retire_session(project_dir, active_session)
+        save_task_runtime_state(
+            project_dir,
+            task_id,
+            {
+                **review_repair_state,
+                "review_repair_limit_reached": True,
+                "review_repair_limit_report": exception_report,
+                "review_requested_scope_paths": accepted_scope_paths,
+                "pending_scope_report": None,
+            },
+        )
+        refresh_gates(project_dir)
+        return 2
+
     if _review_requests_task_contract_repair(parsed):
         task_contract_assessment = parsed["task_contract_assessment"]
         tasks_before_repair = all_tasks(project_dir)
         try:
             repaired_tasks, repair_result = apply_task_contract_repair(project_dir, tasks_before_repair, task, task_contract_assessment)
         except TaskContractRepairError as exc:
-            raise DeliveryError(
-                code="task_contract_repair_invalid",
-                message=str(exc),
-                exit_code=2,
-                details={"project": str(project_dir), "task_id": task_id, "input_path": str(input_path)},
-            ) from exc
+            invalid_reason = str(exc)
+            tasks = mark_task(
+                all_tasks(project_dir),
+                task.id,
+                "pending",
+                git_commit=None,
+                status_session_id=task.status_session_id,
+                started_at=None,
+                completed_at=None,
+                review_status=review_status,
+                review_artifact=review_artifact,
+                reviewed_at=reviewed_at,
+                verified_at=None,
+                blocked_reason=(
+                    f"code review requested invalid task-contract repair ({invalid_reason}); "
+                    f"treating as implementation repair. {str(parsed.get('summary') or '').strip()}"
+                ).strip(),
+                attempts=max(task.attempts, 1),
+            )
+            save_tasks(project_dir, tasks)
+            active_session = current_session(project_dir)
+            if active_session is not None and active_session.id == task.status_session_id:
+                retire_session(project_dir, active_session)
+            save_task_runtime_state(
+                project_dir,
+                task_id,
+                {
+                    **review_repair_state,
+                    "review_requested_scope_paths": accepted_scope_paths,
+                    "task_contract_repair_invalid": {
+                        "error": invalid_reason,
+                        "assessment": task_contract_assessment,
+                    },
+                    "task_contract_blocker": None,
+                    "pending_scope_report": None,
+                },
+            )
+            refresh_gates(project_dir)
+            return 2
         except RuntimeError as exc:
             if exc.__class__.__name__ != "TaskContractRepairBlocked":
                 raise
@@ -1353,6 +550,7 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
                 project_dir,
                 task_id,
                 {
+                    **review_repair_state,
                     "review_requested_scope_paths": accepted_scope_paths,
                     "task_contract_deferred_acceptance": deferral_result,
                     "task_contract_deferred_artifacts": list(deferral_artifacts),
@@ -1388,6 +586,7 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
             project_dir,
             task_id,
             {
+                **review_repair_state,
                 "review_requested_scope_paths": accepted_scope_paths,
                 "task_contract_repair": repair_result,
                 "task_contract_repaired_at": reviewed_at,
@@ -1425,6 +624,7 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
             project_dir,
             task_id,
             {
+                **review_repair_state,
                 "review_requested_scope_paths": accepted_scope_paths,
                 "task_contract_blocker": task_contract_assessment,
                 "task_contract_blocked_at": reviewed_at,
@@ -1456,6 +656,7 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         project_dir,
         task_id,
         {
+            **review_repair_state,
             "review_requested_scope_paths": accepted_scope_paths,
         },
     )
@@ -1481,11 +682,21 @@ def import_final_review(project_root: Path | str, payload: dict[str, Any], input
             details={"project": str(project_dir), "status": task.status, "input_path": str(input_path)},
         )
     parsed = _parse_review_payload(json.dumps(payload, ensure_ascii=False))
-    persisted_input = final_review_input_path(project_dir)
-    persisted_input.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    review_artifact = _write_final_review_artifact(project_dir, parsed)
-    review_status = str(parsed.get("status") or "changes_requested").strip()
     reviewed_at = utc_now_iso()
+    persisted_input = final_review_input_path(project_dir)
+    persisted_input_content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    persisted_input.write_text(persisted_input_content, encoding="utf-8")
+    review_artifact = _write_final_review_artifact(project_dir, parsed)
+    _archive_review_round(
+        project_dir,
+        review_name="final-review",
+        request_path=final_review_request_path(project_dir),
+        input_extension=".json",
+        input_content=persisted_input_content,
+        artifact_path=project_paths(project_dir).project_root / review_artifact,
+        reviewed_at=reviewed_at,
+    )
+    review_status = str(parsed.get("status") or "changes_requested").strip()
     if review_status.casefold() == "pass":
         tasks = mark_task(
             all_tasks(project_dir),

@@ -7,7 +7,7 @@ from typing import Any
 
 from .bootstrap import archive_requirements_source, save_project_dependency_hints
 from .errors import DeliveryError
-from .runtime_config import load_project_runtime, root_context_filename
+from .runtime_config import load_project_metadata, load_project_runtime, root_context_filename
 from .scaffold import write_project_structure_snapshot
 from .gates import sync_gates
 from .state import ensure_runtime_dirs, load_architecture_meta, project_paths, save_architecture_meta, save_test_plan, save_work_items, utc_now_iso
@@ -64,11 +64,106 @@ NON_CANONICAL_BACKEND_TREE_CHILD_RE = re.compile(
 )
 UNSUPPORTED_TOP_LEVEL_MCP_SERVER_RE = re.compile(r"\bmcp-server(?:/|\b)", re.IGNORECASE)
 TREE_FILE_ENTRY_RE = re.compile(
-    r"^(?:[│ ]+)?(?:├──|└──)\s*(?P<name>[^\s#]+\.(?:py|pyi|ts|tsx|js|jsx|sql|ya?ml|json|toml|ini|sh|md))(?:\s|$)",
+    r"^(?:[│ ]+)?(?:├──|└──)\s*(?P<name>[^\s#]+)(?:\s|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 ALLOWED_TREE_PLACEHOLDER_FILES = {"__init__.py", ".gitkeep"}
-MAX_MODULE_TREE_FILE_ENTRIES = 20
+ALLOWED_SCAFFOLD_TREE_FILES = {
+    ".env",
+    ".env.example",
+    ".gitignore",
+    ".worktreeinclude",
+    "Dockerfile",
+    "README.md",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "pyproject.toml",
+    "uv.lock",
+    "requirements.txt",
+    "poetry.lock",
+    "go.mod",
+    "go.sum",
+    "Cargo.toml",
+    "Cargo.lock",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "tsconfig.json",
+    "vite.config.ts",
+    "next.config.js",
+    "next.config.mjs",
+    "tailwind.config.js",
+    "postcss.config.js",
+    "playwright.config.ts",
+}
+IMPLEMENTATION_TREE_FILE_RE = re.compile(
+    r"\.(?:py|pyi|ipynb|ts|tsx|js|jsx|mjs|cjs|java|kt|kts|scala|go|rs|cs|fs|vb|cpp|cc|cxx|c|h|hpp|swift|rb|php|dart|sql|graphql|proto)$",
+    re.IGNORECASE,
+)
+MAX_MODULE_TREE_IMPLEMENTATION_FILE_ENTRIES = 20
+
+
+def _looks_like_adr_doc(path: str, content: str) -> bool:
+    path_text = str(path or "").strip().casefold()
+    content_text = str(content or "").strip().casefold()
+    filename = Path(path_text).name
+    if filename.startswith("adr-") or "/adr" in path_text or "/adrs" in path_text:
+        return True
+    if re.search(r"^#\s*adr[-\s:]", content_text, flags=re.MULTILINE):
+        return True
+    if "## decision" in content_text and "## consequences" in content_text and "## context" in content_text:
+        return True
+    return False
+
+
+def _invalid_module_docs(payload: dict[str, Any]) -> list[str]:
+    invalid: list[str] = []
+    for index, row in enumerate(payload.get("modules", []) or []):
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("path") or "").strip()
+        content = str(row.get("content") or "").strip()
+        if _looks_like_adr_doc(path, content):
+            invalid.append(path or f"modules[{index}]")
+    return invalid
+
+
+def _dependency_hint_tokens(name: str) -> list[str]:
+    return [token for token in re.split(r"[^A-Za-z0-9]+", str(name or "").casefold()) if len(token) >= 3]
+
+
+def _architecture_missing_dependency_hints(project_root: Path | str, payload: dict[str, Any]) -> list[str]:
+    metadata = load_project_metadata(project_root)
+    dependency_hints = metadata.get("dependency_hints") if isinstance(metadata.get("dependency_hints"), list) else []
+    if not dependency_hints:
+        return []
+    docs = [str(payload.get("architecture_md") or ""), str(payload.get("shared_components_md") or "")]
+    for collection_name in ["modules", "adrs"]:
+        for row in payload.get(collection_name, []) or []:
+            if isinstance(row, dict):
+                docs.append(str(row.get("content") or ""))
+                docs.append(str(row.get("path") or ""))
+    haystack = "\n".join(docs).casefold()
+    missing: list[str] = []
+    for hint in dependency_hints:
+        if not isinstance(hint, dict):
+            continue
+        name = str(hint.get("name") or "").strip()
+        if not name:
+            continue
+        if name.casefold() in haystack:
+            continue
+        tokens = _dependency_hint_tokens(name)
+        if tokens and all(token in haystack for token in tokens):
+            continue
+        missing.append(name)
+    return missing
 
 def _runtime_context_baseline(runtime: str) -> str:
     context_name = "CLAUDE.md" if runtime == "claude" else "AGENTS.md"
@@ -155,17 +250,24 @@ def _validate_architecture_markdown(input_path: Path, architecture_md: str) -> N
             input_path,
             "python-react architecture must use the selected stack's canonical service roots; found an unsupported extra service root in the Module Architecture tree",
         )
-    tree_files = [
-        match.group("name")
-        for match in TREE_FILE_ENTRY_RE.finditer(tree_body)
-        if match.group("name") not in ALLOWED_TREE_PLACEHOLDER_FILES
-    ]
-    if len(tree_files) > MAX_MODULE_TREE_FILE_ENTRIES:
+    implementation_files = []
+    for match in TREE_FILE_ENTRY_RE.finditer(tree_body):
+        name = match.group("name").rstrip("/")
+        if name in ALLOWED_TREE_PLACEHOLDER_FILES or name in ALLOWED_SCAFFOLD_TREE_FILES:
+            continue
+        if IMPLEMENTATION_TREE_FILE_RE.search(name):
+            implementation_files.append(name)
+    if len(implementation_files) > MAX_MODULE_TREE_IMPLEMENTATION_FILE_ENTRIES:
         raise _shape_error(
             "arch-design",
             input_path,
-            "arch-design Module Architecture tree must be a scaffold skeleton, not an implementation file inventory; too many concrete files were listed",
-            details={"max_file_entries": MAX_MODULE_TREE_FILE_ENTRIES, "file_entry_count": len(tree_files)},
+            "arch-design Module Architecture tree must be a scaffold skeleton, not an implementation file inventory; too many implementation source files were listed",
+            details={
+                "max_implementation_file_entries": MAX_MODULE_TREE_IMPLEMENTATION_FILE_ENTRIES,
+                "implementation_file_entry_count": len(implementation_files),
+                "implementation_file_examples": implementation_files[:30],
+                "ignored_scaffold_files": sorted(ALLOWED_SCAFFOLD_TREE_FILES),
+            },
         )
 
 
@@ -214,12 +316,13 @@ def _shape_error(stage_name: str, input_path: Path, message: str, *, details: di
     payload_details = {"stage": stage_name, "input_path": str(input_path)}
     if details:
         payload_details.update(details)
+    project_hint = input_path.parents[2] if len(input_path.parents) > 2 else input_path.parent
     return DeliveryError(
         code="input_invalid_shape",
         message=message,
         exit_code=2,
         details=payload_details,
-        suggested_action=f"Ask the stage skill to repair the JSON for {stage_name} and rerun: {stage_import_command(input_path.parents[2], stage_name, input_path)}",
+        suggested_action=f"Ask the stage skill to repair the JSON for {stage_name} and rerun: {stage_import_command(project_hint, stage_name, input_path)}",
     )
 
 
@@ -334,7 +437,23 @@ def import_arch_design(project_root: Path | str, payload: dict[str, Any], input_
     if not isinstance(payload.get("ui_required"), bool):
         raise _shape_error("arch-design", input_path, "arch-design payload field ui_required must be a boolean")
     _validate_architecture_markdown(input_path, str(payload.get("architecture_md") or ""))
+    invalid_module_docs = _invalid_module_docs(payload)
+    if invalid_module_docs:
+        raise _shape_error(
+            "arch-design",
+            input_path,
+            "arch-design modules[] must contain module design docs, not ADR documents",
+            details={"invalid_module_docs": invalid_module_docs},
+        )
     project_root = Path(project_root).expanduser().resolve()
+    missing_dependency_hints = _architecture_missing_dependency_hints(project_root, payload)
+    if missing_dependency_hints:
+        raise _shape_error(
+            "arch-design",
+            input_path,
+            "arch-design output must preserve explicit project technology constraints from dependency_hints",
+            details={"missing_dependency_hints": missing_dependency_hints},
+        )
     _persist_stage_input(project_root, "arch-design", payload)
     docs_dir = project_root / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)

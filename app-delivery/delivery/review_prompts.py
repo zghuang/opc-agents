@@ -1,0 +1,349 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from .builtin_task_prompts import render_frontend_api_audit_review_request, render_prefinal_audit_review_request
+from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
+from .requirements_context import format_acceptance_context, format_requirement_context
+from .runtime_config import load_project_metadata, resolve_project_root
+from .task import FINAL_VERIFY_TASK_ID, Task
+
+
+REVIEW_PROMPT_NOISE_PATHS = {
+    "docs/gates.json",
+    "docs/test-results.json",
+    "docs/work-items.json",
+    "docs/work-items.md",
+    "docs/project-summary.json",
+    "docs/project-summary.md",
+}
+
+REVIEW_PROMPT_NOISE_PREFIXES = (
+    ".app-delivery-runtime/",
+    "app-delivery-runtime/",
+    "docs/reviews/code-review-",
+    "docs/reviews/test-report-",
+    "docs/reviews/gate-report-",
+)
+
+REVIEW_PROMPT_CHANGED_PATH_LIMIT = 12
+REVIEW_CONTRACT_PATH = Path(__file__).resolve().parents[1] / "skills" / "code-review" / "references" / "review-contract.md"
+
+
+def _task_intent_fields(task: Task) -> tuple[str, str, list[str], list[str]]:
+    intent = task.intent if isinstance(task.intent, dict) else {}
+    return (
+        str(intent.get("objective") or "").strip(),
+        str(intent.get("journey") or "").strip(),
+        [str(value).strip() for value in intent.get("done_when", []) if str(value).strip()],
+        [str(value).strip() for value in intent.get("non_goals", []) if str(value).strip()],
+    )
+
+
+def _append_task_intent_section(lines: list[str], task: Task) -> None:
+    objective, journey, done_when, non_goals = _task_intent_fields(task)
+    if not any([objective, journey, done_when, non_goals]):
+        return
+    lines.append("Task intent:")
+    if objective:
+        lines.append(f"- Objective: {objective}")
+    if journey:
+        lines.append(f"- Journey: {journey}")
+    if done_when:
+        lines.append("- Done when:")
+        lines.extend(f"  - {value}" for value in done_when)
+    if non_goals:
+        lines.append("- Non-goals:")
+        lines.extend(f"  - {value}" for value in non_goals)
+    lines.append("")
+
+
+def _append_review_contract(lines: list[str], task: Task) -> None:
+    declared_acceptance = ", ".join(task.acceptance_scenarios) if task.acceptance_scenarios else "none; this task declares no acceptance scenarios, so do not use task_contract_repair"
+    text = REVIEW_CONTRACT_PATH.read_text(encoding="utf-8").strip()
+    text = text.replace("{{declared_acceptance_scenarios}}", declared_acceptance)
+    lines.append(text)
+    lines.append("")
+
+
+def _append_scope_observations(lines: list[str], scope_report: dict[str, Any] | None, *, validation: bool = False) -> None:
+    if not isinstance(scope_report, dict):
+        return
+    out_of_scope = [str(path).strip() for path in scope_report.get("out_of_scope", []) if str(path).strip()]
+    changed_paths, omitted_changed_path_count = _review_prompt_changed_paths(scope_report)
+    lines.append("Scope observations:")
+    if out_of_scope:
+        if validation:
+            lines.append("- The framework detected changes outside planned validation scope.")
+        else:
+            lines.append("- The framework detected changes outside planned scope.")
+        for path in out_of_scope:
+            lines.append(f"- out_of_scope: {path}")
+        if validation:
+            lines.append("- Pass only if they are necessary validation support; otherwise request changes and cite them.")
+        else:
+            lines.append("- Pass only if they are necessary support for this task; otherwise request changes and cite them.")
+    else:
+        lines.append("- No out-of-scope paths were detected by the framework.")
+    if changed_paths:
+        lines.append("- Implementation-relevant changed paths seen by the framework:")
+        for path in changed_paths:
+            lines.append(f"  - {path}")
+    if omitted_changed_path_count:
+        lines.append(f"- Omitted {omitted_changed_path_count} framework-generated or low-signal changed paths from this summary.")
+    lines.append("")
+
+
+def _dependency_hint_tokens(name: str) -> list[str]:
+    import re
+
+    return [token for token in re.split(r"[^A-Za-z0-9]+", str(name or "").casefold()) if len(token) >= 3]
+
+
+def _task_hint_context(task: Task, requirement_context: list[str], acceptance_context: list[str]) -> str:
+    parts = [
+        task.title,
+        " ".join(task.requirements),
+        " ".join(task.acceptance_scenarios),
+        " ".join(task.output_paths),
+        " ".join(task.output_tests),
+        " ".join(requirement_context),
+        " ".join(acceptance_context),
+    ]
+    return "\n".join(parts).casefold()
+
+
+def _task_touches_manifest_for_ecosystem(task: Task, ecosystem: str) -> bool:
+    paths = set(task.output_paths)
+    if ecosystem == "backend":
+        return bool(paths.intersection({"backend/pyproject.toml", "backend/uv.lock"}))
+    if ecosystem == "frontend":
+        return bool(paths.intersection({"frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}))
+    if ecosystem in {"infra", "project"}:
+        return any(path in paths for path in {"docker-compose.yml", "README.md"})
+    return False
+
+
+def _dependency_hint_relevant(task: Task, hint: dict[str, str], context: str) -> bool:
+    ecosystem = str(hint.get("ecosystem") or "project").strip().lower() or "project"
+    if _task_touches_manifest_for_ecosystem(task, ecosystem):
+        return True
+    name = str(hint.get("name") or "").strip()
+    if not name:
+        return False
+    if name.casefold() in context:
+        return True
+    tokens = _dependency_hint_tokens(name)
+    return bool(tokens) and any(token in context for token in tokens)
+
+
+def _relevant_dependency_hints(project_root: Path | str, task: Task, requirement_context: list[str] | None = None, acceptance_context: list[str] | None = None) -> list[dict[str, str]]:
+    metadata = load_project_metadata(project_root)
+    raw_hints = metadata.get("dependency_hints") if isinstance(metadata.get("dependency_hints"), list) else []
+    ecosystems = {"project"}
+    if any(path.startswith("backend/") for path in task.output_paths):
+        ecosystems.add("backend")
+    if any(path.startswith("frontend/") for path in task.output_paths):
+        ecosystems.add("frontend")
+    result: list[dict[str, str]] = []
+    for row in raw_hints:
+        if not isinstance(row, dict):
+            continue
+        ecosystem = str(row.get("ecosystem") or "project").strip().lower() or "project"
+        if ecosystem not in ecosystems:
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        hint = {
+            "ecosystem": ecosystem,
+            "name": name,
+            "reason": str(row.get("reason") or "").strip(),
+            "source": str(row.get("source") or "").strip(),
+            "evidence": str(row.get("evidence") or "").strip(),
+        }
+        context = _task_hint_context(task, requirement_context or [], acceptance_context or [])
+        if _dependency_hint_relevant(task, hint, context):
+            result.append(hint)
+    return result
+
+
+def _append_dependency_hint_review_section(lines: list[str], dependency_hints: list[dict[str, str]]) -> None:
+    if not dependency_hints:
+        return
+    lines.append("Project technology constraints to verify:")
+    for hint in dependency_hints:
+        suffix = ""
+        evidence = str(hint.get("evidence") or "").strip()
+        source = str(hint.get("source") or "").strip()
+        if evidence or source:
+            suffix = f" [{'; '.join(part for part in [source, evidence] if part)}]"
+        reason = str(hint.get("reason") or "").strip() or "Required by project planning artifacts."
+        lines.append(f"- {hint['name']} ({hint['ecosystem']}): {reason}{suffix}")
+    lines.append("- Require implementation evidence or an explicit superseding ADR/clarification.")
+    lines.append("")
+
+
+def _is_review_prompt_noise_path(path: str) -> bool:
+    normalized = str(path or "").strip()
+    if not normalized:
+        return True
+    if normalized in REVIEW_PROMPT_NOISE_PATHS:
+        return True
+    return any(normalized.startswith(prefix) for prefix in REVIEW_PROMPT_NOISE_PREFIXES)
+
+
+def _review_prompt_changed_paths(scope_report: dict[str, Any]) -> tuple[list[str], int]:
+    raw_changed_paths = [str(path).strip() for path in scope_report.get("changed_paths", []) if str(path).strip()]
+    out_of_scope = {str(path).strip() for path in scope_report.get("out_of_scope", []) if str(path).strip()}
+    filtered: list[str] = []
+    seen: set[str] = set()
+    omitted = 0
+    for path in raw_changed_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        if path in out_of_scope:
+            continue
+        if _is_review_prompt_noise_path(path):
+            omitted += 1
+            continue
+        filtered.append(path)
+    return filtered[:REVIEW_PROMPT_CHANGED_PATH_LIMIT], omitted + max(0, len(filtered) - REVIEW_PROMPT_CHANGED_PATH_LIMIT)
+
+
+def build_code_review_request(
+    project_root: Path | str,
+    task: Task,
+    *,
+    scope_report: dict[str, Any] | None = None,
+) -> str:
+    if task.id == FRONTEND_API_AUDIT_TASK_ID:
+        return render_frontend_api_audit_review_request(project_root, task, scope_report=scope_report)
+    if task.id == PREFINAL_AUDIT_TASK_ID:
+        return render_prefinal_audit_review_request(project_root, task, scope_report=scope_report)
+    if task.task_kind == "validation":
+        return build_validation_code_review_request(project_root, task, scope_report=scope_report)
+    touches_dependency_manifest = any(
+        path in {"backend/pyproject.toml", "frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}
+        for path in task.output_paths
+    )
+    lines = [
+        f"Perform an independent code review for task {task.id}.",
+        f"Project path: {Path(project_root).expanduser().resolve()}",
+        f"Task title: {task.title}",
+        "",
+    ]
+    _append_task_intent_section(lines, task)
+    lines.append("Requirement details:")
+    requirement_context = format_requirement_context(project_root, task.requirements) or []
+    lines.extend(requirement_context or ["- none"])
+    lines.append("")
+    lines.append("Acceptance scenario details:")
+    acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
+    lines.extend(acceptance_context or ["- none"])
+    lines.append("")
+    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
+    _append_dependency_hint_review_section(lines, dependency_hints)
+    _append_review_contract(lines, task)
+    lines.append("Feature review checks:")
+    lines.append("- Judge declared requirements, acceptance scenarios, output_paths, output_tests, and necessary support edits.")
+    lines.append("- Missing behavior, placeholders/stubs as complete, unmet IDs, and unowned deferrals are blocking findings.")
+    lines.append("- For auth/RBAC/data-isolation requirements, verify enforcement on the owning route or service path.")
+    lines.append("- For agent or workflow tasks, verify real case/context/tool/service data, not only static demo payloads.")
+    if any(path.startswith("frontend/") for path in task.output_paths) and task.acceptance_scenarios:
+        lines.append("- Frontend acceptance flows need browser/e2e evidence here unless a declared downstream validation task owns the exact journey.")
+    lines.append("")
+    if touches_dependency_manifest:
+        lines.append("Tech-design check:")
+        lines.append("- Manifest changes must align with `Tech Design` in AGENTS.md / CLAUDE.md and `docs/architecture.md`.")
+        lines.append("- Fail silent contradictions or unjustified deferrals of mandated stack choices.")
+        lines.append("")
+    _append_scope_observations(lines, scope_report)
+    lines.append("Inspect current repository state and the task-scoped snapshot only.")
+    lines.append("Use `pass` only when the task is acceptable as-is; otherwise use `changes_requested`.")
+    return "\n".join(lines)
+
+
+def build_validation_code_review_request(
+    project_root: Path | str,
+    task: Task,
+    *,
+    scope_report: dict[str, Any] | None = None,
+) -> str:
+    lines = [
+        f"Perform an independent code review for validation task {task.id}.",
+        f"Project path: {Path(project_root).expanduser().resolve()}",
+        f"Task title: {task.title}",
+        "",
+        "This is a validation-task review. Judge whether the task delivered credible executable validation assets for its owned requirements and acceptance scenarios.",
+        "",
+    ]
+    _append_task_intent_section(lines, task)
+    lines.append("Requirement details:")
+    requirement_context = format_requirement_context(project_root, task.requirements) or []
+    lines.extend(requirement_context or ["- none"])
+    lines.append("")
+    lines.append("Acceptance scenario details:")
+    acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
+    lines.extend(acceptance_context or ["- none"])
+    lines.append("")
+    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
+    _append_dependency_hint_review_section(lines, dependency_hints)
+    _append_review_contract(lines, task)
+    lines.append("Validation review checks:")
+    lines.append("- Declared output_tests are contractual validation entrypoints.")
+    lines.append("- Tests or commands must exist, run, and prove the owned requirements and scenarios.")
+    lines.append("- Each declared scenario must map to assertions, fixtures, scenario data, or browser/e2e coverage.")
+    lines.append("- Mocked browser tests using `page.route()` count as mocked-browser evidence, not real backend E2E evidence.")
+    lines.append("- Production gates must block demo constants, hardcoded API responses, missing auth/RBAC, and log-only execution dispatch.")
+    lines.append("- Return `status=changes_requested` for placeholder tests, shallow smoke checks, missing scenario coverage, weak assertions, or tests that cannot actually execute.")
+    lines.append("- Support code is acceptable only when needed for truthful validation.")
+    lines.append("- Fail broad product implementation that belongs to upstream feature tasks.")
+    lines.append("")
+    _append_scope_observations(lines, scope_report, validation=True)
+    lines.append("Inspect current repository state and the validation-task snapshot only.")
+    lines.append("Use `pass` only when validation evidence is credible, executable, and scoped.")
+    return "\n".join(lines)
+
+
+def build_final_review_request(
+    project_root: Path | str,
+    *,
+    results_summary: str,
+    requirement_coverage: dict[str, Any],
+    missing_test_types: list[tuple[str, str]],
+) -> str:
+    lines = [
+        "Perform an independent final release review.",
+        f"Project path: {Path(project_root).expanduser().resolve()}",
+        "",
+        "Full suite summary:",
+        results_summary or "No test results were recorded.",
+        "",
+        f"Requirement coverage: total={requirement_coverage.get('total', 0)} covered={requirement_coverage.get('covered', 0)} uncovered={', '.join(requirement_coverage.get('uncovered', [])) or 'none'}",
+        "",
+        "Missing test-type coverage:",
+    ]
+    if missing_test_types:
+        for requirement_id, test_type in missing_test_types:
+            lines.append(f"- {requirement_id}: missing {test_type}")
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "Inspect the repository state and release evidence.",
+            "Use status=pass only when the release is ready to accept as-is. Otherwise use status=changes_requested.",
+            "Reply in raw JSON with fields: status, summary, findings (array of finding objects). Use an empty findings array when there are no findings.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+__all__ = [
+    "build_code_review_request",
+    "build_final_review_request",
+    "build_validation_code_review_request",
+]

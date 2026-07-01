@@ -16,6 +16,7 @@ from .runtime_config import resolve_runtime
 from .scaffold import scaffold_project
 from .session import RuntimeErrorResponse, RuntimeSession, current_session, execute_in_session, retire_session, save_current_session, start_task_session, touch_session
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID
+from .config_validation import config_validation_summary, validate_project_config_files
 from .state import (
     clear_task_runtime_failure,
     ensure_runtime_dirs,
@@ -632,6 +633,24 @@ class DeliveryLoop:
             tasks = mark_task(tasks, scaffold_task.id, "active", git_commit=git_head_sha(self.project_root), blocked_reason=None)
             save_tasks(self.project_root, tasks)
         scaffold_project(self.project_root)
+        config_failures = validate_project_config_files(self.project_root)
+        if config_failures:
+            summary = config_validation_summary(config_failures)
+            if scaffold_task:
+                exception_report = _write_exception_report(self.project_root, scaffold_task, summary)
+                tasks = mark_task(
+                    all_tasks(self.project_root),
+                    scaffold_task.id,
+                    "exception",
+                    completed_at=None,
+                    verified_at=None,
+                    review_artifact=exception_report,
+                    reviewed_at=utc_now_iso(),
+                    blocked_reason=summary,
+                    attempts=1,
+                )
+                save_tasks(self.project_root, tasks)
+            return {"status": "exception", "task_id": SCAFFOLD_TASK_ID, "reason": summary, "config_failures": config_failures}
         review_payload = {
             "status": "pass",
             "summary": "Built-in scaffold executed deterministically.",

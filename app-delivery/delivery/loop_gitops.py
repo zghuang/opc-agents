@@ -91,6 +91,11 @@ def git_head_sha(project_root: Path | str) -> str:
     return completed.stdout.strip() if completed.returncode == 0 else ""
 
 
+def git_commit_subject(project_root: Path | str, commit: str = "HEAD") -> str:
+    completed = git(["show", "-s", "--format=%s", commit], cwd=Path(project_root).expanduser().resolve())
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
 def git_latest_task_commit(project_root: Path | str, task_id: str) -> str:
     project_dir = Path(project_root).expanduser().resolve()
     prefixes = [f"feat({task_id}):"]
@@ -619,6 +624,11 @@ def git_commit_task(project_root: Path | str, task: Task, message: str, *, extra
         head_sha = git_head_sha(project_dir)
         if not head_sha:
             raise RuntimeError("git repository has no baseline commit")
+        subject = git_commit_subject(project_dir, head_sha)
+        if task.id != "T000" and task.id not in subject:
+            raise RuntimeError(
+                f"no staged changes for {task.id}; refusing to assign existing HEAD commit {head_sha} ({subject}) to this task"
+            )
         return head_sha
     commit_result = git(["commit", "-m", message], cwd=project_dir)
     if commit_result.returncode != 0:
