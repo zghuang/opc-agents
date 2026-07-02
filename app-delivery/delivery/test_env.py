@@ -18,6 +18,20 @@ ENV_STATE_FILE = "env-state.json"
 VALIDATION_STRIP_ENV_VARS = ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH", "__PYVENV_LAUNCHER__")
 APP_LOCAL_SERVICE_NAMES = ("backend", "frontend", "web", "app", "api", "mocks", "mock-server")
 BROWSER_E2E_MARKERS = ("frontend/e2e/", "playwright", "npm run e2e", "pnpm run e2e", "yarn e2e")
+BACKEND_ENTRYPOINT_EXCLUDED_PARTS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "migrations",
+    "node_modules",
+    "tests",
+    "venv",
+}
 
 
 @dataclass(frozen=True)
@@ -76,6 +90,40 @@ def _configured_backend_health_url() -> str:
     return _configured_backend_base_url() + "/health"
 
 
+def _backend_entrypoint_module(backend_root: Path, main_path: Path) -> str | None:
+    relative = main_path.relative_to(backend_root)
+    if any(part in BACKEND_ENTRYPOINT_EXCLUDED_PARTS or part.startswith(".") for part in relative.parts[:-1]):
+        return None
+    if relative.parts == ("main.py",):
+        module_parts = ["main"]
+    elif relative.parts and relative.parts[0] == "src":
+        module_parts = list(relative.with_suffix("").parts[1:])
+    else:
+        module_parts = list(relative.with_suffix("").parts)
+    if not module_parts or not all(part.isidentifier() for part in module_parts):
+        return None
+    return ".".join(module_parts) + ":app"
+
+
+def _backend_entrypoint_candidates(backend_root: Path) -> list[str]:
+    prioritized_paths = [backend_root / "main.py", backend_root / "app" / "main.py", backend_root / "api" / "main.py"]
+    discovered_paths = sorted(
+        backend_root.rglob("main.py"),
+        key=lambda path: (len(path.relative_to(backend_root).parts), path.relative_to(backend_root).as_posix()),
+    )
+    candidates: list[str] = []
+    seen_paths: set[Path] = set()
+    for path in [*prioritized_paths, *discovered_paths]:
+        resolved = path.resolve()
+        if resolved in seen_paths or not path.exists():
+            continue
+        seen_paths.add(resolved)
+        module = _backend_entrypoint_module(backend_root, path)
+        if module is not None and module not in candidates:
+            candidates.append(module)
+    return candidates
+
+
 def default_backend_e2e_command(project_root: Path | str) -> str | None:
     if str(os.environ.get("E2E_BACKEND_CMD") or "").strip():
         return None
@@ -83,10 +131,11 @@ def default_backend_e2e_command(project_root: Path | str) -> str | None:
     backend_root = project_dir / "backend"
     if not backend_root.joinpath("pyproject.toml").exists():
         return None
-    if not backend_root.joinpath("src", "main.py").exists():
+    entrypoint = next(iter(_backend_entrypoint_candidates(backend_root)), None)
+    if entrypoint is None:
         return None
     return (
-        f"cd {shlex.quote(str(backend_root))} && uv run uvicorn src.main:app "
+        f"cd {shlex.quote(str(backend_root))} && uv run uvicorn {entrypoint} "
         f"--host {_configured_backend_host()} --port {_configured_backend_port()}"
     )
 

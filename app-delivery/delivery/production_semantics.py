@@ -31,6 +31,25 @@ def _read(path: Path) -> str:
         return ""
 
 
+def mock_only_browser_e2e_issues(project_root: Path | str, output_tests: list[str]) -> list[str]:
+    project_dir = Path(project_root).expanduser().resolve()
+    issues: list[str] = []
+    for spec in output_tests:
+        normalized = str(spec or "").strip().lstrip("./")
+        if not normalized.startswith("frontend/e2e/"):
+            continue
+        text = _read(project_dir / normalized)
+        lowered = text.casefold()
+        if "page.route" not in lowered or "/api" not in lowered or "route.fulfill" not in lowered:
+            continue
+        if "route.continue" in lowered or "route.fallback" in lowered:
+            continue
+        issues.append(
+            f"{normalized} uses Playwright route fulfillment for project-owned API calls without route passthrough; mocked browser proof is not real backend E2E evidence"
+        )
+    return issues
+
+
 def _iter_files(root: Path, patterns: tuple[str, ...]) -> list[Path]:
     if not root.exists():
         return []
@@ -56,6 +75,16 @@ def _scan_mocked_only_e2e(project_dir: Path) -> list[SemanticFinding]:
     specs = _iter_files(e2e_dir, ("*.ts", "*.tsx", "*.js", "*.jsx"))
     if not specs or not (_frontend_has_api_surface(project_dir) and _backend_has_api_surface(project_dir)):
         return []
+    task_level_issues = mock_only_browser_e2e_issues(project_dir, [str(path.relative_to(project_dir)).replace("\\", "/") for path in specs])
+    if task_level_issues:
+        return [
+            SemanticFinding(
+                category="real-backend-e2e",
+                message=task_level_issues[0],
+                path="frontend/e2e",
+                repair_hint="Use the framework-provided E2E_BACKEND_CMD/VITE_API_PROXY_TARGET path and avoid page.route fulfillment for the core application API flow.",
+            )
+        ]
     api_specs = [path for path in specs if "api" in _read(path).casefold() or "/api/" in _read(path).casefold() or "page.route" in _read(path)]
     real_backend_specs = [path for path in api_specs if "page.route" not in _read(path) and ("/api/" in _read(path).casefold() or "api" in _read(path).casefold())]
     if real_backend_specs:

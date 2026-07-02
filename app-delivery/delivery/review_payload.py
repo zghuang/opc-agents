@@ -39,6 +39,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
         },
         "intent_assessment": {"type": "object"},
         "task_contract_assessment": {"type": "object"},
+        "technology_assessment": {"type": "array", "items": {"type": "object"}},
     },
     "required": ["status", "summary", "findings"],
 }
@@ -46,6 +47,11 @@ REVIEW_SCHEMA: dict[str, Any] = {
 ALLOWED_REVIEW_STATUSES = {"pass", "changes_requested"}
 ALLOWED_ASSESSMENT_STATUSES = {"pass", "changes_requested"}
 ALLOWED_FINDING_SEVERITIES = {"blocking", "non_blocking"}
+FINDING_SEVERITY_ALIASES = {
+    "advisory": "non_blocking",
+    "non-blocking": "non_blocking",
+    "nonblocking": "non_blocking",
+}
 TASK_CONTRACT_REPAIR_ACTION = "task_contract_repair"
 TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION = "repair_task_decompose"
 ALLOWED_TASK_CONTRACT_ACTIONS = {
@@ -116,8 +122,9 @@ def _normalize_findings(value: Any) -> list[dict[str, Any]]:
         if not isinstance(row, dict):
             errors.append(f"findings[{index}] must be an object with fields severity, message, requirement_ids, and acceptance_ids")
             continue
-        severity = str(row.get("severity") or "").strip().casefold()
-        message = str(row.get("message") or "").strip()
+        raw_severity = str(row.get("severity") or "").strip().casefold()
+        severity = FINDING_SEVERITY_ALIASES.get(raw_severity, raw_severity)
+        message = str(row.get("message") or row.get("description") or row.get("recommendation") or "").strip()
         if severity not in ALLOWED_FINDING_SEVERITIES:
             errors.append(f"findings[{index}].severity must be one of: {', '.join(sorted(ALLOWED_FINDING_SEVERITIES))}")
         if not message:
@@ -191,6 +198,50 @@ def _normalize_task_contract_assessment(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _normalize_technology_assessment(value: Any, task: Task) -> list[dict[str, Any]]:
+    constraints = task.technology_constraints or []
+    if not constraints:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("technology_assessment must be provided as an array when task technology_constraints are present")
+    allowed_names = {str(row.get("name") or "").strip() for row in constraints if str(row.get("name") or "").strip()}
+    required_names = {str(row.get("name") or "").strip() for row in constraints if str(row.get("name") or "").strip() and str(row.get("requirement") or "must_use").strip().lower() == "must_use"}
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    errors: list[str] = []
+    for index, row in enumerate(value):
+        if not isinstance(row, dict):
+            errors.append(f"technology_assessment[{index}] must be an object")
+            continue
+        name = str(row.get("name") or "").strip()
+        status = str(row.get("status") or "").strip().casefold()
+        evidence = [str(item).strip() for item in row.get("evidence", []) if str(item).strip()] if isinstance(row.get("evidence"), list) else []
+        notes = str(row.get("notes") or "").strip()
+        if name not in allowed_names:
+            errors.append(f"technology_assessment contains unknown technology constraint: {name or '<empty>'}")
+            continue
+        if name in seen:
+            errors.append(f"technology_assessment contains duplicate technology constraint: {name}")
+            continue
+        if status not in ALLOWED_ASSESSMENT_STATUSES:
+            errors.append(f"technology_assessment status for {name} must be pass or changes_requested")
+            continue
+        if not notes:
+            errors.append(f"technology_assessment notes must be non-empty for {name}")
+            continue
+        normalized.append({"name": name, "status": status, "evidence": evidence, "notes": notes})
+        seen.add(name)
+    missing = sorted(name for name in allowed_names if name not in seen)
+    if missing:
+        errors.append(f"missing technology assessments: {', '.join(missing)}")
+    passing_without_evidence = sorted(row["name"] for row in normalized if row["name"] in required_names and row["status"] == "pass" and not row["evidence"])
+    if passing_without_evidence:
+        errors.append(f"must_use technology assessments require evidence: {', '.join(passing_without_evidence)}")
+    if errors:
+        raise ValueError("; ".join(errors))
+    return normalized
+
+
 def review_requests_task_contract_repair(review_payload: dict[str, Any]) -> bool:
     assessment = review_payload.get("task_contract_assessment") if isinstance(review_payload.get("task_contract_assessment"), dict) else None
     if not assessment:
@@ -246,6 +297,11 @@ def validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str,
     except ValueError as exc:
         task_contract_assessment = None
         errors.append(str(exc))
+    try:
+        technology_assessment = _normalize_technology_assessment(parsed.get("technology_assessment"), task)
+    except ValueError as exc:
+        technology_assessment = []
+        errors.append(str(exc))
     if errors:
         raise ValueError("; ".join(error for error in errors if error))
     parsed["findings"] = findings
@@ -255,6 +311,8 @@ def validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str,
         parsed["intent_assessment"] = intent_assessment
     if task_contract_assessment is not None:
         parsed["task_contract_assessment"] = task_contract_assessment
+    if task.technology_constraints:
+        parsed["technology_assessment"] = technology_assessment
 
     if str(parsed.get("status") or "").strip().casefold() != "pass":
         return parsed
@@ -268,6 +326,9 @@ def validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str,
         blocking_findings.append("intent_assessment is changes_requested")
     if task_contract_assessment is not None and str(task_contract_assessment.get("status") or "").strip().casefold() != "pass":
         blocking_findings.append("task_contract_assessment is changes_requested")
+    non_passing_technology = [row["name"] for row in technology_assessment if row["status"] != "pass"]
+    if non_passing_technology:
+        blocking_findings.append("technology_assessment is changes_requested: " + ", ".join(non_passing_technology))
 
     requirement_ids = {row["id"] for row in requirement_assessment}
     acceptance_ids = {row["id"] for row in acceptance_assessment}

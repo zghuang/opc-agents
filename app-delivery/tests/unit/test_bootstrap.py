@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from delivery.bootstrap import archive_requirements_source, doctor_report, initialize_project, normalize_dependency_hints, save_project_dependency_hints, start_preflight
@@ -9,10 +10,9 @@ from delivery.bootstrap import archive_requirements_source, doctor_report, initi
 def test_initialize_project_creates_scaffold_and_metadata(tmp_path: Path) -> None:
     framework_root = tmp_path / "framework"
     template_root = framework_root / "project_temp" / "stacks" / "python-react"
-    (template_root / "backend" / "src").mkdir(parents=True)
+    (template_root / "backend").mkdir(parents=True)
     (template_root / "frontend" / "src").mkdir(parents=True)
     (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql://demo\n", encoding="utf-8")
-    (template_root / "backend" / "src" / "main.py").write_text("print('backend')\n", encoding="utf-8")
     (template_root / "frontend" / "src" / "main.tsx").write_text("console.log('frontend')\n", encoding="utf-8")
     (template_root / ".gitignore").write_text(".venv\n", encoding="utf-8")
     (framework_root / "delivery").mkdir(parents=True)
@@ -36,6 +36,7 @@ def test_initialize_project_creates_scaffold_and_metadata(tmp_path: Path) -> Non
     assert payload["status"] == "ok"
     assert (project_root / ".git").exists()
     assert (project_root / "backend").exists()
+    assert not (project_root / "backend" / "src").exists()
     assert (project_root / "backend" / ".env").exists()
     assert (project_root / "frontend").exists()
     assert (project_root / "mock-server").exists()
@@ -45,13 +46,20 @@ def test_initialize_project_creates_scaffold_and_metadata(tmp_path: Path) -> Non
     assert bootstrap_meta["watchdog_enabled"] is False
 
 
+def test_python_react_template_does_not_precreate_backend_package_layout() -> None:
+    template_root = Path(__file__).resolve().parents[2] / "project_temp" / "stacks" / "python-react"
+
+    assert (template_root / "backend" / "pyproject.toml").exists()
+    assert not (template_root / "backend" / "src").exists()
+    assert "src.main" not in (template_root / "backend" / "Dockerfile").read_text(encoding="utf-8")
+
+
 def test_initialize_project_uses_opencode_scaffold_when_requested(tmp_path: Path) -> None:
     framework_root = tmp_path / "framework"
     template_root = framework_root / "project_temp" / "stacks" / "python-react"
-    (template_root / "backend" / "src").mkdir(parents=True)
+    (template_root / "backend").mkdir(parents=True)
     (template_root / "frontend" / "src").mkdir(parents=True)
     (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql://demo\n", encoding="utf-8")
-    (template_root / "backend" / "src" / "main.py").write_text("print('backend')\n", encoding="utf-8")
     (template_root / "frontend" / "src" / "main.tsx").write_text("console.log('frontend')\n", encoding="utf-8")
     (template_root / ".gitignore").write_text(".venv\n", encoding="utf-8")
     (template_root / ".claude" / "rules").mkdir(parents=True)
@@ -81,10 +89,9 @@ def test_initialize_project_uses_opencode_scaffold_when_requested(tmp_path: Path
 def test_initialize_project_can_enable_watchdog_explicitly(tmp_path: Path) -> None:
     framework_root = tmp_path / "framework"
     template_root = framework_root / "project_temp" / "stacks" / "python-react"
-    (template_root / "backend" / "src").mkdir(parents=True)
+    (template_root / "backend").mkdir(parents=True)
     (template_root / "frontend" / "src").mkdir(parents=True)
     (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql://demo\n", encoding="utf-8")
-    (template_root / "backend" / "src" / "main.py").write_text("print('backend')\n", encoding="utf-8")
     (template_root / "frontend" / "src" / "main.tsx").write_text("console.log('frontend')\n", encoding="utf-8")
     (template_root / ".gitignore").write_text(".venv\n", encoding="utf-8")
     (framework_root / "delivery").mkdir(parents=True)
@@ -104,6 +111,47 @@ def test_initialize_project_can_enable_watchdog_explicitly(tmp_path: Path) -> No
     project_root = Path(payload["project_root"])
     bootstrap_meta = json.loads((project_root / "docs" / "project-bootstrap.json").read_text(encoding="utf-8"))
     assert bootstrap_meta["watchdog_enabled"] is True
+
+
+def test_initialize_project_force_retries_directory_not_empty(tmp_path: Path, monkeypatch) -> None:
+    framework_root = tmp_path / "framework"
+    template_root = framework_root / "project_temp" / "stacks" / "python-react"
+    (template_root / "backend").mkdir(parents=True)
+    (template_root / "frontend" / "src").mkdir(parents=True)
+    (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql://demo\n", encoding="utf-8")
+    (template_root / "frontend" / "src" / "main.tsx").write_text("console.log('frontend')\n", encoding="utf-8")
+    (framework_root / "delivery").mkdir(parents=True)
+    (framework_root / "skills").mkdir(parents=True)
+    (framework_root / "scripts").mkdir(parents=True)
+    (framework_root / "mock-server").mkdir(parents=True)
+    (framework_root / "mock-server" / "README.md").write_text("mock\n", encoding="utf-8")
+    project_root = tmp_path / "demo-project-force"
+    (project_root / ".app-delivery-runtime").mkdir(parents=True)
+    (project_root / ".app-delivery-runtime" / "watchdog-state.json").write_text(json.dumps({"pid": 999999}), encoding="utf-8")
+    (project_root / "README.md").write_text("old\n", encoding="utf-8")
+    original_rmtree = shutil.rmtree
+    calls = 0
+
+    def flaky_rmtree(path, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(66, "Directory not empty", str(path))
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("delivery.bootstrap.shutil.rmtree", flaky_rmtree)
+
+    payload = initialize_project(
+        project_root,
+        description="Demo project",
+        runtime="opencode",
+        framework_root=framework_root,
+        force=True,
+    )
+
+    assert payload["status"] == "ok"
+    assert calls == 2
+    assert not (project_root / "README.md").read_text(encoding="utf-8").startswith("old")
 
 
 def test_save_project_dependency_hints_normalizes_structured_skill_output(tmp_path: Path) -> None:

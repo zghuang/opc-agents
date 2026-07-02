@@ -22,11 +22,11 @@ from .project_readiness import (
     work_items_ready,
 )
 from .runtime_config import resolve_project_root
-from .state import load_task_runtime_state, normalize_task_runtime_state
+from .state import load_json, load_task_runtime_state, normalize_task_runtime_state, project_paths, write_json
 from .task import FINAL_VERIFY_TASK_ID, all_tasks
 
 
-CONTROL_GOALS = {"auto", "status", "pause", "repair"}
+CONTROL_GOALS = {"auto", "status", "pause", "repair", "step"}
 
 
 @dataclass(frozen=True)
@@ -80,10 +80,70 @@ def _planning_blocker_code(project_root: Path) -> str | None:
     return None
 
 
+def _auto_exception_repair_state_path(project_root: Path) -> Path:
+    return project_paths(project_root).runtime_dir / "auto-exception-repair.json"
+
+
+def _auto_exception_repair_state(project_root: Path) -> dict[str, Any]:
+    payload = load_json(_auto_exception_repair_state_path(project_root), {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def mark_auto_exception_repair_attempted(project_root: Path | str, task_id: str) -> None:
+    project_dir = resolve_project_root(project_root)
+    state = _auto_exception_repair_state(project_dir)
+    attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
+    task_label = str(task_id or "").strip()
+    attempts[task_label] = {"attempted_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")}
+    state["attempts"] = attempts
+    write_json(_auto_exception_repair_state_path(project_dir), state)
+
+
+def _auto_exception_repair_already_attempted(project_root: Path, task_id: str) -> bool:
+    attempts = _auto_exception_repair_state(project_root).get("attempts")
+    return isinstance(attempts, dict) and str(task_id or "").strip() in attempts
+
+
+def _exception_blocking_pending_ids(tasks: list[Any], exception_id: str) -> list[str]:
+    by_id = {task.id: task for task in tasks}
+
+    def depends_on_exception(task_id: str, seen: set[str]) -> bool:
+        if task_id in seen:
+            return False
+        seen.add(task_id)
+        task = by_id.get(task_id)
+        if task is None:
+            return False
+        for dependency_id in task.dependencies:
+            if dependency_id == exception_id:
+                return True
+            dependency = by_id.get(dependency_id)
+            if dependency is not None and depends_on_exception(dependency.id, seen):
+                return True
+        return False
+
+    return [task.id for task in tasks if task.status == "pending" and task.id != FINAL_VERIFY_TASK_ID and depends_on_exception(task.id, set())]
+
+
+def _auto_exception_repair_candidate(project_root: Path, tasks: list[Any]) -> tuple[Any, list[str]] | None:
+    exceptions = [task for task in tasks if task.status == "exception"]
+    pending = [task for task in tasks if task.status == "pending" and task.id != FINAL_VERIFY_TASK_ID]
+    if not exceptions or not pending:
+        return None
+    for task in exceptions:
+        if _auto_exception_repair_already_attempted(project_root, task.id):
+            continue
+        blocked = _exception_blocking_pending_ids(tasks, task.id)
+        if blocked and len(blocked) == len(pending):
+            return task, blocked
+    return None
+
+
 def routed_status(project_root: Path | str, *, requirements_path: str | None = None) -> dict[str, Any]:
     project_dir = resolve_project_root(project_root)
     base = runtime_status(project_dir)
     tasks = all_tasks(project_dir)
+    invalid_verified = base.get("invalid_verified_tasks") if isinstance(base.get("invalid_verified_tasks"), dict) else {}
     gates_payload = base.get("gates") if isinstance(base.get("gates"), dict) else {}
     gate_rows = gates_payload.get("gates") if isinstance(gates_payload.get("gates"), list) else []
     blocked_gates = [gate for gate in gate_rows if isinstance(gate, dict) and str(gate.get("status") or "").strip() == "blocked"]
@@ -128,9 +188,12 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
         must_continue = next_step is not None
         control_status = "in_progress" if must_continue else "blocked"
     elif isinstance(base.get("active_task"), dict):
+        task = base["active_task"]
+        runtime_state = task.get("runtime_state") if isinstance(task.get("runtime_state"), dict) else {}
+        runtime_state_status = str(runtime_state.get("status") or "").strip()
+        runtime_completed_at = str(runtime_state.get("completed_at") or "").strip()
         runtime_attention = base.get("runtime_attention") if isinstance(base.get("runtime_attention"), dict) else None
         if runtime_attention and runtime_attention.get("suspected"):
-            task = base["active_task"]
             next_step = _step(
                 "framework",
                 "recover_stalled",
@@ -139,6 +202,29 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
                 project=str(project_dir),
                 task_id=str(task.get("id") or "").strip(),
                 attention_kind=str(runtime_attention.get("kind") or "").strip() or None,
+            ).to_dict()
+            must_continue = True
+            control_status = "in_progress"
+        elif runtime_state_status in {"completed", "failed", "interrupted"}:
+            if runtime_state_status == "completed":
+                message = (
+                    f"Continue framework validation and repair flow for {task.get('id')}; "
+                    f"the last runtime attempt already completed{(' at ' + runtime_completed_at) if runtime_completed_at else ''}."
+                )
+            elif runtime_state_status == "failed":
+                message = f"Resume repair flow for {task.get('id')}; the last runtime attempt failed and left the task pending continuation."
+            else:
+                message = f"Resume the active task {task.get('id')}; the last runtime attempt was interrupted and left the task pending continuation."
+            next_step = _step(
+                "framework",
+                "run_resume",
+                "framework",
+                message=message,
+                project=str(project_dir),
+                task_id=str(task.get("id") or "").strip(),
+                task_title=str(task.get("title") or "").strip(),
+                runtime_status=runtime_state_status,
+                runtime_completed_at=runtime_completed_at or None,
             ).to_dict()
             must_continue = True
             control_status = "in_progress"
@@ -304,13 +390,29 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
         must_continue = True
         control_status = "in_progress"
     else:
-        actionable_counts = base.get("counts") if isinstance(base.get("counts"), dict) else {}
-        any_actionable = any(
-            actionable_counts.get(key, 0)
-            for key in ["pending", "active", "review_pending", "blocked", "exception"]
-        )
-        delivery_claim_allowed = final_task_status == "verified" and not any_actionable
-        control_status = "complete" if delivery_claim_allowed else "blocked"
+        auto_repair = _auto_exception_repair_candidate(project_dir, tasks)
+        if auto_repair is not None:
+            exception_task, blocked_pending_ids = auto_repair
+            next_step = _step(
+                "framework",
+                "auto_repair_exception",
+                "framework",
+                message=f"All pending tasks are blocked by exception task {exception_task.id}; reapply its exception patch and retry once.",
+                project=str(project_dir),
+                task_id=exception_task.id,
+                task_title=exception_task.title,
+                blocked_pending_task_ids=blocked_pending_ids,
+            ).to_dict()
+            must_continue = True
+            control_status = "in_progress"
+        else:
+            actionable_counts = base.get("counts") if isinstance(base.get("counts"), dict) else {}
+            any_actionable = any(
+                actionable_counts.get(key, 0)
+                for key in ["pending", "active", "review_pending", "blocked", "exception"]
+            )
+            delivery_claim_allowed = final_task_status == "verified" and not any_actionable
+            control_status = "complete" if delivery_claim_allowed else "blocked"
 
     continue_instruction = ""
     if must_continue and isinstance(next_step, dict):

@@ -4,9 +4,11 @@ import os
 import shutil
 import subprocess
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .runtime_config import load_project_runtime
+from .production_semantics import mock_only_browser_e2e_issues
+from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
 from .state import load_test_results
 from .task import FINAL_VERIFY_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, SCAFFOLD_OUTPUT_PATHS, Task, reset_task
 from .verify import is_path_test_spec
@@ -53,6 +55,7 @@ ALWAYS_ALLOWED_FRAMEWORK_PREFIXES = (
     ".app-delivery-runtime/prompts/",
     "app-delivery-runtime/prompts/",
     "docs/reviews/code-review-",
+    "docs/reviews/exception-report-",
     "docs/reviews/gate-report-",
     "docs/reviews/test-report-",
 )
@@ -175,6 +178,9 @@ def verified_task_issue(project_root: Path | str, task: Task) -> str | None:
     commit_ok = bool(task.git_commit and git_commit_timestamp(project_root, task.git_commit))
     review_status_value, review_artifact = review_artifact_status(project_root, task.id)
     review_ok = bool(review_artifact) and str(review_status_value or "").strip().casefold() == "pass"
+    semantic_issues = mock_only_browser_e2e_issues(project_root, task.output_tests)
+    if semantic_issues:
+        return semantic_issues[0]
     if commit_ok and review_ok:
         return None
     if not commit_ok and not review_ok:
@@ -357,16 +363,6 @@ def _implicit_feature_support_paths(paths: list[str], tests: list[str]) -> list[
         normalized = _normalize_scope_path(raw_path)
         path = Path(normalized)
         parts = path.parts
-        if len(parts) >= 4 and parts[0] == "backend" and parts[1] == "src" and parts[3] == "services":
-            feature = parts[2]
-            inferred.extend(
-                [
-                    f"backend/src/{feature}/services/",
-                    f"backend/src/{feature}/router.py",
-                    f"backend/src/{feature}/schemas/",
-                    f"backend/src/{feature}/models/",
-                ]
-            )
         if len(parts) >= 5 and parts[0] == "frontend" and parts[1] == "src" and parts[2] == "features" and parts[4] == "pages":
             feature = parts[3]
             inferred.extend(
@@ -380,9 +376,11 @@ def _implicit_feature_support_paths(paths: list[str], tests: list[str]) -> list[
         normalized = _normalize_scope_path(raw_path)
         path = Path(normalized)
         parts = path.parts
-        if len(parts) >= 3 and parts[0] == "backend" and parts[1] == "tests" and path.name.startswith("test_") and path.suffix == ".py":
-            feature = parts[2]
-            inferred.append(f"backend/tests/{feature}/conftest.py")
+        backend_tests_root = backend_test_root(PYTHON_REACT_CONTRACT)
+        backend_tests_parts = PurePosixPath(backend_tests_root).parts
+        if len(parts) >= len(backend_tests_parts) + 1 and parts[: len(backend_tests_parts)] == backend_tests_parts and path.name.startswith("test_") and path.suffix == ".py":
+            feature = parts[len(backend_tests_parts)]
+            inferred.append(f"{backend_tests_root}/{feature}/conftest.py")
     return inferred
 
 

@@ -31,6 +31,7 @@ from .review_payload import (
     _validate_pass_review_matrix,
 )
 from .review_prompts import build_code_review_request, build_final_review_request, build_validation_code_review_request
+from .production_semantics import mock_only_browser_e2e_issues
 from .session import current_session, retire_session, save_current_session
 from .state import ensure_runtime_dirs, load_task_runtime_state, load_test_results, normalize_task_runtime_state, project_paths, save_task_runtime_state, utc_now_iso
 from .task import Task, all_tasks, mark_task, next_generated_task_id, save_tasks
@@ -128,6 +129,7 @@ def _review_pass_precondition_errors(project_root: Path | str, task: Task) -> li
         errors.extend(_prefinal_audit_artifact_issues(project_root))
     if task.id == FRONTEND_API_AUDIT_TASK_ID:
         errors.extend(_frontend_api_audit_artifact_issues(project_root))
+    errors.extend(mock_only_browser_e2e_issues(project_root, task.output_tests))
     return errors
 
 

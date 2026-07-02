@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
+from .stack_contracts import PYTHON_REACT_CONTRACT
 from .state import load_task_runtime_state, process_alive, utc_now_iso
 from .task import FINAL_VERIFY_TASK_ID, Task, all_tasks
 
@@ -14,9 +15,17 @@ from .task import FINAL_VERIFY_TASK_ID, Task, all_tasks
 DEFAULT_ATTENTION_SECONDS = 600
 DEFAULT_HARD_STALL_SECONDS = 900
 DEFAULT_AUDIT_HARD_STALL_SECONDS = 1500
+DEFAULT_LARGE_FRONTEND_HARD_STALL_SECONDS = 1800
 DEFAULT_READ_ONLY_STREAK = 20
-SOURCE_ROOTS = ("backend/src", "frontend/src", "mock-server")
+SOURCE_ROOTS = (PYTHON_REACT_CONTRACT.backend_source_root, PYTHON_REACT_CONTRACT.frontend_source_root, PYTHON_REACT_CONTRACT.mock_server_root)
 IGNORED_PARTS = {".app-delivery-runtime", ".git", "node_modules", ".venv", "__pycache__"}
+FRESH_ACTIVITY_FIELDS = (
+    ("stdout", "seconds_since_output"),
+    ("session_store", "seconds_since_session_update"),
+    ("tool", "seconds_since_tool"),
+    ("mutation", "seconds_since_mutation"),
+    ("task_file", "seconds_since_relevant_change"),
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,10 @@ def hard_stall_threshold_for_task(project_root: Path | str, task_id: str) -> int
         task = None
     if task is not None and task.task_kind == "audit":
         return DEFAULT_AUDIT_HARD_STALL_SECONDS
+    if task is not None:
+        frontend_paths = [path for path in [*task.output_paths, *task.output_tests] if str(path).strip().startswith("frontend/")]
+        if len(frontend_paths) >= 12:
+            return DEFAULT_LARGE_FRONTEND_HARD_STALL_SECONDS
     return DEFAULT_HARD_STALL_SECONDS
 
 
@@ -154,6 +167,8 @@ def seconds_since_relevant_change(project_root: Path | str, task: Task | None, *
 def _runtime_activity_details(runtime_state: dict[str, Any], *, now: dt.datetime) -> dict[str, Any]:
     return {
         "elapsed_seconds": _seconds_since(runtime_state.get("started_at"), now=now),
+        "seconds_since_output": _seconds_since(runtime_state.get("last_output_at"), now=now),
+        "seconds_since_session_update": _seconds_since(runtime_state.get("last_session_update_at"), now=now),
         "seconds_since_tool": _seconds_since(runtime_state.get("last_tool_at"), now=now),
         "seconds_since_mutation": _seconds_since(runtime_state.get("last_mutation_at"), now=now),
         "last_tool_name": str(runtime_state.get("last_tool_name") or "").strip() or None,
@@ -163,6 +178,15 @@ def _runtime_activity_details(runtime_state: dict[str, Any], *, now: dt.datetime
         "runtime_pid": runtime_state.get("runtime_pid"),
         "wrapper_pid": runtime_state.get("wrapper_pid"),
     }
+
+
+def _fresh_activity(details: dict[str, Any], attention_seconds: int) -> list[str]:
+    fresh: list[str] = []
+    for name, field in FRESH_ACTIVITY_FIELDS:
+        value = details.get(field)
+        if value is not None and int(value) < attention_seconds:
+            fresh.append(name)
+    return fresh
 
 
 def classify_running_runtime(
@@ -192,16 +216,12 @@ def classify_running_runtime(
     if elapsed is None or elapsed < attention_seconds:
         return RuntimeLiveness(False, "running", "runtime has not exceeded the attention threshold", details)
 
-    seconds_since_tool = details.get("seconds_since_tool")
-    seconds_since_mutation = details.get("seconds_since_mutation")
-    seconds_since_relevant_change_value = details.get("seconds_since_relevant_change")
     read_only_streak = int(details.get("read_only_streak") or 0)
 
-    recent_tool = seconds_since_tool is not None and seconds_since_tool < attention_seconds
-    recent_mutation = seconds_since_mutation is not None and seconds_since_mutation < attention_seconds
-    recent_file_change = seconds_since_relevant_change_value is not None and seconds_since_relevant_change_value < attention_seconds
-    if recent_tool or recent_mutation or recent_file_change:
-        return RuntimeLiveness(False, "running", "runtime still has recent progress evidence", details)
+    fresh = _fresh_activity(details, attention_seconds)
+    details["fresh_activity"] = fresh
+    if fresh:
+        return RuntimeLiveness(False, "running", "runtime still has recent activity evidence: " + ", ".join(fresh), details)
 
     if read_only_streak >= DEFAULT_READ_ONLY_STREAK:
         return RuntimeLiveness(True, "read_only_stall", "Runtime has a long read-only tool streak without recent mutation or relevant file changes.", details)
@@ -243,15 +263,20 @@ def wrapper_should_interrupt(
     started_monotonic: float,
     now_monotonic: float,
     threshold_seconds: int | None = None,
+    attention_seconds: int = DEFAULT_ATTENTION_SECONDS,
 ) -> RuntimeLiveness:
     threshold = int(threshold_seconds) if threshold_seconds is not None else hard_stall_threshold_for_task(project_root, task_id)
     elapsed = int(max(0, now_monotonic - started_monotonic))
     if elapsed < threshold:
         return RuntimeLiveness(False, "running", "runtime is below the hard stall threshold", {"elapsed_seconds": elapsed})
     last_tool_at = activity.get("last_tool_at")
+    last_output_at = activity.get("last_output_at")
+    last_session_update_at = activity.get("last_session_update_at")
     last_mutation_at = activity.get("last_mutation_at")
     details = {
         "elapsed_seconds": elapsed,
+        "last_output_at": last_output_at or None,
+        "last_session_update_at": last_session_update_at or None,
         "last_tool_at": last_tool_at or None,
         "last_mutation_at": last_mutation_at or None,
         "last_tool_name": activity.get("last_tool_name") or None,
@@ -259,14 +284,24 @@ def wrapper_should_interrupt(
         "read_only_streak": int(activity.get("read_only_streak") or 0),
     }
     current = _now()
+    seconds_since_output = _seconds_since(last_output_at, now=current)
+    seconds_since_session_update = _seconds_since(last_session_update_at, now=current)
     seconds_since_tool = _seconds_since(last_tool_at, now=current)
     seconds_since_mutation = _seconds_since(last_mutation_at, now=current)
+    try:
+        task = next((row for row in all_tasks(project_root) if row.id == str(task_id or "").strip()), None)
+    except Exception:
+        task = None
+    seconds_since_relevant_change_value = seconds_since_relevant_change(project_root, task, now=current)
+    details["seconds_since_output"] = seconds_since_output
+    details["seconds_since_session_update"] = seconds_since_session_update
     details["seconds_since_tool"] = seconds_since_tool
     details["seconds_since_mutation"] = seconds_since_mutation
-    if seconds_since_tool is not None and seconds_since_tool < threshold:
-        return RuntimeLiveness(False, "running", "runtime has recent tool activity", details)
-    if seconds_since_mutation is not None and seconds_since_mutation < threshold:
-        return RuntimeLiveness(False, "running", "runtime has recent mutation activity", details)
+    details["seconds_since_relevant_change"] = seconds_since_relevant_change_value
+    fresh = _fresh_activity(details, attention_seconds)
+    details["fresh_activity"] = fresh
+    if fresh:
+        return RuntimeLiveness(False, "running", "runtime has recent activity evidence: " + ", ".join(fresh), details)
     if int(activity.get("read_only_streak") or 0) >= DEFAULT_READ_ONLY_STREAK:
         return RuntimeLiveness(True, "read_only_stall", "runtime liveness stalled: long read-only streak without progress", details)
     return RuntimeLiveness(True, "silent_stall", "runtime liveness stalled: no recent tool, mutation, or output progress", details)

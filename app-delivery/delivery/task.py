@@ -21,6 +21,7 @@ from .builtin_tasks import (
     needs_frontend_api_audit,
 )
 from .production_gates import PRODUCTION_GATE_TITLE_PREFIX, next_production_gate_task_id, production_gate_task_dict, required_production_gates
+from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root, optional_stack_paths
 from .state import load_gates, load_test_plan, load_work_items, project_paths, save_work_items, utc_now_iso
 
 
@@ -31,26 +32,12 @@ REQ_RANGE_RE = re.compile(
 )
 TASK_ID_RE = re.compile(r"^T\d{3,}$")
 VALID_STATUSES = {"pending", "active", "review_pending", "done", "verified", "blocked", "exception", "cancelled"}
-NON_CANONICAL_BACKEND_ROOT_DIRS = {
-    "api",
-    "agents",
-    "orchestration",
-    "mcp",
-    "simulation",
-    "models",
-    "core",
-    "services",
-    "actions",
-    "infra",
-    "knowledge",
-}
+NON_CANONICAL_BACKEND_ROOT_DIRS = set(PYTHON_REACT_CONTRACT.noncanonical_backend_root_dirs)
 FOUNDATION_SCOPE_PREFIXES = (
     "backend/",
     "backend/pyproject.toml",
     "backend/uv.lock",
-    "backend/src/main.py",
-    "backend/src/runtime/",
-    "backend/src/tests/",
+    *optional_stack_paths(PYTHON_REACT_CONTRACT.backend_entrypoint, f"{PYTHON_REACT_CONTRACT.backend_runtime_root}/", f"{backend_test_root(PYTHON_REACT_CONTRACT)}/"),
     "frontend/package.json",
     "frontend/package-lock.json",
     "frontend/src/lib/",
@@ -62,9 +49,7 @@ FOUNDATION_SCOPE_PREFIXES = (
 SHARED_FOUNDATION_OUTPUT_PATHS = [
     "backend/pyproject.toml",
     "backend/uv.lock",
-    "backend/src/main.py",
-    "backend/src/runtime/",
-    "backend/src/tests/",
+    *optional_stack_paths(PYTHON_REACT_CONTRACT.backend_entrypoint, f"{PYTHON_REACT_CONTRACT.backend_runtime_root}/", f"{backend_test_root(PYTHON_REACT_CONTRACT)}/"),
     "frontend/package.json",
     "frontend/package-lock.json",
     "frontend/pnpm-lock.yaml",
@@ -76,8 +61,8 @@ SHARED_FOUNDATION_OUTPUT_PATHS = [
     "frontend/e2e/",
 ]
 SHARED_FOUNDATION_OUTPUT_TESTS = [
-    "backend/src/tests/test_health.py",
-    "backend/src/tests/test_database.py",
+    f"{backend_test_root(PYTHON_REACT_CONTRACT)}/test_health.py",
+    f"{backend_test_root(PYTHON_REACT_CONTRACT)}/test_database.py",
     "frontend/src/App.test.tsx",
 ]
 FOUNDATION_TITLE_MARKERS = (
@@ -173,6 +158,38 @@ def _normalize_intent(payload: Any) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_technology_constraints(payload: Any) -> list[dict[str, Any]]:
+    rows = payload if isinstance(payload, list) else []
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        ecosystem = str(row.get("ecosystem") or "project").strip().lower() or "project"
+        if not name:
+            continue
+        key = (name.casefold(), ecosystem)
+        if key in seen:
+            continue
+        seen.add(key)
+        requirement = str(row.get("requirement") or "must_use").strip().lower() or "must_use"
+        if requirement not in {"must_use", "should_use", "avoid"}:
+            requirement = "must_use"
+        expected_evidence = row.get("expected_evidence") if isinstance(row.get("expected_evidence"), list) else []
+        normalized.append(
+            {
+                "name": name,
+                "ecosystem": ecosystem,
+                "requirement": requirement,
+                "reason": str(row.get("reason") or "").strip(),
+                "source": str(row.get("source") or "").strip(),
+                "expected_evidence": _dedupe_preserve([str(value).strip() for value in expected_evidence if str(value).strip()]),
+            }
+        )
+    return normalized
+
+
 def _normalize_session_ids(values: Any, current_session_id: str | None = None) -> list[str]:
     raw_values = values if isinstance(values, list) else []
     return _dedupe_preserve(
@@ -187,12 +204,14 @@ def _normalize_contract_path(value: Any) -> str:
     normalized = str(value or "").strip()
     if not normalized:
         return ""
-    if normalized == "backend/app":
-        return "backend/src"
-    if normalized.startswith("backend/app/"):
-        return f"backend/src/{normalized[len('backend/app/') :]}"
-    if normalized == "backend/app/":
-        return "backend/src/"
+    legacy_root = PYTHON_REACT_CONTRACT.legacy_backend_app_root
+    backend_root = PYTHON_REACT_CONTRACT.backend_source_root
+    if legacy_root and normalized == legacy_root:
+        return backend_root
+    if legacy_root and normalized.startswith(legacy_root + "/"):
+        return f"{backend_root}/{normalized[len(legacy_root + '/') :]}"
+    if legacy_root and normalized == legacy_root + "/":
+        return backend_root + "/"
     return normalized
 
 
@@ -204,7 +223,7 @@ def _is_noncanonical_backend_root_path(path: str) -> bool:
 
 def _is_unsupported_top_level_mcp_server_path(path: str) -> bool:
     normalized = _strip_current_dir_prefix(path).rstrip("/")
-    return normalized == "mcp-server" or normalized.startswith("mcp-server/")
+    return any(normalized == root or normalized.startswith(root + "/") for root in PYTHON_REACT_CONTRACT.unsupported_top_level_roots)
 
 
 def _strip_current_dir_prefix(value: str) -> str:
@@ -345,6 +364,7 @@ class Task:
     verified_at: str | None = None
     blocked_reason: str | None = None
     attempts: int = 0
+    technology_constraints: list[dict[str, Any]] | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "Task":
@@ -370,6 +390,7 @@ class Task:
             verified_at=str(payload.get("verified_at") or "").strip() or None,
             blocked_reason=str(payload.get("blocked_reason") or "").strip() or None,
             attempts=int(payload.get("attempts") or 0),
+            technology_constraints=_normalize_technology_constraints(payload.get("technology_constraints")) or None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -393,6 +414,7 @@ class Task:
             "output_tests": self.output_tests,
             "output_paths": self.output_paths,
             "intent": self.intent or None,
+            "technology_constraints": self.technology_constraints or [],
             "blocked_reason": self.blocked_reason,
             "attempts": self.attempts,
         }
@@ -554,6 +576,11 @@ def reset_task(tasks: list[Task], task_id: str, *, blocked_reason: str | None = 
         if task.id != task_id:
             result.append(task)
             continue
+        if task.status == "verified" and task.task_kind != "repair":
+            raise ValueError(
+                f"task {task_id} is already verified; do not reopen verified feature tasks. "
+                "Repair regressions from the current task or a dedicated repair bundle instead."
+            )
         data = task.to_dict()
         data.update(
             {
@@ -667,12 +694,12 @@ def _validate_task_shape(tasks: list[Task]) -> None:
         invalid_backend_paths = [path for path in [*task.output_paths, *task.output_tests] if _is_noncanonical_backend_root_path(path)]
         if invalid_backend_paths:
             oversized.append(
-                f"{task.id} uses backend-root package paths not supported by python-react: {', '.join(invalid_backend_paths)}; use backend/src/..."
+                f"{task.id} uses backend-root package paths not supported by {PYTHON_REACT_CONTRACT.id}: {', '.join(invalid_backend_paths)}; use {PYTHON_REACT_CONTRACT.backend_source_root}/..."
             )
         invalid_mcp_server_paths = [path for path in [*task.output_paths, *task.output_tests] if _is_unsupported_top_level_mcp_server_path(path)]
         if invalid_mcp_server_paths:
             oversized.append(
-                f"{task.id} uses top-level mcp-server paths not supported by python-react: {', '.join(invalid_mcp_server_paths)}; use backend/src/... for production MCP code or mock-server/... for simulated tool services"
+                f"{task.id} uses top-level MCP service paths not supported by {PYTHON_REACT_CONTRACT.id}: {', '.join(invalid_mcp_server_paths)}; use {PYTHON_REACT_CONTRACT.backend_source_root}/... for production MCP code or {PYTHON_REACT_CONTRACT.mock_server_root}/... for simulated tool services"
             )
         if len(task.output_paths) > 20 or len(task.output_tests) > 10:
             oversized.append(
@@ -695,6 +722,60 @@ def _validate_task_shape(tasks: list[Task]) -> None:
             )
     if oversized:
         raise ValueError("task decomposition produced oversized or under-specified tasks: " + ", ".join(oversized))
+
+
+def _raw_task_ref_keys(row: dict[str, Any]) -> set[str]:
+    task_id = str(row.get("id") or "").strip()
+    title = str(row.get("title") or "").strip()
+    values = [task_id, title]
+    shortened = re.sub(r"\s*\([^()]*\)\s*$", "", title).strip()
+    if shortened:
+        values.append(shortened)
+    for separator in (" — ", " - ", ": "):
+        prefix = f"{task_id}{separator}"
+        if title.startswith(prefix):
+            suffix = title[len(prefix) :].strip()
+            if suffix:
+                values.append(suffix)
+                normalized_suffix = re.sub(r"\s*\([^()]*\)\s*$", "", suffix).strip()
+                if normalized_suffix:
+                    values.append(f"{task_id}{separator}{normalized_suffix}")
+    return {_normalized_dependency_key(value) for value in values if value}
+
+
+def _validate_raw_dependency_quality(raw_tasks: list[dict[str, Any]], *, require_graph_edges: bool) -> None:
+    generated_tasks = [row for row in raw_tasks if str(row.get("task_kind") or "feature").strip().casefold() in {"feature", "validation"}]
+    if require_graph_edges and len(generated_tasks) >= 8 and all(not row.get("dependencies") for row in generated_tasks):
+        raise ValueError(
+            "task decomposition produced a flat dependency graph: all generated feature/validation tasks declare no dependencies. "
+            "Add real prerequisite edges for product workflow order, shared contracts, domain sequencing, and validation ownership; do not rely only on the framework-inserted shared foundation task."
+        )
+
+    feature_tasks = [row for row in raw_tasks if str(row.get("task_kind") or "feature").strip().casefold() == "feature"]
+    validation_tasks = [row for row in raw_tasks if str(row.get("task_kind") or "feature").strip().casefold() == "validation"]
+    for validation_task in validation_tasks:
+        validation_requirements = {str(value).strip() for value in validation_task.get("requirements", []) if str(value).strip()}
+        validation_scenarios = {str(value).strip() for value in validation_task.get("acceptance_scenarios", []) if str(value).strip()}
+        if not validation_requirements and not validation_scenarios:
+            continue
+        candidate_features = [
+            row
+            for row in feature_tasks
+            if validation_requirements.intersection(str(value).strip() for value in row.get("requirements", []) if str(value).strip())
+            or validation_scenarios.intersection(str(value).strip() for value in row.get("acceptance_scenarios", []) if str(value).strip())
+        ]
+        if not candidate_features:
+            continue
+        declared_dependencies = {_normalized_dependency_key(value) for value in validation_task.get("dependencies", []) if str(value).strip()}
+        candidate_refs = set().union(*(_raw_task_ref_keys(row) for row in candidate_features)) if candidate_features else set()
+        if declared_dependencies.intersection(candidate_refs):
+            continue
+        validation_label = str(validation_task.get("title") or validation_task.get("id") or "validation task").strip()
+        examples = [str(row.get("title") or row.get("id") or "feature task").strip() for row in candidate_features[:6]]
+        raise ValueError(
+            f"validation task '{validation_label}' must depend on the feature task(s) it validates. "
+            f"Add explicit dependencies to relevant feature tasks such as: {', '.join(examples)}"
+        )
 
 
 def lint_task_contract(task: Task) -> dict[str, list[str]]:
@@ -918,6 +999,7 @@ def decompose_tasks(
     task_ids: set[str] = {task.id for task in normalized_items}
     previous_id = SHARED_FOUNDATION_TASK_ID if include_shared_foundation else SCAFFOLD_TASK_ID
     raw_dependency_map: dict[str, list[str]] = {}
+    raw_task_records: list[dict[str, Any]] = []
     for raw_item in items:
         if not isinstance(raw_item, dict):
             continue
@@ -927,7 +1009,19 @@ def decompose_tasks(
         if not TASK_ID_RE.match(task_id) or task_id in task_ids or task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID}:
             task_id = f"T{next_index:03d}"
         next_index += 1
-        dependencies = [str(value).strip() for value in raw_item.get("dependencies", []) if str(value).strip()]
+        explicit_dependencies = [str(value).strip() for value in raw_item.get("dependencies", []) if str(value).strip()]
+        raw_task_records.append(
+            {
+                "id": task_id,
+                "title": str(raw_item.get("title") or f"Task {task_id}").strip(),
+                "task_kind": str(raw_item.get("task_kind") or "feature").strip() or "feature",
+                "requirements": raw_item.get("requirements", []),
+                "acceptance_scenarios": raw_item.get("acceptance_scenarios", []),
+                "dependencies": explicit_dependencies,
+                "technology_constraints": raw_item.get("technology_constraints", []),
+            }
+        )
+        dependencies = list(explicit_dependencies)
         if not dependencies:
             dependencies = [SHARED_FOUNDATION_TASK_ID if include_shared_foundation else SCAFFOLD_TASK_ID]
         raw_dependency_map[task_id] = dependencies
@@ -943,11 +1037,14 @@ def decompose_tasks(
                 "output_tests": raw_item.get("output_tests", []),
                 "output_paths": raw_item.get("output_paths", []),
                 "intent": raw_item.get("intent") or {},
+                "technology_constraints": raw_item.get("technology_constraints", []),
             }
         )
         normalized_items.append(task)
         task_ids.add(task_id)
         previous_id = task_id
+
+    _validate_raw_dependency_quality(raw_task_records, require_graph_edges=include_shared_foundation)
 
     aliases: dict[str, str] = {}
     for task in normalized_items:

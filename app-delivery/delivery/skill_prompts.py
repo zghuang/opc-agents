@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from .runtime_config import load_project_metadata
+from .stack_contracts import project_stack_guidance_markdown, project_stack_id, stack_guidance_markdown
 
 
 SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
@@ -28,6 +29,12 @@ def render_skill_prompt(name: str, **values: str) -> str:
         metadata = load_project_metadata(str(values.get("project") or "")) if values.get("project") else {}
         dependency_hints = metadata.get("dependency_hints") if isinstance(metadata.get("dependency_hints"), list) else []
         values["dependency_hints_json"] = json.dumps(dependency_hints, indent=2, ensure_ascii=False)
+    if "stack_guidance_md" not in values and "{{stack_guidance_md}}" in text:
+        project = str(values.get("project") or "").strip()
+        values["stack_guidance_md"] = project_stack_guidance_markdown(project) if project else stack_guidance_markdown("python-react")
+    if "stack_id" not in values and "{{stack_id}}" in text:
+        project = str(values.get("project") or "").strip()
+        values["stack_id"] = project_stack_id(project) if project else "python-react"
     for key, value in values.items():
         text = text.replace(f"{{{{{key}}}}}", str(value))
     return text

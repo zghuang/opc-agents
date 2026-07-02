@@ -27,9 +27,7 @@ def test_decompose_tasks_inserts_builtin_foundations(tmp_path: Path) -> None:
     assert payload["items"][1]["output_paths"] == [
         "backend/pyproject.toml",
         "backend/uv.lock",
-        "backend/src/main.py",
-        "backend/src/runtime/",
-        "backend/src/tests/",
+        "backend/tests/",
         "frontend/package.json",
         "frontend/package-lock.json",
         "frontend/pnpm-lock.yaml",
@@ -254,7 +252,7 @@ def test_decompose_tasks_does_not_add_agent_gate_without_agent_requirements(tmp_
     titles = [item["title"] for item in payload["items"]]
     assert "Production Gate: Real agent integration" not in titles
 
-def test_decompose_tasks_normalizes_backend_app_contract_paths(tmp_path: Path) -> None:
+def test_decompose_tasks_preserves_architecture_selected_backend_app_contract_paths(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "requirements.json").write_text(
@@ -288,9 +286,9 @@ def test_decompose_tasks_normalizes_backend_app_contract_paths(tmp_path: Path) -
 
     task = payload["items"][2]
     assert task["output_paths"] == [
-        "backend/src/core/config.py",
-        "backend/src/domain/models.py",
-        "backend/src/main.py",
+        "backend/app/core/config.py",
+        "backend/app/domain/models.py",
+        "backend/app/main.py",
     ]
 
 def test_decompose_tasks_rejects_companion_mock_server_contract_paths(tmp_path: Path) -> None:
@@ -327,7 +325,7 @@ def test_decompose_tasks_rejects_companion_mock_server_contract_paths(tmp_path: 
     else:
         raise AssertionError("expected companion/mock-server paths to be rejected")
 
-def test_decompose_tasks_rejects_top_level_mcp_server_contract_paths(tmp_path: Path) -> None:
+def test_decompose_tasks_allows_architecture_selected_top_level_mcp_server_contract_paths(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "requirements.json").write_text(
@@ -340,27 +338,23 @@ def test_decompose_tasks_rejects_top_level_mcp_server_contract_paths(tmp_path: P
         encoding="utf-8",
     )
 
-    try:
-        decompose_tasks(
-            tmp_path,
-            [
-                {
-                    "title": "MCP tools",
-                    "requirements": ["REQ-001"],
-                    "acceptance_scenarios": [],
-                    "dependencies": ["T001"],
-                    "output_tests": ["mcp-server/tests/test_tools.py"],
-                    "output_paths": ["mcp-server/server.py", "mcp-server/tools/rules.py"],
-                }
-            ],
-            include_shared_foundation=True,
-        )
-    except ValueError as exc:
-        assert "top-level mcp-server paths" in str(exc)
-        assert "backend/src/..." in str(exc)
-        assert "mock-server/..." in str(exc)
-    else:
-        raise AssertionError("expected top-level mcp-server paths to be rejected")
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "MCP tools",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": [],
+                "dependencies": ["T001"],
+                "output_tests": ["mcp-server/tests/test_tools.py"],
+                "output_paths": ["mcp-server/server.py", "mcp-server/tools/rules.py"],
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    task = next(item for item in payload["items"] if item["title"] == "MCP tools")
+    assert task["output_paths"] == ["mcp-server/server.py", "mcp-server/tools/rules.py"]
 
 def test_normalize_complexity_override_requires_task_decompose_metadata() -> None:
     payload = normalize_complexity_override(
@@ -527,14 +521,14 @@ def test_all_tasks_normalizes_existing_t001_contract(tmp_path: Path) -> None:
 
     assert "backend/src/main.py" in tasks["T001"].output_paths
     assert "backend/pyproject.toml" in tasks["T001"].output_paths
-    assert "backend/src/runtime/" in tasks["T001"].output_paths
+    assert "backend/tests/" in tasks["T001"].output_paths
     assert "frontend/src/App.tsx" in tasks["T001"].output_paths
     assert "frontend/package-lock.json" in tasks["T001"].output_paths
     assert "frontend/pnpm-lock.yaml" in tasks["T001"].output_paths
     assert "frontend/e2e/" in tasks["T001"].output_paths
     assert "backend/tests/core/" not in tasks["T001"].output_tests
-    assert "backend/src/tests/test_health.py" in tasks["T001"].output_tests
-    assert "backend/src/tests/test_database.py" in tasks["T001"].output_tests
+    assert "backend/tests/test_health.py" in tasks["T001"].output_tests
+    assert "backend/tests/test_database.py" in tasks["T001"].output_tests
     assert "frontend/src/App.test.tsx" in tasks["T001"].output_tests
 
 def test_check_test_type_coverage_flags_verified_frontend_acceptance_without_browser_evidence(tmp_path: Path) -> None:
@@ -802,6 +796,64 @@ def test_decompose_tasks_default_to_scaffold_not_previous_task(tmp_path: Path) -
     by_id = {item["id"]: item for item in payload["items"]}
     assert by_id["T002"]["dependencies"] == ["T000"]
     assert by_id["T003"]["dependencies"] == ["T000"]
+
+
+def test_decompose_tasks_rejects_flat_dependency_graph_for_shared_foundation_projects(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    requirements = [{"id": f"REQ-{idx:03d}", "title": f"Req {idx}", "summary": "One"} for idx in range(1, 9)]
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": requirements, "acceptance_scenarios": []}), encoding="utf-8")
+    items = [
+        {"title": f"Feature {idx}", "requirements": [f"REQ-{idx:03d}"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [f"backend/tests/test_{idx}.py"], "output_paths": [f"backend/feature_{idx}/"]}
+        for idx in range(1, 9)
+    ]
+
+    try:
+        decompose_tasks(tmp_path, items, include_shared_foundation=True)
+    except ValueError as exc:
+        assert "flat dependency graph" in str(exc)
+        assert "Add real prerequisite edges" in str(exc)
+    else:
+        raise AssertionError("expected flat graph guard to reject all-empty dependencies")
+
+
+def test_decompose_tasks_rejects_validation_task_without_validated_feature_dependency(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+
+    try:
+        decompose_tasks(
+            tmp_path,
+            [
+                {"id": "T010", "title": "Feature", "task_kind": "feature", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/feature/"]},
+                {"id": "T020", "title": "Feature validation", "task_kind": "validation", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_feature_validation.py"], "output_paths": ["docs/reviews/feature-validation.md"]},
+            ],
+            include_shared_foundation=True,
+        )
+    except ValueError as exc:
+        assert "must depend on the feature task(s) it validates" in str(exc)
+        assert "Feature" in str(exc)
+    else:
+        raise AssertionError("expected validation task dependency guard")
+
+
+def test_decompose_tasks_allows_validation_task_with_validated_feature_dependency(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {"id": "T010", "title": "Feature", "task_kind": "feature", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/feature/"]},
+            {"id": "T020", "title": "Feature validation", "task_kind": "validation", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["Feature"], "output_tests": ["backend/tests/test_feature_validation.py"], "output_paths": ["docs/reviews/feature-validation.md"]},
+        ],
+        include_shared_foundation=True,
+    )
+
+    by_title = {item["title"]: item for item in payload["items"]}
+    assert by_title["Feature validation"]["dependencies"] == [by_title["Feature"]["id"]]
 
 def test_decompose_tasks_rejects_oversized_task_shape(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"

@@ -157,6 +157,29 @@ def test_run_task_tests_with_no_output_tests_passes(tmp_path: Path) -> None:
     assert result.failed_count == 0
 
 
+def test_run_task_tests_converts_environment_prepare_errors_to_failures(tmp_path: Path, monkeypatch) -> None:
+    from delivery import verify as verify_module
+
+    def fail_environment(*args, **kwargs):
+        raise RuntimeError("yaml: while parsing a block mapping: did not find expected key")
+
+    monkeypatch.setattr(verify_module, "ensure_task_test_environment", fail_environment)
+
+    result = run_task_tests(
+        tmp_path,
+        {
+            "id": "T007",
+            "requirements": ["REQ-001"],
+            "output_tests": ["frontend/e2e/case-workspace.spec.ts"],
+        },
+    )
+
+    assert result.passed is False
+    assert result.failed_count == 1
+    assert result.failures[0].failure_kind == "environment_prepare_error"
+    assert "yaml: while parsing" in result.failures[0].message
+
+
 def test_run_records_validation_activity_for_status_visibility(tmp_path: Path, monkeypatch) -> None:
     from delivery import verify as verify_module
 
@@ -232,21 +255,28 @@ def test_infer_final_repair_candidates_does_not_guess_from_ecosystem_missing_typ
     assert infer_final_repair_candidates(tmp_path, [], [("NFR-002", "integration")]) == []
 
 
-def test_infer_test_types_marks_backend_suite_as_api_and_integration() -> None:
-    assert infer_test_types(["backend/tests/test_auth/test_login.py"]) == ["api", "integration"]
+def test_infer_test_types_marks_backend_unit_suites_as_unit() -> None:
+    assert infer_test_types(["backend/tests/test_auth/test_login.py"]) == ["unit"]
+    assert infer_test_types(["backend/tests/test_agents/test_base_agent.py"]) == ["unit"]
+    assert infer_test_types(["backend/tests/test_memory/test_case_memory.py"]) == ["unit"]
 
 
 def test_infer_test_types_marks_backend_core_and_src_tests_as_unit() -> None:
     assert infer_test_types(["backend/tests/core/test_database.py"]) == ["unit"]
+    assert infer_test_types(["backend/tests/test_core/test_otif_engine.py"]) == ["unit"]
     assert infer_test_types(["backend/src/tests/test_health.py"]) == ["unit"]
 
 
-def test_infer_test_types_marks_backend_feature_src_tests_as_api() -> None:
-    assert infer_test_types(["backend/src/tests/test_auth/test_login.py"]) == ["api"]
+def test_infer_test_types_marks_backend_feature_tests_as_api_and_integration() -> None:
+    assert infer_test_types(["backend/tests/test_api/test_login.py"]) == ["api", "integration"]
+
+
+def test_infer_test_types_marks_backend_performance_suite_as_performance() -> None:
+    assert infer_test_types(["backend/tests/test_ingestion/test_performance.py"]) == ["performance", "unit"]
 
 
 def test_infer_test_types_marks_frontend_e2e_specs_as_browser_and_e2e() -> None:
-    assert infer_test_types(["frontend/e2e/auth.spec.ts"]) == ["browser", "e2e"]
+    assert infer_test_types(["frontend/e2e/auth.spec.ts"]) == ["browser", "e2e", "integration"]
 
 
 def test_infer_test_types_marks_mock_server_suites_as_integration_and_contract() -> None:
@@ -463,23 +493,56 @@ def test_run_full_suite_adds_frontend_quality_gate_commands(tmp_path: Path) -> N
 def test_command_for_frontend_e2e_spec_auto_wires_backend_when_template_backend_exists(tmp_path: Path) -> None:
     (tmp_path / "frontend").mkdir(parents=True)
     (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")
-    (tmp_path / "backend" / "src").mkdir(parents=True)
+    (tmp_path / "backend").mkdir(parents=True)
     (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
-    (tmp_path / "backend" / "src" / "main.py").write_text("app = object()\n", encoding="utf-8")
+    (tmp_path / "backend" / "main.py").write_text("app = object()\n", encoding="utf-8")
 
     command = _command_for_test_spec(tmp_path, "frontend/e2e/app-shell.spec.ts")
 
     assert "E2E_BACKEND_CMD=" in command[2]
     assert "VITE_API_PROXY_TARGET=http://127.0.0.1:8000" in command[2]
-    assert "uvicorn src.main:app --host 127.0.0.1 --port 8000" in command[2]
+    assert "uvicorn main:app --host 127.0.0.1 --port 8000" in command[2]
+
+
+def test_command_for_frontend_e2e_spec_auto_wires_package_backend_entrypoint(tmp_path: Path) -> None:
+    (tmp_path / "frontend").mkdir(parents=True)
+    (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "backend" / "otif").mkdir(parents=True)
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "backend" / "otif" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "otif" / "main.py").write_text("app = object()\n", encoding="utf-8")
+
+    command = _command_for_test_spec(tmp_path, "frontend/e2e/app-shell.spec.ts")
+
+    assert "E2E_BACKEND_CMD=" in command[2]
+    assert "uvicorn otif.main:app --host 127.0.0.1 --port 8000" in command[2]
+
+
+def test_command_for_frontend_e2e_spec_discovers_nested_package_backend_entrypoint(tmp_path: Path) -> None:
+    (tmp_path / "frontend").mkdir(parents=True)
+    (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "backend" / "src" / "platform" / "api").mkdir(parents=True)
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    for package_dir in [
+        tmp_path / "backend" / "src",
+        tmp_path / "backend" / "src" / "platform",
+        tmp_path / "backend" / "src" / "platform" / "api",
+    ]:
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "src" / "platform" / "api" / "main.py").write_text("app = object()\n", encoding="utf-8")
+
+    command = _command_for_test_spec(tmp_path, "frontend/e2e/app-shell.spec.ts")
+
+    assert "E2E_BACKEND_CMD=" in command[2]
+    assert "uvicorn platform.api.main:app --host 127.0.0.1 --port 8000" in command[2]
 
 
 def test_command_for_npm_e2e_runs_in_frontend_with_backend_env_when_available(tmp_path: Path) -> None:
     (tmp_path / "frontend").mkdir(parents=True)
     (tmp_path / "frontend" / "package.json").write_text("{}\n", encoding="utf-8")
-    (tmp_path / "backend" / "src").mkdir(parents=True)
+    (tmp_path / "backend").mkdir(parents=True)
     (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
-    (tmp_path / "backend" / "src" / "main.py").write_text("app = object()\n", encoding="utf-8")
+    (tmp_path / "backend" / "main.py").write_text("app = object()\n", encoding="utf-8")
 
     command = _command_for_test_spec(tmp_path, "npm run e2e")
 

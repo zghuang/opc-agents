@@ -37,6 +37,35 @@ def test_cmd_start_requires_external_spec_review_from_requirements(tmp_path: Pat
     assert exc_info.value.details["requirements_path"] == str(requirements.resolve())
     assert (tmp_path / "docs" / "requirements-source.md").read_text(encoding="utf-8") == "# Raw requirements\n"
 
+def test_spec_review_prompt_treats_source_ids_as_traceability_not_always_canonical() -> None:
+    prompt = render_skill_prompt("spec-review.md", source_document="# Requirements\n\n- REQ-001: Large capability bucket\n")
+
+    assert "Preserve a source REQ- or NFR-style ID as the canonical requirement ID only when" in prompt
+    assert "source_requirement_ids" in prompt
+    assert "fields, UI fragments, endpoint fragments" in prompt
+    assert "Do not invent domain-specific canonical ID prefixes" in prompt
+
+
+def test_cmd_spec_review_rejects_domain_specific_canonical_requirement_ids(tmp_path: Path) -> None:
+    input_path = tmp_path / "spec-review.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "OTIF-001", "title": "OTIF", "summary": "Domain-labeled ID should not be canonical."}],
+                "acceptance_scenarios": [],
+                "clarifications": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_spec_review(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert exc_info.value.code == "input_invalid_shape"
+    assert "REQ-###/NFR-###" in exc_info.value.message
+    assert exc_info.value.details["invalid_requirement_ids"] == ["OTIF-001"]
+
 def test_cmd_spec_review_archives_source_requirements_when_payload_includes_path(tmp_path: Path) -> None:
     requirements = tmp_path / "raw-req.md"
     requirements.write_text("# Raw requirements\n", encoding="utf-8")
@@ -205,7 +234,7 @@ def test_cmd_control_tolerates_project_summary_refresh_failure(tmp_path: Path, m
     result = cli.cmd_control(
         argparse.Namespace(
             project=str(tmp_path),
-            goal="auto",
+            goal="step",
             requirements=None,
             task_id=None,
             runtime=None,
@@ -920,7 +949,7 @@ def test_cmd_control_auto_stops_when_final_repair_task_is_missing(tmp_path: Path
     result = cli.cmd_control(
         argparse.Namespace(
             project=str(project_root),
-            goal="auto",
+            goal="step",
             requirements=None,
             task_id=None,
             runtime=None,
@@ -978,6 +1007,14 @@ def test_cmd_control_auto_executes_repair_task_for_blocked_final_verify(tmp_path
 
     monkeypatch.setattr(cli, "_run_fix_once", fake_run_fix_once)
     monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+    import delivery.control_plane as control_plane
+    monkeypatch.setattr(control_plane, "requirements_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "blocking_clarifications_present", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "architecture_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "ui_required", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "context_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_items_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_item_contract_errors", lambda project_root: {})
     monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
 
     result = cli.cmd_control(
@@ -1024,7 +1061,105 @@ def test_cmd_control_auto_defers_host_review_step_to_outer_host(tmp_path: Path, 
     result = cli.cmd_control(
         argparse.Namespace(
             project=str(tmp_path),
-            goal="auto",
+            goal="step",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert len(payload["executed_steps"]) == 1
+    assert payload["executed_steps"][0]["owner"] == "host"
+    assert payload["executed_steps"][0]["action"] == "run_code_review"
+    assert payload["executed_steps"][0]["deferred_to_host"] is True
+    assert payload["next_step"]["owner"] == "host"
+
+
+def test_cmd_control_auto_records_waiting_for_host_without_spawning_watchdog(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
+    snapshots = [
+        {
+            "control_status": "in_progress",
+            "must_continue": True,
+            "next_step": {
+                "owner": "host",
+                "action": "run_code_review",
+                "skill": "code-review",
+                "task_id": "T002",
+                "prompt": "review prompt",
+                "expected_input_path": str(input_path),
+            },
+        },
+    ]
+    spawned: list[str] = []
+
+    def fake_run_control(project_root, *, goal, requirements_path=None, repair_task_id=None):
+        return dict(snapshots.pop(0))
+
+    monkeypatch.setattr(cli, "run_control", fake_run_control)
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: True)
+    monkeypatch.setattr(cli, "spawn_watchdog", lambda project_root: spawned.append(str(project_root)) or 123)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="step",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    state = json.loads((tmp_path / ".app-delivery-runtime" / "watchdog-state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert payload["executed_steps"][0]["deferred_to_host"] is True
+    assert spawned == []
+    assert state["status"] == "waiting_for_host"
+    assert state["last_action"] == "run_code_review"
+    assert state["skill"] == "code-review"
+    assert state["task_id"] == "T002"
+    assert state["expected_input_path"] == str(input_path)
+
+
+def test_cmd_control_step_executes_one_framework_step(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    snapshots = [
+        {
+            "control_status": "in_progress",
+            "must_continue": True,
+            "next_step": {"owner": "framework", "action": "run_scaffold"},
+        },
+        {
+            "control_status": "in_progress",
+            "must_continue": True,
+            "next_step": {"owner": "framework", "action": "run_resume"},
+        },
+    ]
+    calls: list[str] = []
+
+    def fake_run_control(project_root, *, goal, requirements_path=None, repair_task_id=None):
+        return dict(snapshots.pop(0))
+
+    def fake_execute(step, args):
+        calls.append(str(step.get("action") or ""))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(cli, "run_control", fake_run_control)
+    monkeypatch.setattr(cli, "_execute_framework_control_step", fake_execute)
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="step",
             requirements=None,
             task_id=None,
             runtime=None,
@@ -1036,11 +1171,79 @@ def test_cmd_control_auto_defers_host_review_step_to_outer_host(tmp_path: Path, 
 
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
+    assert calls == ["run_scaffold"]
     assert len(payload["executed_steps"]) == 1
-    assert payload["executed_steps"][0]["owner"] == "host"
-    assert payload["executed_steps"][0]["action"] == "run_code_review"
-    assert payload["executed_steps"][0]["deferred_to_host"] is True
-    assert payload["next_step"]["owner"] == "host"
+    assert payload["executed_steps"][0]["action"] == "run_scaffold"
+    assert payload["next_step"]["action"] == "run_resume"
+
+
+def test_cmd_control_auto_repairs_exception_blocking_all_pending_tasks_once(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from delivery.state import save_work_items
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T001", "title": "Foundation", "status": "exception", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/shared.py"], "attempts": 3},
+                {"id": "T002", "title": "Feature A", "status": "pending", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": [], "output_paths": ["backend/a.py"]},
+                {"id": "T003", "title": "Feature B", "status": "pending", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": [], "output_paths": ["backend/b.py"]},
+                {"id": "T-FINAL", "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T003"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+    calls: list[str] = []
+
+    def fake_run_fix_once(project_root, task_id, runtime, no_start=False, spawn_watchdog_after=True):
+        from delivery.task import all_tasks, reset_task, save_tasks
+
+        calls.append(task_id)
+        save_tasks(project_root, reset_task(all_tasks(project_root), task_id))
+        return {"status": "reset", "task_id": task_id, "no_start": no_start}
+
+    monkeypatch.setattr(cli, "_run_fix_once", fake_run_fix_once)
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+    import delivery.control_plane as control_plane
+    monkeypatch.setattr(control_plane, "requirements_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "blocking_clarifications_present", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "architecture_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "ui_required", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "context_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_items_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_item_contract_errors", lambda project_root: {})
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="step",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    state = json.loads((tmp_path / ".app-delivery-runtime" / "auto-exception-repair.json").read_text(encoding="utf-8"))
+    assert result == 0
+    assert calls == ["T001"]
+    assert payload["executed_steps"][0]["action"] == "auto_repair_exception"
+    assert payload["executed_steps"][0]["result"] == {"status": "reset", "task_id": "T001", "no_start": True}
+    assert "T001" in state["attempts"]
+
+    from delivery.task import all_tasks, mark_task, save_tasks
+    save_tasks(tmp_path, mark_task(all_tasks(tmp_path), "T001", "exception", attempts=3))
+
+    payload_again = control_plane.routed_status(tmp_path)
+    assert calls == ["T001"]
+    assert payload_again["control_status"] == "blocked"
+    assert payload_again["next_step"] is None
 
 def test_cmd_control_auto_imports_ready_host_review_artifact(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
@@ -1266,7 +1469,7 @@ def test_cmd_control_auto_defers_stale_host_review_input_until_new_review_arrive
     )
 
     payload = json.loads(capsys.readouterr().out)
-    assert result == 0
+    assert result == 1
     assert imported == []
     assert payload["executed_steps"][0]["owner"] == "host"
     assert payload["executed_steps"][0]["action"] == "run_code_review"
@@ -1872,6 +2075,32 @@ def test_routed_status_ignores_stale_final_blocker_until_regular_tasks_finish(tm
     assert payload["next_step"]["action"] == "run_resume"
     assert payload["next_step"]["task_id"] == "T003"
 
+def test_routed_status_resumes_interrupted_active_task(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.control_plane._planning_blocker_code", lambda project_root: None)
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T006", "title": "Case workbench", "status": "active", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/incidents.spec.ts"], "output_paths": ["frontend/src/routes/incidents.tsx"]},
+            ],
+        },
+    )
+    save_task_runtime_state(tmp_path, "T006", {"status": "running", "runtime_pid": 0, "wrapper_pid": 0})
+
+    payload = cli.routed_status(tmp_path)
+
+    assert payload["active_task"]["runtime_state"]["status"] == "interrupted"
+    assert payload["control_status"] == "in_progress"
+    assert payload["must_continue"] is True
+    assert payload["next_step"]["action"] == "run_resume"
+    assert payload["next_step"]["task_id"] == "T006"
+    assert payload["next_step"]["runtime_status"] == "interrupted"
+
 def test_cmd_control_auto_stops_when_final_task_is_blocked(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -2057,6 +2286,76 @@ def test_status_reports_verified_task_without_evidence_without_reopening(tmp_pat
     }
     persisted = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     assert all(item["status"] == "verified" for item in persisted["items"])
+
+def test_status_reports_verified_task_with_mock_only_browser_e2e_as_invalid(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.loop_gitops.git_commit_timestamp", lambda project_root, commit: "2026-06-24T00:00:00Z")
+    docs_dir = tmp_path / "docs" / "reviews"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "code-review-T002.md").write_text("status: pass\nreview_type: code\n", encoding="utf-8")
+    (tmp_path / "frontend" / "e2e").mkdir(parents=True)
+    (tmp_path / "frontend" / "e2e" / "case.spec.ts").write_text(
+        "import { test } from '@playwright/test'\n"
+        "test('case flow', async ({ page }) => {\n"
+        "  await page.route('**/api/incidents', route => route.fulfill({ status: 200, body: '{}' }))\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Cases", "status": "verified", "git_commit": "abc123", "review_status": "pass", "review_artifact": "docs/reviews/code-review-T002.md", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/case.spec.ts"], "output_paths": ["frontend/src/routes/cases.tsx"]},
+            ],
+        },
+    )
+
+    payload = loop_status(tmp_path)
+
+    assert payload["invalid_verified_tasks"] == {
+        "T002": "frontend/e2e/case.spec.ts uses Playwright route fulfillment for project-owned API calls without route passthrough; mocked browser proof is not real backend E2E evidence"
+    }
+
+def test_routed_status_reports_invalid_verified_task_without_blocking_next_task(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.loop_gitops.git_commit_timestamp", lambda project_root, commit: "2026-06-24T00:00:00Z")
+    monkeypatch.setattr("delivery.control_plane._planning_blocker_code", lambda project_root: None)
+    docs_dir = tmp_path / "docs" / "reviews"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "code-review-T002.md").write_text("status: pass\nreview_type: code\n", encoding="utf-8")
+    (tmp_path / "frontend" / "e2e").mkdir(parents=True)
+    (tmp_path / "frontend" / "e2e" / "case.spec.ts").write_text(
+        "import { test } from '@playwright/test'\n"
+        "test('case flow', async ({ page }) => {\n"
+        "  await page.route('**/api/incidents', route => route.fulfill({ status: 200, body: '{}' }))\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": [], "git_commit": "base"},
+                {"id": "T002", "title": "Cases", "status": "verified", "git_commit": "abc123", "review_status": "pass", "review_artifact": "docs/reviews/code-review-T002.md", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/case.spec.ts"], "output_paths": ["frontend/src/routes/cases.tsx"]},
+                {"id": "T003", "title": "Downstream", "status": "pending", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": ["backend/tests/test_api/test_downstream.py"], "output_paths": ["backend/src/downstream.py"]},
+            ],
+        },
+    )
+
+    payload = cli.routed_status(tmp_path)
+
+    assert payload["next_task"]["id"] == "T003"
+    assert payload["invalid_verified_tasks"]
+    assert payload["control_status"] == "in_progress"
+    assert payload["must_continue"] is True
+    assert payload["next_step"]["action"] == "run_resume"
+    assert payload["next_step"]["task_id"] == "T003"
 
 def test_cmd_start_stops_on_blocking_clarification(tmp_path: Path, monkeypatch) -> None:
     docs_dir = tmp_path / "docs"

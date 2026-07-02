@@ -6,7 +6,7 @@ from pathlib import Path
 from delivery.builtin_tasks import FINAL_VERIFY_TASK_ID, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from delivery.state import save_gates, save_test_plan, save_test_results, save_work_items
 from delivery.task import Task, check_requirements_coverage, check_test_type_coverage, decompose_tasks, lint_task_contract, mark_task, pick_next_task, referenced_req_ids, reset_task
-from delivery.gates import normalize_complexity_override, normalize_stage_gates, refresh_gates, validate_validation_tasks, validate_gate_references
+from delivery.gates import accept_gate, normalize_complexity_override, normalize_stage_gates, refresh_gates, validate_validation_tasks, validate_gate_references
 
 
 def test_refresh_gates_marks_gate_verified_when_scope_and_validation_evidence_pass(tmp_path: Path) -> None:
@@ -87,6 +87,70 @@ def test_refresh_gates_marks_gate_verified_when_scope_and_validation_evidence_pa
     assert gate["report_artifact"] == "docs/reviews/gate-report-GATE-auth.md"
     assert (tmp_path / "docs" / "reviews" / "gate-report-GATE-auth.md").exists()
 
+
+def test_refresh_gates_accepts_api_and_integration_as_e2e_coverage(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "API flow", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_flow.py"], "output_paths": ["backend/src/flow.py"], "review_status": "pass"},
+            ],
+        },
+    )
+    save_gates(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "complexity": {"tier": "M", "score": 0, "signals": {}, "source": "task-decompose"},
+            "gates": [
+                {
+                    "id": "GATE-api-flow",
+                    "kind": "module",
+                    "title": "API flow gate",
+                    "status": "pending",
+                    "scope_tasks": ["T002"],
+                    "scope_requirements": ["REQ-001"],
+                    "required_test_types": ["e2e"],
+                    "source": "task-decompose",
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "results": [
+                {
+                    "task_id": "T002",
+                    "timestamp": "2026-06-24T00:00:00Z",
+                    "test_files": ["backend/tests/test_flow.py"],
+                    "test_types": ["api", "integration"],
+                    "requirement_ids": ["REQ-001"],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                },
+            ],
+            "full_suite_results": {"passed": True, "scores": {}},
+        },
+    )
+
+    payload = refresh_gates(tmp_path)
+
+    gate = payload["gates"][0]
+    assert gate["status"] == "verified"
+    assert gate["observed_test_types"] == ["api", "integration"]
+    assert gate["missing_test_types"] == []
+
 def test_refresh_gates_marks_gate_blocked_and_suggests_repairs_when_evidence_is_missing(tmp_path: Path) -> None:
     save_work_items(
         tmp_path,
@@ -152,6 +216,72 @@ def test_refresh_gates_marks_gate_blocked_and_suggests_repairs_when_evidence_is_
     assert gate["report_artifact"] == "docs/reviews/gate-report-GATE-auth.md"
     text = (tmp_path / "docs" / "reviews" / "gate-report-GATE-auth.md").read_text(encoding="utf-8")
     assert "Missing test types: browser" in text
+
+
+def test_accept_gate_persists_manual_override_through_refresh(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Auth feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_auth/test_login.py"], "output_paths": ["backend/src/auth/service.py"], "review_status": "pass"},
+            ],
+        },
+    )
+    save_gates(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "complexity": {"tier": "M", "score": 0, "signals": {}, "source": "task-decompose"},
+            "gates": [
+                {
+                    "id": "GATE-auth",
+                    "kind": "module",
+                    "title": "Auth gate",
+                    "status": "blocked",
+                    "scope_tasks": ["T002"],
+                    "scope_requirements": ["REQ-001"],
+                    "required_test_types": ["api", "browser"],
+                    "source": "task-decompose",
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "results": [
+                {
+                    "task_id": "T002",
+                    "timestamp": "2026-06-24T00:00:00Z",
+                    "test_files": ["backend/tests/test_auth/test_login.py"],
+                    "test_types": ["api"],
+                    "requirement_ids": ["REQ-001"],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                },
+            ],
+            "full_suite_results": {"passed": False, "scores": {}},
+        },
+    )
+
+    payload = accept_gate(tmp_path, "GATE-auth", reason="Host accepted API coverage for this module.")
+    refreshed = refresh_gates(tmp_path)
+
+    for gate in (payload["gates"][0], refreshed["gates"][0]):
+        assert gate["status"] == "verified"
+        assert gate["manual_override"]["reason"] == "Host accepted API coverage for this module."
+        assert gate["missing_test_types"] == ["browser"]
+        assert gate["repair_candidates"] == []
 
 def test_refresh_gates_waits_for_pending_validation_task_before_reopening_verified_scope_task(tmp_path: Path) -> None:
     save_work_items(
@@ -511,8 +641,8 @@ def test_refresh_gates_normalizes_supplychain_auth_results_to_api_and_browser(tm
                 {
                     "task_id": "T002",
                     "timestamp": "2026-06-24T00:00:00Z",
-                    "test_files": ["backend/src/tests/test_auth/test_login.py", "frontend/e2e/auth.spec.ts"],
-                    "test_types": ["unit", "e2e"],
+                    "test_files": ["backend/tests/test_auth/test_login.py", "frontend/e2e/auth.spec.ts"],
+                    "test_types": ["e2e"],
                     "requirement_ids": ["REQ-001"],
                     "passed": True,
                     "passed_count": 3,
@@ -528,6 +658,6 @@ def test_refresh_gates_normalizes_supplychain_auth_results_to_api_and_browser(tm
     payload = refresh_gates(tmp_path)
 
     gate = payload["gates"][0]
-    assert gate["observed_test_types"] == ["api", "browser", "e2e", "unit"]
+    assert gate["observed_test_types"] == ["api", "browser", "e2e", "integration"]
     assert gate["missing_test_types"] == []
 

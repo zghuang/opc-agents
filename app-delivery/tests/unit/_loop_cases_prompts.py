@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from delivery.loop import DeliveryLoop
 from delivery.loop import recover
 from delivery.loop_gitops import git_commit_task, task_scope_delta
@@ -62,6 +64,95 @@ def test_review_payload_validation_reports_multiple_schema_errors() -> None:
     assert "findings[1].severity must be one of" in message
     assert "requirement_assessment status for REQ-001 must be one of" in message
     assert "acceptance_assessment must be provided as an array" in message
+
+
+def test_review_payload_normalizes_legacy_finding_aliases() -> None:
+    from delivery.task import Task
+
+    task = Task("T002", "Login", "review_pending", ["REQ-001"], [], [], [], [])
+    payload = {
+        "status": "changes_requested",
+        "summary": "Needs polish.",
+        "findings": [
+            {
+                "severity": "advisory",
+                "category": "style",
+                "file_path": "src/login.py",
+                "description": "Use the shared formatter.",
+                "recommendation": "Run the project formatter.",
+                "requirement_ids": ["REQ-001"],
+            }
+        ],
+        "requirement_assessment": [{"id": "REQ-001", "status": "changes_requested", "notes": "Formatting still differs."}],
+        "acceptance_assessment": [],
+    }
+
+    parsed = _validate_pass_review_matrix(task, payload)
+
+    assert parsed["findings"] == [
+        {
+            "severity": "non_blocking",
+            "requirement_ids": ["REQ-001"],
+            "acceptance_ids": [],
+            "message": "Use the shared formatter.",
+        }
+    ]
+
+def test_review_payload_requires_technology_assessment_for_constraints() -> None:
+    from delivery.task import Task
+
+    task = Task.from_dict(
+        {
+            "id": "T009",
+            "title": "Orchestrator",
+            "status": "review_pending",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": [],
+            "output_paths": ["backend/otif/workflows/incident_workflow.py"],
+            "technology_constraints": [{"name": "LangGraph", "ecosystem": "backend", "requirement": "must_use"}],
+        }
+    )
+    payload = {
+        "status": "pass",
+        "summary": "Looks good.",
+        "findings": [],
+        "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+        "acceptance_assessment": [],
+    }
+
+    with pytest.raises(ValueError, match="technology_assessment must be provided"):
+        _validate_pass_review_matrix(task, payload)
+
+def test_review_payload_accepts_passing_technology_assessment_with_evidence() -> None:
+    from delivery.task import Task
+
+    task = Task.from_dict(
+        {
+            "id": "T009",
+            "title": "Orchestrator",
+            "status": "review_pending",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": [],
+            "output_paths": ["backend/otif/workflows/incident_workflow.py"],
+            "technology_constraints": [{"name": "LangGraph", "ecosystem": "backend", "requirement": "must_use"}],
+        }
+    )
+    payload = {
+        "status": "pass",
+        "summary": "Looks good.",
+        "findings": [],
+        "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+        "acceptance_assessment": [],
+        "technology_assessment": [{"name": "LangGraph", "status": "pass", "evidence": ["backend/pyproject.toml", "StateGraph import"], "notes": "Implemented with LangGraph."}],
+    }
+
+    parsed = _validate_pass_review_matrix(task, payload)
+
+    assert parsed["technology_assessment"] == payload["technology_assessment"]
 
 def test_write_code_review_request_preserves_timestamp_when_content_is_unchanged(tmp_path: Path) -> None:
     from delivery.task import Task
@@ -459,7 +550,7 @@ def test_build_code_review_request_includes_task_intent(tmp_path: Path) -> None:
     assert "Objective: Enable users to review cases." in prompt
     assert "Use task intent only for purpose" in prompt
 
-def test_build_task_prompt_includes_dependency_hints(tmp_path: Path) -> None:
+def test_build_task_prompt_ignores_project_dependency_hints_without_task_constraints(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "requirements.json").write_text(
@@ -501,7 +592,7 @@ def test_build_task_prompt_includes_dependency_hints(tmp_path: Path) -> None:
     assert "Project technology constraints for this task:" not in prompt
     assert "Ant Design" not in prompt
 
-def test_build_code_review_prompt_includes_dependency_hints(tmp_path: Path) -> None:
+def test_build_code_review_prompt_includes_structured_technology_constraints(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "requirements.json").write_text(
@@ -513,36 +604,38 @@ def test_build_code_review_prompt_includes_dependency_hints(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    (docs_dir / "project-bootstrap.json").write_text(
-        json.dumps(
-            {
-                "runtime": "claude",
-                "dependency_hints": [
-                    {"ecosystem": "backend", "name": "FastAPI Users", "reason": "Requirements explicitly call for this auth library."}
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
     from delivery.task import Task
 
     prompt = build_code_review_request(
         tmp_path,
-        Task(
-            "T021",
-            "Auth API",
-            "pending",
-            ["REQ-001"],
-            ["AS-001"],
-            [],
-            ["backend/tests/test_auth/test_login.py"],
-            ["backend/src/auth/router.py", "backend/src/auth/service.py"],
+        Task.from_dict(
+            {
+                "id": "T021",
+                "title": "Auth API",
+                "status": "pending",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": ["AS-001"],
+                "dependencies": [],
+                "output_tests": ["backend/tests/test_auth/test_login.py"],
+                "output_paths": ["backend/src/auth/router.py", "backend/src/auth/service.py"],
+                "technology_constraints": [
+                    {
+                        "name": "FastAPI Users",
+                        "ecosystem": "backend",
+                        "requirement": "must_use",
+                        "reason": "Architecture selects this auth library.",
+                        "source": "docs/architecture.md",
+                        "expected_evidence": ["dependency manifest includes fastapi-users", "auth router uses the library"],
+                    }
+                ],
+            }
         ),
     )
 
-    assert "Project technology constraints to verify:" in prompt
-    assert "FastAPI Users" in prompt
-    assert "Require implementation evidence or an explicit superseding ADR/clarification." in prompt
+    assert "Technology constraints to verify:" in prompt
+    assert "FastAPI Users (backend, must_use): Architecture selects this auth library." in prompt
+    assert "dependency manifest includes fastapi-users" in prompt
+    assert "technology_assessment" in prompt
 
 def test_build_fix_prompt_reanchors_repairs_to_project_contract(tmp_path: Path) -> None:
     from delivery.task import Task
@@ -569,6 +662,32 @@ def test_build_fix_prompt_reanchors_repairs_to_project_contract(tmp_path: Path) 
     assert "cd backend && uv run pytest" in prompt
     assert "frontend/package.json" in prompt
 
+def test_build_task_prompt_includes_browser_e2e_backend_env_prefix(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    (tmp_path / "backend" / "otif").mkdir(parents=True)
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "backend" / "otif" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "otif" / "main.py").write_text("app = object()\n", encoding="utf-8")
+
+    prompt = build_task_prompt(
+        tmp_path,
+        Task(
+            "T006",
+            "Case workbench",
+            "pending",
+            ["REQ-001"],
+            [],
+            [],
+            ["frontend/e2e/incidents.spec.ts"],
+            ["frontend/src/routes/incidents.tsx"],
+        ),
+    )
+
+    assert "Browser/e2e validation" in prompt
+    assert "E2E_BACKEND_CMD=" in prompt
+    assert "uv run uvicorn otif.main:app --host 127.0.0.1 --port 8000" in prompt
+
 def test_build_stalled_recovery_prompt_focuses_on_existing_work_and_stall_evidence(tmp_path: Path) -> None:
     from delivery.task import Task
 
@@ -593,6 +712,34 @@ def test_build_stalled_recovery_prompt_focuses_on_existing_work_and_stall_eviden
     assert "Last tool event: todowrite" in prompt
     assert "Do not re-scan the whole repository from scratch" in prompt
     assert "Continue from the existing implementation already on disk" in prompt
+
+def test_build_stalled_recovery_prompt_includes_browser_e2e_backend_env_prefix(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    (tmp_path / "backend" / "otif").mkdir(parents=True)
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "backend" / "otif" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "otif" / "main.py").write_text("app = object()\n", encoding="utf-8")
+
+    prompt = build_stalled_recovery_prompt(
+        tmp_path,
+        Task(
+            "T006",
+            "Case workbench",
+            "active",
+            ["REQ-001"],
+            [],
+            [],
+            ["backend/tests/test_api/test_incidents.py", "frontend/e2e/incidents.spec.ts"],
+            ["backend/otif/api/incidents.py", "frontend/src/routes/incidents.tsx"],
+        ),
+        runtime_state={"session_id": "ses-op-stall", "started_at": "2026-06-24T00:00:00Z"},
+        runtime_attention={"kind": "silent_stall", "message": "Runtime is still alive but has not produced progress."},
+    )
+
+    assert "Browser/e2e validation" in prompt
+    assert "E2E_BACKEND_CMD=" in prompt
+    assert "uv run uvicorn otif.main:app --host 127.0.0.1 --port 8000" in prompt
 
 def test_build_task_prompt_filters_recent_failures_to_task_scope(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
@@ -710,8 +857,8 @@ def test_build_task_prompt_uses_project_context_reference_for_manifest_tasks(tmp
     )
 
     assert "Project dependency hints from requirements:" not in prompt
-    assert "Project technology constraints for this task:" in prompt
-    assert "LangGraph" in prompt
+    assert "Required technology constraints for this task:" not in prompt
+    assert "LangGraph" not in prompt
     assert "Tech Design` section in AGENTS.md / CLAUDE.md" in prompt
     assert "Resolve exact packages deliberately" in prompt
 

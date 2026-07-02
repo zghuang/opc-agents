@@ -5,10 +5,12 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import datetime as dt
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +42,86 @@ READ_ONLY_TOOL_NAMES = {
     "find",
     "view",
 }
+
+
+def _utc_iso_from_epoch_ms(value: int | float | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        timestamp = float(value) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _opencode_data_dir() -> Path:
+    raw = os.environ.get("XDG_DATA_HOME")
+    base = Path(raw).expanduser() if raw else Path.home() / ".local" / "share"
+    return base / "opencode"
+
+
+def _opencode_db_candidates() -> list[Path]:
+    data_dir = _opencode_data_dir()
+    configured = os.environ.get("OPENCODE_DB")
+    if configured:
+        if configured == ":memory:":
+            return []
+        configured_path = Path(configured).expanduser()
+        return [configured_path if configured_path.is_absolute() else data_dir / configured_path]
+    candidates = [data_dir / "opencode.db"]
+    candidates.extend(sorted(path for path in data_dir.glob("opencode-*.db") if path not in candidates))
+    return candidates
+
+
+def _opencode_session_updated_at(session_id: str) -> str | None:
+    session = str(session_id or "").strip()
+    if not session:
+        return None
+    for db_path in _opencode_db_candidates():
+        if not db_path.exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.1)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT max(updated_at)
+                    FROM (
+                      SELECT max(time_updated) AS updated_at FROM session WHERE id = ?
+                      UNION ALL
+                      SELECT max(time_updated) AS updated_at FROM message WHERE session_id = ?
+                      UNION ALL
+                      SELECT max(time_updated) AS updated_at FROM part WHERE session_id = ?
+                    )
+                    """,
+                    (session, session, session),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        value = row[0] if row else None
+        updated = _utc_iso_from_epoch_ms(value)
+        if updated:
+            return updated
+    return None
+
+
+def _claude_project_slug(project_root: Path | str) -> str:
+    text = str(Path(project_root).expanduser().resolve())
+    return text.replace("/", "-") or "-"
+
+
+def _claude_session_updated_at(project_root: Path | str, session_id: str) -> str | None:
+    session = str(session_id or "").strip()
+    if not session:
+        return None
+    transcript = Path.home() / ".claude" / "projects" / _claude_project_slug(project_root) / f"{session}.jsonl"
+    try:
+        mtime = transcript.stat().st_mtime
+    except OSError:
+        return None
+    return dt.datetime.fromtimestamp(mtime, tz=dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def utc_now_iso() -> str:
@@ -176,6 +258,8 @@ def write_task_runtime_state(path: Path, payload: dict[str, Any]) -> None:
         except Exception:
             existing = {}
     body = {**existing, **dict(payload)}
+    if payload.get("started_at") and not str(body.get("first_started_at") or "").strip():
+        body["first_started_at"] = str(existing.get("started_at") or payload.get("started_at") or "").strip() or None
     body["updated_at"] = utc_now_iso()
     body.setdefault("created_at", body["updated_at"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +408,8 @@ def run_observed_process(
     activity = {
         "started_at": time.monotonic(),
         "last_output_at": time.monotonic(),
+        "last_output_at_iso": utc_now_iso(),
+        "last_session_update_at": "",
         "last_report_at": 0.0,
         "last_persist_at": 0.0,
         "last_tool_name": "",
@@ -355,6 +441,8 @@ def run_observed_process(
     def _activity_snapshot() -> dict[str, Any]:
         with activity_lock:
             return {
+                "last_output_at": activity["last_output_at_iso"] or None,
+                "last_session_update_at": activity["last_session_update_at"] or None,
                 "last_tool_name": activity["last_tool_name"] or None,
                 "last_tool_at": activity["last_tool_at"] or None,
                 "last_activity_kind": activity["last_activity_kind"] or None,
@@ -385,6 +473,16 @@ def run_observed_process(
                     continue
                 activity["last_report_at"] = now
                 elapsed_seconds = int(now - activity["started_at"])
+            if runtime == "opencode":
+                session_update_at = _opencode_session_updated_at(observed_session_id or session_id)
+            elif runtime == "claude":
+                session_update_at = _claude_session_updated_at(project_root, observed_session_id or session_id)
+            else:
+                session_update_at = None
+            if session_update_at:
+                with activity_lock:
+                    if session_update_at > str(activity["last_session_update_at"] or ""):
+                        activity["last_session_update_at"] = session_update_at
             if record_path is not None:
                 write_active_task_record(record_path, {"status": "running", "runtime_pid": process.pid, **_activity_snapshot()})
             if runtime_state_path is not None:
@@ -451,6 +549,7 @@ def run_observed_process(
                 now = time.monotonic()
                 with activity_lock:
                     activity["last_output_at"] = now
+                    activity["last_output_at_iso"] = utc_now_iso()
                 stripped = line.strip()
                 if stripped:
                     try:

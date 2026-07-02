@@ -9,8 +9,12 @@ source_requirements_path:
 
 requirements:
 - Each item must include id, title, summary.
-- Preserve stable REQ- or NFR- style IDs when they already exist.
-- If an item has no explicit ID, create a stable one.
+- Each item may include source_requirement_ids when it was split from, merged from, or renamed from source IDs.
+- Preserve a source REQ- or NFR-style ID as the canonical requirement ID only when the source item is already actionable enough for downstream architecture, implementation, and validation.
+- If a source ID contains multiple independent behaviors, workflows, roles, integrations, state changes, or acceptance signals, split it into multiple canonical requirements. Give each canonical requirement a stable ID and include the original source ID in source_requirement_ids.
+- If candidate requirements are only fields, UI fragments, endpoint fragments, test fragments, or implementation steps of one behavior, merge them into one canonical requirement.
+- If an item has no explicit canonical ID, create a stable canonical ID in document order using `REQ-###` for functional/business requirements and `NFR-###` for non-functional requirements.
+- Do not invent domain-specific canonical ID prefixes. Put domain labels in title, summary, or source traceability instead.
 - Keep summaries concise and implementation-neutral.
 - Do not invent requirements that are not grounded in the source.
 - Do not turn a broad aspiration into detailed product behavior unless that behavior is explicitly stated or clearly implied by the source.

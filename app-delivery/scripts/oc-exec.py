@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    project_root = Path(args.project_root).expanduser().resolve()
     opencode_bin = os.environ.get("APP_DELIVERY_OPENCODE_BIN", "opencode")
     prompt = sys.stdin.read()
     real_git = os.environ.get("APP_DELIVERY_REAL_GIT") or subprocess.run(
@@ -66,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         command=command,
         cwd=Path(args.project_root).expanduser().resolve(),
         env=env,
-        project_root=Path(args.project_root).expanduser().resolve(),
+        project_root=project_root,
         runtime="opencode",
         session_id=str(args.session_id or ""),
         task_id=str(args.task_id or ""),

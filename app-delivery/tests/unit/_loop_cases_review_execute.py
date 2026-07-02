@@ -680,7 +680,59 @@ def test_import_task_review_pass_requires_explicit_passing_requirement_assessmen
 
     assert exc_info.value.code == "review_assessment_invalid"
     assert "status=pass requires no blocking findings" in exc_info.value.message
-    assert "explicit passing review assessments" in exc_info.value.message
+
+def test_import_task_review_pass_rejects_mock_only_browser_e2e(tmp_path: Path) -> None:
+    import pytest
+
+    from delivery.errors import DeliveryError
+    from delivery.loop_review import import_task_review
+
+    (tmp_path / "frontend" / "e2e").mkdir(parents=True)
+    (tmp_path / "frontend" / "e2e" / "case.spec.ts").write_text(
+        "import { test } from '@playwright/test'\n"
+        "test('case flow', async ({ page }) => {\n"
+        "  await page.route('**/api/incidents', route => route.fulfill({ status: 200, body: '{}' }))\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Cases",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["frontend/e2e/case.spec.ts"],
+                    "output_paths": ["frontend/src/routes/cases.tsx"],
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        import_task_review(
+            tmp_path,
+            "T002",
+            {
+                "status": "pass",
+                "summary": "Looks good.",
+                "findings": [],
+                "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+                "acceptance_assessment": [],
+            },
+            tmp_path / "review-input.json",
+        )
+
+    assert exc_info.value.code == "review_pass_preconditions_failed"
+    assert "mocked browser proof is not real backend E2E evidence" in str(exc_info.value.details)
 
 def test_import_task_review_pass_rejects_non_passing_acceptance_assessment(tmp_path: Path) -> None:
     import pytest

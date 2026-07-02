@@ -54,6 +54,18 @@ def test_render_arch_design_prompt_includes_project_dependency_hints(tmp_path: P
 
     assert "Project technology constraints:" in prompt
     assert "LangGraph" in prompt
+    assert "Selected stack contract:" in prompt
+    assert "does not prescribe a backend package directory" in prompt
+    assert "Backend implementation code lives under `backend/src" not in prompt
+
+
+def test_render_stage_prompts_include_layout_neutral_python_react_guidance() -> None:
+    for prompt_name in ["arch-design.md", "context-sync.md", "decompose.md"]:
+        prompt = render_skill_prompt(prompt_name, project="")
+        assert "Python React Stack Contract" in prompt
+        assert "does not prescribe a backend package directory" in prompt
+        assert "explicit FastAPI application lifecycle setup and cleanup" in prompt
+        assert "backend/src" not in prompt
 
 def test_build_task_prompt_explains_project_relative_test_paths(tmp_path: Path) -> None:
     from delivery.loop_task_prompt import build_task_prompt
@@ -83,55 +95,112 @@ def test_task_and_review_prompts_inline_relevant_technology_constraints(tmp_path
     from delivery.loop_review import build_code_review_request
     from delivery.loop_task_prompt import build_task_prompt
 
-    docs_dir = tmp_path / "docs"
-    docs_dir.mkdir(parents=True, exist_ok=True)
-    (docs_dir / "project-bootstrap.json").write_text(
-        json.dumps(
-            {
-                "dependency_hints": [
-                    {
-                        "ecosystem": "backend",
-                        "name": "LangGraph",
-                        "source": "requirements-analysis",
-                        "reason": "Agent orchestration framework with checkpointing and human-in-the-loop resume.",
-                        "evidence": "ADR-001",
-                    },
-                    {
-                        "ecosystem": "backend",
-                        "name": "PostgreSQL",
-                        "source": "requirements-analysis",
-                        "reason": "Primary database.",
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
     task = Task.from_dict(
         {
             "id": "T015",
-            "title": "Orchestrator Agent Graph: LangGraph State Machine",
+            "title": "Orchestrator incident workflow",
             "status": "pending",
             "requirements": ["REQ-017"],
             "acceptance_scenarios": [],
             "dependencies": ["T013"],
             "output_tests": ["backend/tests/agents/test_orchestrator_graph.py"],
             "output_paths": ["backend/src/agents/graph.py", "backend/src/agents/orchestrator.py"],
+            "intent": {
+                "objective": "Stateful incident orchestration workflow",
+            },
+            "technology_constraints": [
+                {
+                    "name": "LangGraph",
+                    "ecosystem": "backend",
+                    "requirement": "must_use",
+                    "reason": "ADR 001 selects LangGraph for stateful multi-agent orchestration.",
+                    "source": "docs/adr/001-agent-framework.md",
+                    "expected_evidence": [
+                        "backend dependency manifest includes langgraph",
+                        "workflow implementation imports LangGraph primitives",
+                    ],
+                }
+            ],
         }
     )
 
     task_prompt = build_task_prompt(tmp_path, task)
     review_prompt = build_code_review_request(tmp_path, task)
 
-    assert "Project technology constraints for this task:" in task_prompt
-    assert "LangGraph (backend): Agent orchestration framework" in task_prompt
-    assert "ADR-001" in task_prompt
-    assert "Use these technologies unless an ADR or clarification supersedes them." in task_prompt
+    assert "Required technology constraints for this task:" in task_prompt
+    assert "LangGraph (backend, must_use): ADR 001 selects LangGraph" in task_prompt
+    assert "backend dependency manifest includes langgraph" in task_prompt
+    assert "docs/adr/001-agent-framework.md" in task_prompt
     assert "PostgreSQL" not in task_prompt
-    assert "Project technology constraints to verify:" in review_prompt
-    assert "LangGraph (backend): Agent orchestration framework" in review_prompt
-    assert "Require implementation evidence or an explicit superseding ADR/clarification." in review_prompt
+    assert "Technology constraints to verify:" in review_prompt
+    assert "LangGraph (backend, must_use): ADR 001 selects LangGraph" in review_prompt
+    assert "technology_assessment" in review_prompt
+    assert "A `must_use` constraint without implementation evidence" in review_prompt
     assert "PostgreSQL" not in review_prompt
+
+def test_task_prompt_surfaces_invalid_verified_upstream_evidence_without_reopening(tmp_path: Path) -> None:
+    from delivery.loop_task_prompt import build_task_prompt
+
+    e2e_dir = tmp_path / "frontend" / "e2e"
+    e2e_dir.mkdir(parents=True, exist_ok=True)
+    reviews_dir = tmp_path / "docs" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "code-review-T005.md").write_text("status: pass\n", encoding="utf-8")
+    (reviews_dir / "test-report-T005.md").write_text("status: pass\n", encoding="utf-8")
+    (e2e_dir / "dashboard.spec.ts").write_text(
+        """
+import { test } from '@playwright/test'
+
+test('dashboard', async ({ page }) => {
+  await page.route('**/api/dashboard', route => route.fulfill({ status: 200, json: {} }))
+})
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T005", "title": "Dashboard", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/dashboard.spec.ts"], "output_paths": ["frontend/src/routes/dashboard.tsx"], "review_status": "pass", "review_artifact": "docs/reviews/code-review-T005.md", "git_commit": "abc"},
+                {"id": "T010", "title": "Approval workflow", "status": "pending", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T005"], "output_tests": ["backend/tests/test_approvals.py"], "output_paths": ["backend/otif/api/approvals.py"]},
+            ],
+        },
+    )
+
+    prompt = build_task_prompt(tmp_path, Task.from_dict(json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))["items"][1]))
+
+    assert "Verified upstream evidence issues:" in prompt
+    assert "T005:" in prompt
+    assert ".app-delivery-runtime/prompts/T005.md" in prompt
+    assert "docs/reviews/code-review-T005.md" in prompt
+    assert "docs/reviews/test-report-T005.md" in prompt
+    assert "Do not reopen, reset, or re-run verified feature tasks" in prompt
+    assert "dedicated repair bundle" in prompt
+
+    repair_task = Task.from_dict(
+        {
+            "id": "T010",
+            "title": "Approval workflow",
+            "status": "pending",
+            "review_status": "changes_requested",
+            "review_artifact": "docs/reviews/code-review-T010.md",
+            "requirements": ["REQ-002"],
+            "acceptance_scenarios": [],
+            "dependencies": ["T005"],
+            "output_tests": ["backend/tests/test_approvals.py"],
+            "output_paths": ["backend/otif/api/approvals.py"],
+        }
+    )
+    repair_prompt = build_task_prompt(tmp_path, repair_task)
+
+    assert "Review repair mode:" in repair_prompt
+    assert "Verified upstream evidence issues:" in repair_prompt
+    assert "Do not reopen, reset, or re-run verified feature tasks" in repair_prompt
 
 def test_shared_foundation_prompt_has_intent_and_manifest_boundary(tmp_path: Path) -> None:
     from delivery.loop_task_prompt import build_task_prompt
@@ -308,6 +377,7 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
                         "requirements": ["REQ-001", "REQ-002"],
                         "acceptance_scenarios": [],
                         "dependencies": [],
+                        "technology_constraints": [],
                         "output_tests": ["tests/test_feature.py"],
                         "output_paths": ["backend/src/feature.py"],
                     }
@@ -335,7 +405,31 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
     gates = load_gates(tmp_path)
     assert any(gate["id"] == "GATE-RELEASE" for gate in gates["gates"])
 
-def test_cmd_decompose_rejects_backend_root_package_paths(tmp_path: Path) -> None:
+def test_cmd_decompose_allows_architecture_selected_backend_root_package_paths(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    input_path = tmp_path / "decompose.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "delivery_complexity": {"tier": "S", "rationale": "Small", "signals": {}},
+                "validation_gates": [],
+                "items": [
+                    {"title": "Feature", "task_kind": "feature", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "technology_constraints": [], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/api/feature.py"]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert result == 0
+    payload = json.loads((docs_dir / "work-items.json").read_text(encoding="utf-8"))
+    assert any("backend/api/feature.py" in item.get("output_paths", []) for item in payload["items"])
+
+def test_cmd_decompose_rejects_items_missing_technology_constraints(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
@@ -356,10 +450,10 @@ def test_cmd_decompose_rejects_backend_root_package_paths(tmp_path: Path) -> Non
     with pytest.raises(DeliveryError) as exc_info:
         cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
-    assert exc_info.value.code == "stage_output_invalid"
-    assert "backend-root package paths" in exc_info.value.message
+    assert exc_info.value.code == "input_invalid_shape"
+    assert "technology_constraints" in exc_info.value.message
 
-def test_cmd_decompose_rejects_top_level_mcp_server_paths(tmp_path: Path) -> None:
+def test_cmd_decompose_allows_architecture_selected_top_level_mcp_server_paths(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
@@ -376,6 +470,7 @@ def test_cmd_decompose_rejects_top_level_mcp_server_paths(tmp_path: Path) -> Non
                         "requirements": ["REQ-001"],
                         "acceptance_scenarios": [],
                         "dependencies": [],
+                        "technology_constraints": [],
                         "output_tests": ["mcp-server/tests/test_tools.py"],
                         "output_paths": ["mcp-server/server.py", "mcp-server/tools/rules.py"],
                     }
@@ -385,11 +480,11 @@ def test_cmd_decompose_rejects_top_level_mcp_server_paths(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    with pytest.raises(DeliveryError) as exc_info:
-        cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+    result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
-    assert exc_info.value.code == "stage_output_invalid"
-    assert "top-level mcp-server paths" in exc_info.value.message
+    assert result == 0
+    payload = json.loads((docs_dir / "work-items.json").read_text(encoding="utf-8"))
+    assert any("mcp-server/server.py" in item.get("output_paths", []) for item in payload["items"])
 
 def test_cmd_decompose_imports_complexity_and_validation_gates_from_object_payload(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
@@ -421,6 +516,7 @@ def test_cmd_decompose_imports_complexity_and_validation_gates_from_object_paylo
                         "requirements": ["REQ-001"],
                         "acceptance_scenarios": [],
                         "dependencies": [],
+                        "technology_constraints": [],
                         "output_tests": ["tests/test_feature.py"],
                         "output_paths": ["backend/src/feature.py"],
                     },
@@ -430,6 +526,7 @@ def test_cmd_decompose_imports_complexity_and_validation_gates_from_object_paylo
                         "requirements": ["REQ-001"],
                         "acceptance_scenarios": [],
                         "dependencies": ["T002"],
+                        "technology_constraints": [],
                         "output_tests": ["backend/tests/test_feature.py"],
                         "output_paths": ["docs/reviews/test-report-auth-domain.md"],
                     }
@@ -468,6 +565,7 @@ def test_cmd_decompose_rejects_invalid_task_contracts_during_import(tmp_path: Pa
                         "requirements": ["REQ-001"],
                         "acceptance_scenarios": [],
                         "dependencies": [],
+                        "technology_constraints": [],
                         "output_tests": ["../tests/test_feature.py"],
                         "output_paths": ["../src/feature.py"],
                     }
@@ -731,7 +829,7 @@ def test_cmd_arch_design_requires_module_architecture_section(tmp_path: Path) ->
     assert exc_info.value.code == "input_invalid_shape"
     assert "Module Architecture" in exc_info.value.message
 
-def test_cmd_arch_design_rejects_backend_root_package_paths(tmp_path: Path) -> None:
+def test_cmd_arch_design_allows_architecture_selected_backend_package_tree(tmp_path: Path) -> None:
     input_path = tmp_path / "arch.json"
     input_path.write_text(
         json.dumps(
@@ -746,13 +844,12 @@ def test_cmd_arch_design_rejects_backend_root_package_paths(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    with pytest.raises(DeliveryError) as exc_info:
-        cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+    result = cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
-    assert exc_info.value.code == "input_invalid_shape"
-    assert "backend/src" in exc_info.value.message
+    assert result == 0
+    assert (tmp_path / "docs" / "architecture.md").exists()
 
-def test_cmd_arch_design_rejects_top_level_mcp_server_paths(tmp_path: Path) -> None:
+def test_cmd_arch_design_allows_explicit_top_level_mcp_server_paths(tmp_path: Path) -> None:
     input_path = tmp_path / "arch.json"
     input_path.write_text(
         json.dumps(
@@ -767,11 +864,10 @@ def test_cmd_arch_design_rejects_top_level_mcp_server_paths(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    with pytest.raises(DeliveryError) as exc_info:
-        cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+    result = cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
-    assert exc_info.value.code == "input_invalid_shape"
-    assert "unsupported extra service root" in exc_info.value.message
+    assert result == 0
+    assert (tmp_path / "docs" / "architecture.md").exists()
 
 def test_cmd_arch_design_ignores_backend_root_examples_outside_module_tree(tmp_path: Path) -> None:
     input_path = tmp_path / "arch.json"

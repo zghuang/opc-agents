@@ -9,6 +9,14 @@ from .task import FINAL_VERIFY_TASK_ID, SHARED_FOUNDATION_TASK_ID, SCAFFOLD_TASK
 from .verify import infer_test_types
 
 
+TEST_TYPE_COVERAGE_ALIASES = {
+    "e2e": {"e2e", "browser", "api", "integration"},
+    "integration": {"integration", "api", "contract"},
+    "api": {"api", "integration"},
+    "browser": {"browser", "e2e"},
+}
+
+
 def normalize_complexity_override(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("task-decompose payload must include a delivery_complexity object")
@@ -99,6 +107,19 @@ def _normalized_result_test_types(row: dict[str, Any]) -> list[str]:
     return sorted({*explicit, *inferred})
 
 
+def _missing_gate_test_types(required: list[str], observed: list[str]) -> list[str]:
+    observed_set = {str(value).strip() for value in observed if str(value).strip()}
+    missing: list[str] = []
+    for test_type in required:
+        normalized = str(test_type or "").strip()
+        if not normalized:
+            continue
+        accepted = TEST_TYPE_COVERAGE_ALIASES.get(normalized, {normalized})
+        if not observed_set.intersection(accepted):
+            missing.append(normalized)
+    return missing
+
+
 def _matched_gate_results(
     results: list[dict[str, Any]],
     *,
@@ -127,6 +148,54 @@ def _gate_has_scope_binding(gate: dict[str, Any]) -> bool:
     scope_tasks = [str(value).strip() for value in gate.get("scope_tasks", []) if str(value).strip()]
     scope_requirements = [str(value).strip() for value in gate.get("scope_requirements", []) if str(value).strip()]
     return bool(scope_tasks or scope_requirements)
+
+
+def _manual_gate_override(gate: dict[str, Any]) -> dict[str, Any] | None:
+    override = gate.get("manual_override") if isinstance(gate.get("manual_override"), dict) else None
+    if not override:
+        return None
+    status = str(override.get("status") or "").strip()
+    if status != "verified":
+        return None
+    reason = str(override.get("reason") or "").strip()
+    if not reason:
+        return None
+    return override
+
+
+def accept_gate(project_root: Path | str, gate_id: str, *, reason: str, actor: str = "host") -> dict[str, Any]:
+    normalized_gate_id = str(gate_id or "").strip()
+    normalized_reason = str(reason or "").strip()
+    if not normalized_gate_id:
+        raise ValueError("gate_id is required")
+    if not normalized_reason:
+        raise ValueError("manual gate acceptance requires a reason")
+    payload = load_gates(project_root)
+    gates = payload.get("gates") if isinstance(payload.get("gates"), list) else []
+    matched = False
+    now = utc_now_iso()
+    updated_gates: list[dict[str, Any]] = []
+    for gate in gates:
+        if not isinstance(gate, dict):
+            continue
+        updated = dict(gate)
+        if str(updated.get("id") or "").strip() == normalized_gate_id:
+            matched = True
+            updated["manual_override"] = {
+                "status": "verified",
+                "reason": normalized_reason,
+                "actor": str(actor or "host").strip() or "host",
+                "accepted_at": now,
+            }
+            updated["status"] = "verified"
+            updated["blocked_reason"] = None
+            updated["verified_at"] = now
+        updated_gates.append(updated)
+    if not matched:
+        raise ValueError(f"validation gate not found: {normalized_gate_id}")
+    payload["gates"] = updated_gates
+    save_gates(project_root, payload)
+    return refresh_gates(project_root)
 
 
 def _gate_repair_candidates(
@@ -293,13 +362,37 @@ def refresh_gates(project_root: Path | str) -> dict[str, Any]:
             }
         )
         required_test_types = [str(value).strip() for value in gate.get("required_test_types", []) if str(value).strip()]
-        missing_test_types = [test_type for test_type in required_test_types if test_type not in observed_test_types]
+        missing_test_types = _missing_gate_test_types(required_test_types, observed_test_types)
         deferred_providers = _deferred_test_type_providers(
             tasks,
             scope_task_ids=set(scope_task_ids),
             scope_requirement_ids=scope_requirement_ids,
             missing_test_types=missing_test_types,
         )
+
+        manual_override = _manual_gate_override(gate)
+        if manual_override is not None:
+            updated_gate = dict(gate)
+            updated_gate["status"] = "verified"
+            updated_gate["scope_requirements"] = list(scope_requirement_ids)
+            updated_gate["observed_test_types"] = observed_test_types
+            updated_gate["missing_test_types"] = missing_test_types
+            updated_gate["repair_candidates"] = []
+            updated_gate["updated_at"] = now
+            updated_gate["verified_at"] = str(manual_override.get("accepted_at") or gate.get("verified_at") or now)
+            updated_gate["blocked_reason"] = None
+            updated_gate["report_artifact"] = _write_gate_report(
+                project_root,
+                {**updated_gate, "status": "verified"},
+                scope_rows=scope_rows,
+                related_results=related_results,
+                observed_test_types=observed_test_types,
+                missing_test_types=missing_test_types,
+                repair_candidates=[],
+                reason=f"manual gate acceptance: {manual_override.get('reason')}",
+            )
+            updated_gates.append(updated_gate)
+            continue
 
         status = "pending"
         reason: str | None = None

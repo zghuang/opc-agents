@@ -77,6 +77,10 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
     assert payload["items"][0]["git_commit"] == "abc123"
     assert payload["items"][0]["review_status"] == "pass"
     assert payload["items"][0]["review_artifact"] == "docs/reviews/code-review-T002.md"
+    summary = json.loads((tmp_path / "docs" / "project-summary.json").read_text(encoding="utf-8"))
+    metrics = {row["task_id"]: row for row in summary["task_metrics"]}
+    assert metrics["T002"]["status"] == "verified"
+    assert metrics["T002"]["completed_at"] is not None
 
 def test_cmd_code_review_task_contract_repair_moves_acceptance_to_later_task(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
@@ -153,7 +157,7 @@ def test_cmd_code_review_task_contract_repair_moves_acceptance_to_later_task(tmp
     )
     result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
 
-    assert result == 2
+    assert result == 0
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     by_id = {item["id"]: item for item in payload["items"]}
     assert by_id["T002"]["status"] == "pending"
@@ -220,7 +224,7 @@ def test_cmd_code_review_task_contract_repair_creates_followup_when_no_target_ex
     )
     result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
 
-    assert result == 2
+    assert result == 0
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     by_id = {item["id"]: item for item in payload["items"]}
     followup = next(item for item in payload["items"] if item["title"] == "Acceptance Scenario Follow-up: AS-001 workflow")
@@ -294,6 +298,7 @@ def test_cmd_code_review_task_contract_repair_defers_acceptance_when_local_repai
     assert deferrals["deferred_acceptance_scenarios"][0]["policy"] == "delivery_continue"
     review_md = (tmp_path / "docs" / "reviews" / "code-review-T002.md").read_text(encoding="utf-8")
     assert "Deferred acceptance scenario assignment" in review_md
+    capsys.readouterr()
 
     monkeypatch.setattr("delivery.control_plane.needs_scaffold", lambda project_root: False)
     control_result = cli.cmd_control(
@@ -389,7 +394,7 @@ def test_cmd_code_review_invalid_task_contract_repair_falls_back_to_implementati
 
     result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
 
-    assert result == 2
+    assert result == 0
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     item = payload["items"][0]
     assert item["status"] == "pending"
@@ -629,7 +634,7 @@ def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path) -> None:
     assert payload["items"][0]["review_status"] == "pass"
     assert payload["items"][0]["review_artifact"] == "docs/reviews/final-review.md"
 
-def test_cmd_final_review_import_changes_requested_creates_repair_bundle(tmp_path: Path) -> None:
+def test_cmd_final_review_import_changes_requested_creates_repair_bundle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     save_work_items(
         tmp_path,
         {
@@ -684,7 +689,10 @@ def test_cmd_final_review_import_changes_requested_creates_repair_bundle(tmp_pat
 
     result = cli.cmd_final_review(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
-    assert result == 2
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "imported"
+    assert output["import_exit_code"] == 2
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     by_id = {item["id"]: item for item in payload["items"]}
     repair_id = next(item["id"] for item in payload["items"] if item.get("task_kind") == "repair")
@@ -701,7 +709,7 @@ def test_cmd_final_review_import_changes_requested_creates_repair_bundle(tmp_pat
     review_md = (tmp_path / "docs" / "reviews" / "final-review.md").read_text(encoding="utf-8")
     assert "[blocking] Feature behavior is not complete enough for release. (REQ-001, AS-001)" in review_md
 
-def test_cmd_final_review_import_changes_requested_stops_after_repair_iteration_limit(tmp_path: Path) -> None:
+def test_cmd_final_review_import_changes_requested_stops_after_repair_iteration_limit(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     save_work_items(
         tmp_path,
         {
@@ -739,7 +747,10 @@ def test_cmd_final_review_import_changes_requested_stops_after_repair_iteration_
 
     result = cli.cmd_final_review(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
-    assert result == 2
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "imported"
+    assert output["import_exit_code"] == 2
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     repair_tasks = [item for item in payload["items"] if item.get("task_kind") == "repair"]
     final = next(item for item in payload["items"] if item["id"] == "T-FINAL")
@@ -750,6 +761,91 @@ def test_cmd_final_review_import_changes_requested_stops_after_repair_iteration_
     assert runtime_state["repair_candidates"] == ["T002"]
     assert runtime_state["final_repair_limit_reached"] is True
     assert runtime_state["final_verify_status"] == "blocked"
+
+
+def test_cmd_task_accept_manually_verifies_exception_task(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T010", "title": "Workflow", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_workflow.py"], "output_paths": ["backend/src/workflow.py"], "blocked_reason": "review repair limit"},
+            ],
+        },
+    )
+    save_task_runtime_state(tmp_path, "T010", {"review_repair_limit_reached": True, "review_changes_requested_count": 4})
+
+    result = cli.cmd_task(argparse.Namespace(project=str(tmp_path), task_id="T010", action="accept", reason="Host verified all tests and stale finding is resolved."))
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ok"
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    item = payload["items"][0]
+    assert item["status"] == "verified"
+    assert item["blocked_reason"] == "manual host acceptance: Host verified all tests and stale finding is resolved."
+    runtime_state = load_task_runtime_state(tmp_path, "T010")
+    assert runtime_state["manual_override"]["action"] == "accept"
+    assert runtime_state["review_repair_limit_reached"] is False
+    assert runtime_state["review_changes_requested_count"] == 0
+
+
+def test_cmd_task_reset_repair_clears_repair_limit_and_returns_pending(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T010", "title": "Workflow", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_workflow.py"], "output_paths": ["backend/src/workflow.py"], "blocked_reason": "review repair limit", "attempts": 4},
+            ],
+        },
+    )
+    save_task_runtime_state(tmp_path, "T010", {"review_repair_limit_reached": True, "review_changes_requested_count": 4, "failure_count": 2})
+
+    result = cli.cmd_task(argparse.Namespace(project=str(tmp_path), task_id="T010", action="reset-repair", reason="Allow one more repair turn after framework prompt update."))
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ok"
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    item = payload["items"][0]
+    assert item["status"] == "pending"
+    assert item["blocked_reason"] == "manual repair reset: Allow one more repair turn after framework prompt update."
+    assert item["attempts"] == 0
+    runtime_state = load_task_runtime_state(tmp_path, "T010")
+    assert runtime_state["manual_override"]["action"] == "reset-repair"
+    assert runtime_state["review_repair_limit_reached"] is False
+    assert runtime_state["review_changes_requested_count"] == 0
+    assert runtime_state["failure_count"] == 0
+
+
+def test_cmd_task_reset_repair_refuses_verified_feature_task(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T010", "title": "Workflow", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_workflow.py"], "output_paths": ["backend/src/workflow.py"], "review_status": "pass", "verified_at": "2026-06-24T00:10:00Z"},
+            ],
+        },
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_task(argparse.Namespace(project=str(tmp_path), task_id="T010", action="reset-repair", reason="Try to reopen."))
+
+    assert exc_info.value.code == "verified_task_repair_forbidden"
+    item = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))["items"][0]
+    assert item["status"] == "verified"
+    assert item["verified_at"] == "2026-06-24T00:10:00Z"
 
 def test_final_repair_preserves_verified_prefinal_audit_and_updates_final_dependency() -> None:
     loop_module = import_module("delivery.loop")

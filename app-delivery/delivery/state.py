@@ -704,6 +704,8 @@ def save_task_runtime_state(project_root: Path | str, task_id: str, payload: dic
     path = task_runtime_state_path(project_root, task_id)
     existing = load_task_runtime_state(project_root, task_id)
     body = {**existing, **dict(payload)}
+    if payload.get("started_at") and not str(body.get("first_started_at") or "").strip():
+        body["first_started_at"] = str(existing.get("started_at") or payload.get("started_at") or "").strip() or None
     body["task_id"] = str(task_id or "").strip()
     body["updated_at"] = utc_now_iso()
     body.setdefault("created_at", body["updated_at"])

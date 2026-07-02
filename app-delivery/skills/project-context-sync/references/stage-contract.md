@@ -20,7 +20,7 @@ Constraints:
 - Keep context stable; omit feature-local details.
 - Prefer a compact bullet list or short table in `Tech Design` rather than long prose.
 - Do not duplicate generic runtime rules, task instructions, command policy, long repository trees, or feature acceptance details.
-- Keep code paths consistent with the python-react stack contract: backend Python code under `backend/src/...`, frontend code under `frontend/src/...`, browser tests under `frontend/e2e/...`, and mock services under project-root `mock-server/...`. Do not introduce alternative package roots, service roots, mock-service roots, or layout guidance unless the project has explicitly selected a different stack/template that supports them.
+- Keep code paths consistent with the architecture-selected layout and the selected stack guidance below. Do not assume a backend package directory unless requirements or architecture explicitly selected one.
 - Do not invent constraints that are not grounded in the provided requirements, architecture, shared components, or clarification answers.
 - test_plan coverage rows must include every requirement ID.
 - test_types should be realistic, such as unit, api, integration, browser, e2e, accessibility, or performance.
@@ -36,6 +36,11 @@ Requirements JSON:
 
 Project technology constraints:
 {{dependency_hints_json}}
+
+Selected stack: {{stack_id}}
+
+Selected stack contract:
+{{stack_guidance_md}}
 
 Shared components:
 {{shared_components_md}}

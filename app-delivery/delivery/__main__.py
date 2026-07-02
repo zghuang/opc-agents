@@ -6,9 +6,7 @@ import datetime as dt
 import fcntl
 import json
 import os
-import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -16,12 +14,14 @@ from pathlib import Path
 from typing import Any
 
 from .bootstrap import archive_requirements_source, doctor_report, initialize_project, start_preflight
-from .control_plane import run_control, routed_status
+from .control_plane import mark_auto_exception_repair_attempted, run_control, routed_status
 from .errors import DeliveryError, error_payload
+from .gates import accept_gate
 from .loop import DeliveryLoop, PAUSE_FILE, project_summary
 from .loop_task_prompt import build_stalled_recovery_prompt
-from .loop_review import code_review_request_path, final_review_request_path, import_final_review, import_task_review
+from .loop_review import import_final_review, import_task_review
 from . import project_readiness as readiness
+from .review_artifacts import code_review_request_path, final_review_request_path
 from .runtime_config import load_project_metadata, resolve_project_root, resolve_runtime
 from .scaffold import write_project_structure_snapshot
 from .session import RuntimeSession, current_session, retire_session, save_current_session
@@ -40,11 +40,254 @@ from .state import (
     task_runtime_state_path,
     utc_now_iso,
 )
-from .task import all_tasks, reset_task, save_tasks
+from .task import all_tasks, mark_task, reset_task, save_tasks
 
 
 CONTROL_STEP_LIMIT = 128
 EXECUTION_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def _command_runtime(args: argparse.Namespace, project_root: Path | None = None) -> str:
+    return resolve_runtime(getattr(args, "runtime", None), project_root=project_root)
+
+
+def _command_locked(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "_locked", False))
+
+
+def _watchdog_enabled_for(project_root: Path | str) -> bool:
+    metadata = load_project_metadata(project_root)
+    return metadata.get("watchdog_enabled") is True
+
+
+@contextlib.contextmanager
+def _progress_monitor(project_root: Path) -> Any:
+    stop_event = threading.Event()
+
+    def worker() -> None:
+        last_signature: tuple[str, str, str] | None = None
+        while not stop_event.wait(30):
+            active_records = sorted(load_active_task_records(project_root), key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+            active = active_records[0] if active_records else {}
+            task_id = str(active.get("task_id") or "").strip() or "-"
+            phase = str(active.get("phase") or "runtime").strip() or "runtime"
+            event = latest_task_log_event(project_root) or {}
+            message = str(event.get("message") or "still running").strip() or "still running"
+            signature = (task_id, phase, message)
+            if signature == last_signature:
+                print(f"[app-delivery] {phase} {task_id}: still running", file=sys.stderr, flush=True)
+            else:
+                print(f"[app-delivery] {phase} {task_id}: {message}", file=sys.stderr, flush=True)
+                last_signature = signature
+
+    thread = threading.Thread(target=worker, name="app-delivery-progress", daemon=True)
+    thread.start()
+    try:
+        yield None
+    finally:
+        stop_event.set()
+        thread.join(timeout=1)
+
+
+@contextlib.contextmanager
+def _project_execution_guard(project_root: Path, *, already_locked: bool) -> Any:
+    if already_locked:
+        yield None
+        return
+    lock_path = project_root / ".app-delivery-runtime" / "locks" / "execution.lock"
+    try:
+        timeout = float(os.environ.get("APP_DELIVERY_EXECUTION_LOCK_TIMEOUT_SECONDS") or EXECUTION_LOCK_TIMEOUT_SECONDS)
+    except ValueError:
+        timeout = EXECUTION_LOCK_TIMEOUT_SECONDS
+    if timeout <= 0 and read_lock_metadata(lock_path):
+        raise DeliveryError(
+            code="project_busy",
+            message=f"another app-delivery run is already active for {project_root}",
+            exit_code=2,
+            details={"project": str(project_root), "lock_path": str(lock_path), "lock_owner": read_lock_metadata(lock_path)},
+            suggested_action="Wait for the active app-delivery run to finish, or stop the other process before retrying.",
+        )
+    _prune_stale_execution_lock(project_root)
+    try:
+        with acquire_lock(project_root, name="execution", timeout=max(0.0, timeout)):
+            yield lock_path
+    except TimeoutError as exc:
+        lock_details = read_lock_metadata(lock_path)
+        raise DeliveryError(
+            code="project_busy",
+            message=f"another app-delivery run is already active for {project_root}",
+            exit_code=2,
+            details={"project": str(project_root), "lock_path": str(lock_path), **({"lock_owner": lock_details} if lock_details else {})},
+            suggested_action="Wait for the active app-delivery run to finish, or stop the other process before retrying.",
+        ) from exc
+
+
+def cmd_render(args: argparse.Namespace) -> int:
+    render_work_items_markdown(resolve_project_root(args.project))
+    return 0
+
+
+def _refresh_project_summary_best_effort(project_root: Path) -> None:
+    try:
+        write_project_structure_snapshot(project_root)
+    except Exception as exc:
+        print(f"[app-delivery] warning: project structure refresh failed: {exc}", file=sys.stderr)
+    try:
+        project_summary(project_root)
+    except Exception as exc:
+        print(f"[app-delivery] warning: project summary refresh failed: {exc}", file=sys.stderr)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root(args.project)
+    payload = routed_status(project_root)
+    _refresh_project_summary_best_effort(project_root)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    print(json.dumps(project_summary(resolve_project_root(args.project)), indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    payload = doctor_report(resolve_runtime(getattr(args, "runtime", None)), framework_root=args.framework_root, opc_home=args.opc_home)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if payload.get("status") == "ok" else 1
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root(args.project)
+    payload = start_preflight(project_root, args.requirements, runtime=_command_runtime(args, project_root))
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if payload.get("status") == "ok" else 1
+
+
+def cmd_init_project(args: argparse.Namespace) -> int:
+    payload = initialize_project(
+        resolve_project_root(args.project),
+        description=args.description or "App-delivery project",
+        runtime=resolve_runtime(args.runtime),
+        stack=args.stack,
+        force=args.force,
+        framework_root=args.framework_root,
+        watchdog_enabled=bool(getattr(args, "watchdog", False)),
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _run_scaffold_once(project_root: Path | str, *, locked: bool = False) -> dict[str, Any]:
+    resolved = resolve_project_root(project_root)
+    with _project_execution_guard(resolved, already_locked=locked):
+        return DeliveryLoop(resolved).run_builtin_scaffold()
+
+
+def _run_loop_once(
+    project_root: Path | str,
+    *,
+    runtime: str | None,
+    max_auto_tasks: int | None = None,
+    locked: bool = False,
+) -> dict[str, Any]:
+    resolved = resolve_project_root(project_root)
+    with _project_execution_guard(resolved, already_locked=locked):
+        with _progress_monitor(resolved):
+            return DeliveryLoop(resolved, runtime=resolve_runtime(runtime, project_root=resolved)).run(max_auto_tasks=max_auto_tasks)
+
+
+def _run_verify_once(
+    project_root: Path | str,
+    *,
+    runtime: str | None,
+    mode: str = "all",
+    locked: bool = False,
+) -> dict[str, Any]:
+    resolved = resolve_project_root(project_root)
+    with _project_execution_guard(resolved, already_locked=locked):
+        return DeliveryLoop(resolved, runtime=resolve_runtime(runtime, project_root=resolved)).final_verify(suite_mode=mode)
+
+
+def _run_resume_once(
+    project_root: Path | str,
+    *,
+    runtime: str | None,
+    no_run: bool = False,
+    max_auto_tasks: int | None = None,
+    locked: bool = False,
+    spawn_watchdog_after: bool = True,
+) -> dict[str, Any] | None:
+    resolved = resolve_project_root(project_root)
+    with _project_execution_guard(resolved, already_locked=locked):
+        pause_path = resolved / PAUSE_FILE
+        if pause_path.exists():
+            pause_path.unlink()
+        if no_run:
+            if spawn_watchdog_after and _watchdog_enabled_for(resolved):
+                spawn_watchdog(resolved)
+            return None
+        result = _run_loop_once(
+            resolved,
+            runtime=runtime,
+            max_auto_tasks=max_auto_tasks,
+            locked=True,
+        )
+    if spawn_watchdog_after and _watchdog_enabled_for(resolved):
+        spawn_watchdog(resolved)
+    return result
+
+
+def _run_fix_once(
+    project_root: Path | str,
+    *,
+    task_id: str,
+    runtime: str | None,
+    no_start: bool = False,
+    spawn_watchdog_after: bool = True,
+) -> dict[str, Any] | None:
+    resolved = resolve_project_root(project_root)
+    with _project_execution_guard(resolved, already_locked=False):
+        _terminate_runtime_for_task(resolved, task_id)
+        tasks = all_tasks(resolved)
+        current = next((task for task in tasks if task.id == task_id), None)
+        if current is not None and current.status == "verified" and current.task_kind != "repair":
+            raise DeliveryError(
+                code="verified_task_repair_forbidden",
+                message=(
+                    f"task {task_id} is already verified; do not reopen verified feature tasks. "
+                    "Repair regressions from the current task or a dedicated repair bundle instead."
+                ),
+                exit_code=2,
+                details={"task_id": task_id, "status": current.status, "task_kind": current.task_kind},
+            )
+        updated = reset_task(tasks, task_id)
+        save_tasks(resolved, updated)
+        if current and current.status_session_id:
+            active_session = current_session(resolved)
+            if active_session and active_session.id == current.status_session_id:
+                retire_session(resolved, active_session)
+        reapply_task_exception_patch(resolved, task_id)
+        runtime_path = task_runtime_state_path(resolved, task_id)
+        if runtime_path.exists():
+            runtime_path.unlink()
+        review_path = resolved / "docs" / "reviews" / f"code-review-{task_id}.md"
+        if review_path.exists():
+            review_path.unlink()
+        pause_path = resolved / PAUSE_FILE
+        if pause_path.exists():
+            pause_path.unlink()
+    if no_start:
+        if spawn_watchdog_after and _watchdog_enabled_for(resolved):
+            spawn_watchdog(resolved)
+        return None
+    return _run_resume_once(
+        resolved,
+        runtime=runtime,
+        no_run=False,
+        locked=False,
+        spawn_watchdog_after=spawn_watchdog_after,
+    )
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -61,39 +304,8 @@ def _pid_is_running(pid: int) -> bool:
     return True
 
 
-def _prune_stale_execution_lock(project_root: Path) -> bool:
-    lock_path = project_root / ".app-delivery-runtime" / "locks" / "execution.lock"
-    lock_details = read_lock_metadata(lock_path)
-    try:
-        owner_pid = int((lock_details or {}).get("pid") or 0)
-    except (TypeError, ValueError):
-        owner_pid = 0
-    if owner_pid <= 0 or _pid_is_running(owner_pid):
-        return False
-    try:
-        with lock_path.open("a+", encoding="utf-8") as handle:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return False
-            try:
-                refreshed = read_lock_metadata(lock_path)
-                try:
-                    refreshed_pid = int((refreshed or {}).get("pid") or 0)
-                except (TypeError, ValueError):
-                    refreshed_pid = 0
-                if refreshed_pid > 0 and not _pid_is_running(refreshed_pid):
-                    lock_path.unlink(missing_ok=True)
-                    return True
-                return False
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except FileNotFoundError:
-        return False
-
-
 def _terminate_pid(pid: int) -> None:
-    if pid <= 0:
+    if pid <= 0 or pid == os.getpid():
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(pid, signal.SIGTERM)
@@ -108,22 +320,18 @@ def _terminate_pid(pid: int) -> None:
         except OSError:
             return
         time.sleep(0.1)
+    if pid == os.getpid():
+        return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(pid, signal.SIGKILL)
 
 
-def _terminate_runtime_for_task(project_root: Path, task_id: str) -> None:
-    current_tasks = all_tasks(project_root)
-    current = next((task for task in current_tasks if task.id == task_id), None)
-    if current is None or current.status != "active":
-        return
-    active_records = [
-        record
-        for record in load_active_task_records(project_root)
-        if str(record.get("task_id") or "").strip() == task_id
-    ]
+def _terminate_runtime_for_task(project_root: Path | str, task_id: str) -> None:
+    project_dir = resolve_project_root(project_root)
     seen_pids: set[int] = set()
-    for record in active_records:
+    for record in load_active_task_records(project_dir):
+        if str(record.get("task_id") or "").strip() != str(task_id or "").strip():
+            continue
         for key in ("runtime_pid", "pid"):
             try:
                 pid = int(record.get(key) or 0)
@@ -133,7 +341,7 @@ def _terminate_runtime_for_task(project_root: Path, task_id: str) -> None:
                 continue
             seen_pids.add(pid)
             _terminate_pid(pid)
-    lock_path = project_root / ".app-delivery-runtime" / "locks" / "execution.lock"
+    lock_path = project_dir / ".app-delivery-runtime" / "locks" / "execution.lock"
     lock_details = read_lock_metadata(lock_path)
     try:
         lock_owner_pid = int((lock_details or {}).get("pid") or 0)
@@ -167,6 +375,38 @@ def _seed_recovery_session(project_root: Path, *, runtime_name: str, task_id: st
         current_task_id=task_id,
     )
     save_current_session(project_root, seeded)
+
+
+def _prune_stale_execution_lock(project_root: Path | str) -> bool:
+    project_dir = resolve_project_root(project_root)
+    lock_path = project_dir / ".app-delivery-runtime" / "locks" / "execution.lock"
+    lock_details = read_lock_metadata(lock_path)
+    try:
+        owner_pid = int((lock_details or {}).get("pid") or 0)
+    except (TypeError, ValueError):
+        owner_pid = 0
+    if owner_pid <= 0 or _pid_is_running(owner_pid):
+        return False
+    try:
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            try:
+                refreshed = read_lock_metadata(lock_path)
+                try:
+                    refreshed_pid = int((refreshed or {}).get("pid") or 0)
+                except (TypeError, ValueError):
+                    refreshed_pid = 0
+                if refreshed_pid > 0 and not _pid_is_running(refreshed_pid):
+                    lock_path.unlink(missing_ok=True)
+                    return True
+                return False
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return False
 
 
 def _run_stalled_recovery_once(
@@ -241,300 +481,6 @@ def _run_stalled_recovery_once(
     )
 
 
-def _command_runtime(args: argparse.Namespace, project_root: Path | None = None) -> str:
-    return resolve_runtime(getattr(args, "runtime", None), project_root=project_root)
-
-
-def _command_locked(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "_locked", False))
-
-
-def _watchdog_enabled_for(project_root: Path | str) -> bool:
-    metadata = load_project_metadata(project_root)
-    return metadata.get("watchdog_enabled") is True
-
-
-@contextlib.contextmanager
-def _progress_monitor(project_root: Path) -> Any:
-    stop_event = threading.Event()
-
-    def worker() -> None:
-        last_signature: tuple[str, str, str] | None = None
-        while not stop_event.wait(30):
-            active_records = sorted(load_active_task_records(project_root), key=lambda row: str(row.get("updated_at") or ""), reverse=True)
-            active = active_records[0] if active_records else {}
-            task_id = str(active.get("task_id") or "").strip() or "-"
-            phase = str(active.get("phase") or "runtime").strip() or "runtime"
-            event = latest_task_log_event(project_root) or {}
-            message = str(event.get("message") or "still running").strip() or "still running"
-            signature = (task_id, phase, message)
-            if signature == last_signature:
-                print(f"[app-delivery] {phase} {task_id}: still running", file=sys.stderr, flush=True)
-            else:
-                print(f"[app-delivery] {phase} {task_id}: {message}", file=sys.stderr, flush=True)
-                last_signature = signature
-
-    thread = threading.Thread(target=worker, name="app-delivery-progress", daemon=True)
-    thread.start()
-    try:
-        yield None
-    finally:
-        stop_event.set()
-        thread.join(timeout=1)
-
-
-@contextlib.contextmanager
-def _project_execution_guard(project_root: Path, *, already_locked: bool) -> Any:
-    if already_locked:
-        yield None
-        return
-    lock_path = project_root / ".app-delivery-runtime" / "locks" / "execution.lock"
-    _prune_stale_execution_lock(project_root)
-    try:
-        timeout = float(os.environ.get("APP_DELIVERY_EXECUTION_LOCK_TIMEOUT_SECONDS") or EXECUTION_LOCK_TIMEOUT_SECONDS)
-    except ValueError:
-        timeout = EXECUTION_LOCK_TIMEOUT_SECONDS
-    try:
-        with acquire_lock(project_root, name="execution", timeout=max(0.0, timeout)):
-            yield lock_path
-    except TimeoutError as exc:
-        lock_details = read_lock_metadata(lock_path)
-        raise DeliveryError(
-            code="project_busy",
-            message=f"another app-delivery run is already active for {project_root}",
-            exit_code=2,
-            details={"project": str(project_root), "lock_path": str(lock_path), **({"lock_owner": lock_details} if lock_details else {})},
-            suggested_action="Wait for the active app-delivery run to finish, or stop the other process before retrying.",
-        ) from exc
-
-
-def cmd_render(args: argparse.Namespace) -> int:
-    render_work_items_markdown(resolve_project_root(args.project))
-    return 0
-
-
-def _refresh_project_summary_best_effort(project_root: Path) -> None:
-    try:
-        write_project_structure_snapshot(project_root)
-    except Exception as exc:  # pragma: no cover - defensive guard for machine-owned structure rendering
-        print(f"[app-delivery] warning: project structure refresh failed: {exc}", file=sys.stderr)
-    try:
-        project_summary(project_root)
-    except Exception as exc:  # pragma: no cover - defensive guard for machine-owned summary rendering
-        print(f"[app-delivery] warning: project summary refresh failed: {exc}", file=sys.stderr)
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    project_root = resolve_project_root(args.project)
-    payload = routed_status(project_root)
-    _refresh_project_summary_best_effort(project_root)
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    return 0
-
-
-def cmd_summary(args: argparse.Namespace) -> int:
-    print(json.dumps(project_summary(resolve_project_root(args.project)), indent=2, ensure_ascii=False))
-    return 0
-
-
-def cmd_doctor(args: argparse.Namespace) -> int:
-    payload = doctor_report(resolve_runtime(getattr(args, "runtime", None)), framework_root=args.framework_root, opc_home=args.opc_home)
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    return 0 if payload.get("status") == "ok" else 1
-
-
-def cmd_preflight(args: argparse.Namespace) -> int:
-    project_root = resolve_project_root(args.project)
-    payload = start_preflight(project_root, args.requirements, runtime=_command_runtime(args, project_root))
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    return 0 if payload.get("status") == "ok" else 1
-
-
-def cmd_init_project(args: argparse.Namespace) -> int:
-    payload = initialize_project(
-        resolve_project_root(args.project),
-        description=args.description or "App-delivery project",
-        runtime=resolve_runtime(args.runtime),
-        stack=args.stack,
-        force=args.force,
-        framework_root=args.framework_root,
-        watchdog_enabled=bool(getattr(args, "watchdog", True)),
-    )
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    return 0
-
-
-def _run_scaffold_once(project_root: Path | str, *, locked: bool = False) -> dict[str, Any]:
-    resolved = resolve_project_root(project_root)
-    with _project_execution_guard(resolved, already_locked=locked):
-        return DeliveryLoop(resolved).run_builtin_scaffold()
-
-
-def _run_loop_once(
-    project_root: Path | str,
-    *,
-    runtime: str | None,
-    max_auto_tasks: int | None = None,
-    locked: bool = False,
-) -> dict[str, Any]:
-    resolved = resolve_project_root(project_root)
-    with _project_execution_guard(resolved, already_locked=locked):
-        with _progress_monitor(resolved):
-            return DeliveryLoop(resolved, runtime=resolve_runtime(runtime, project_root=resolved)).run(max_auto_tasks=max_auto_tasks)
-
-
-def _run_verify_once(
-    project_root: Path | str,
-    *,
-    runtime: str | None,
-    mode: str = "all",
-    locked: bool = False,
-) -> dict[str, Any]:
-    resolved = resolve_project_root(project_root)
-    if mode == "all":
-        tasks = all_tasks(resolved)
-        incomplete_task_ids = [
-            task.id
-            for task in tasks
-            if task.id != "T-FINAL" and task.task_kind != "repair" and task.status not in {"verified", "cancelled"}
-        ]
-        if incomplete_task_ids:
-            raise DeliveryError(
-                code="verify_project_incomplete",
-                message="full verify is only allowed after all non-final tasks are verified",
-                exit_code=2,
-                details={"project": str(resolved), "incomplete_task_ids": incomplete_task_ids},
-                suggested_action="Continue normal delivery or use `app-delivery verify --mode non-verified` for diagnostic coverage without mutating final verification state.",
-            )
-    with _project_execution_guard(resolved, already_locked=locked):
-        return DeliveryLoop(resolved, runtime=resolve_runtime(runtime, project_root=resolved)).final_verify(suite_mode=mode)
-
-
-def _run_resume_once(
-    project_root: Path | str,
-    *,
-    runtime: str | None,
-    no_run: bool = False,
-    max_auto_tasks: int | None = None,
-    locked: bool = False,
-    spawn_watchdog_after: bool = True,
-) -> dict[str, Any] | None:
-    resolved = resolve_project_root(project_root)
-    with _project_execution_guard(resolved, already_locked=locked):
-        pause_path = resolved / PAUSE_FILE
-        if pause_path.exists():
-            pause_path.unlink()
-        if no_run:
-            if spawn_watchdog_after and _watchdog_enabled_for(resolved):
-                spawn_watchdog(resolved)
-            return None
-        result = _run_loop_once(
-            resolved,
-            runtime=runtime,
-            max_auto_tasks=max_auto_tasks,
-            locked=True,
-        )
-    if spawn_watchdog_after and _watchdog_enabled_for(resolved):
-        spawn_watchdog(resolved)
-    return result
-
-
-def _run_fix_once(
-    project_root: Path | str,
-    *,
-    task_id: str,
-    runtime: str | None,
-    no_start: bool = False,
-    spawn_watchdog_after: bool = True,
-) -> dict[str, Any] | None:
-    resolved = resolve_project_root(project_root)
-    _terminate_runtime_for_task(resolved, task_id)
-    with _project_execution_guard(resolved, already_locked=False):
-        tasks = all_tasks(resolved)
-        current = next((task for task in tasks if task.id == task_id), None)
-        updated = reset_task(tasks, task_id)
-        save_tasks(resolved, updated)
-        runtime_state_path = task_runtime_state_path(resolved, task_id)
-        if runtime_state_path.exists():
-            runtime_state_path.unlink()
-        review_artifact_path = resolved / "docs" / "reviews" / f"code-review-{task_id}.md"
-        if review_artifact_path.exists():
-            review_artifact_path.unlink()
-        if current and current.status_session_id:
-            active_session = current_session(resolved)
-            if active_session and active_session.id == current.status_session_id:
-                retire_session(resolved, active_session)
-        reapply_task_exception_patch(resolved, task_id)
-        pause_path = resolved / PAUSE_FILE
-        if pause_path.exists():
-            pause_path.unlink()
-    if no_start:
-        if spawn_watchdog_after and _watchdog_enabled_for(resolved):
-            spawn_watchdog(resolved)
-        return None
-    return _run_resume_once(
-        resolved,
-        runtime=runtime,
-        no_run=False,
-        locked=False,
-        spawn_watchdog_after=spawn_watchdog_after,
-    )
-
-
-def _execute_framework_control_step(step: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
-    action = str(step.get("action") or "").strip()
-    project_root = resolve_project_root(args.project)
-    if action == "run_scaffold":
-        return _run_scaffold_once(project_root)
-    if action == "run_repair_task":
-        task_id = str(step.get("task_id") or "").strip()
-        if not task_id:
-            raise DeliveryError(
-                code="control_repair_task_missing",
-                message="framework repair step is missing task_id",
-                exit_code=2,
-                details={"step": step},
-            )
-        return _run_fix_once(
-            project_root,
-            task_id=task_id,
-            runtime=getattr(args, "runtime", None),
-            no_start=False,
-            spawn_watchdog_after=False,
-        )
-    if action == "run_resume":
-        return _run_resume_once(
-            project_root,
-            runtime=getattr(args, "runtime", None),
-            max_auto_tasks=getattr(args, "max_auto_tasks", None),
-            spawn_watchdog_after=False,
-        )
-    if action == "run_final_verify":
-        return _run_verify_once(project_root, runtime=getattr(args, "runtime", None), mode="all")
-    if action == "recover_stalled":
-        task_id = str(step.get("task_id") or "").strip()
-        if not task_id:
-            raise DeliveryError(
-                code="control_recover_stalled_task_missing",
-                message="stalled recovery step is missing task_id",
-                exit_code=2,
-                details={"step": step},
-            )
-        return _run_stalled_recovery_once(
-            project_root,
-            task_id=task_id,
-            runtime=getattr(args, "runtime", None),
-            runtime_attention={key: value for key, value in step.items() if key.startswith("attention_") or key in {"message"}},
-            spawn_watchdog_after=False,
-        )
-    raise DeliveryError(
-        code="control_step_unsupported",
-        message=f"unsupported framework control action: {action}",
-        exit_code=2,
-        details={"step": step},
-    )
-
-
 def _parse_iso_datetime(value: Any) -> dt.datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -549,7 +495,7 @@ def _parse_iso_datetime(value: Any) -> dt.datetime | None:
 
 
 def _review_input_matches_latest_runtime_attempt(project_root: Path, task_id: str, input_path: Path) -> bool:
-    runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task_id))
+    runtime_state = load_task_runtime_state(project_root, task_id)
     completed_at = _parse_iso_datetime(runtime_state.get("completed_at"))
     if completed_at is None:
         return False
@@ -560,86 +506,30 @@ def _review_input_matches_latest_runtime_attempt(project_root: Path, task_id: st
     return input_mtime > completed_at
 
 
-def _host_step_autorun_enabled(project_root: Path) -> bool:
-    env_value = str(os.environ.get("APP_DELIVERY_DEFER_HOST_STEPS") or "").strip().lower()
-    if env_value in {"1", "true", "yes", "on"}:
-        return False
-    metadata = load_project_metadata(project_root)
-    configured = metadata.get("host_step_autorun")
-    if isinstance(configured, bool):
-        return configured
-    return True
-
-
-def _host_step_can_autorun(step: dict[str, Any], project_root: Path) -> bool:
-    if not _host_step_autorun_enabled(project_root):
-        return False
-    if str(step.get("owner") or "").strip() != "host":
-        return False
-    if str(step.get("kind") or "").strip() != "host_skill":
-        return False
-    if not str(step.get("skill") or "").strip():
-        return False
-    if not str(step.get("prompt") or "").strip():
-        return False
-    if not str(step.get("expected_input_path") or "").strip():
-        return False
-    return True
-
-
 def _run_host_skill_for_control_step(step: dict[str, Any], project_root: Path) -> dict[str, Any] | None:
-    if not _host_step_can_autorun(step, project_root):
-        return None
-    skill = str(step.get("skill") or "").strip()
-    prompt = str(step.get("prompt") or "").strip()
-    hermes_bin = str(os.environ.get("APP_DELIVERY_HERMES_BIN") or "hermes").strip() or "hermes"
-    hermes_path = hermes_bin if os.sep in hermes_bin else (shutil.which(hermes_bin) or "")
-    if not hermes_path:
-        raise DeliveryError(
-            code="host_skill_runner_missing",
-            message=f"unable to execute host skill {skill}: Hermes CLI was not found",
-            exit_code=2,
-            details={"skill": skill, "runner": hermes_bin, "project": str(project_root)},
-            suggested_action="Install Hermes CLI or set APP_DELIVERY_HERMES_BIN to the executable path, or defer host steps explicitly with APP_DELIVERY_DEFER_HOST_STEPS=1.",
-        )
-    command = [hermes_path, "chat", "-Q", "--skills", skill, "--query", prompt]
-    completed = subprocess.run(
-        command,
-        cwd=project_root,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+    return None
+
+
+def _save_waiting_for_host_step(project_root: Path, next_step: dict[str, Any]) -> None:
+    save_watchdog_state(
+        project_root,
+        {
+            "pid": os.getpid(),
+            "project": str(project_root),
+            "status": "waiting_for_host",
+            "last_action": str(next_step.get("action") or "host_step"),
+            "skill": str(next_step.get("skill") or ""),
+            "task_id": str(next_step.get("task_id") or ""),
+            "expected_input_path": str(next_step.get("expected_input_path") or ""),
+        },
     )
-    output = (completed.stdout or "").strip()
-    result: dict[str, Any] = {
-        "status": "executed",
-        "skill": skill,
-        "runner": hermes_path,
-        "exit_code": completed.returncode,
-    }
-    if output:
-        result["output"] = output[-4000:]
-    if completed.returncode != 0:
-        raise DeliveryError(
-            code="host_skill_execution_failed",
-            message=f"host skill execution failed for {skill}",
-            exit_code=2,
-            details={"skill": skill, "project": str(project_root), "command": command, **({"output": output[-4000:]} if output else {})},
-            suggested_action="Inspect the host-skill output and rerun the control plane after fixing the review/planning skill failure.",
-        )
-    return result
 
 
 def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path) -> dict[str, Any] | None:
     expected_input = str(step.get("expected_input_path") or "").strip()
     if not expected_input:
         return None
-    input_path_value = str(Path(expected_input).expanduser().resolve())
-    input_path = Path(input_path_value)
+    input_path = Path(expected_input).expanduser().resolve()
     if not input_path.exists():
         return None
 
@@ -656,78 +546,38 @@ def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path
 
     if skill == "code-review":
         if not task_id:
-            raise DeliveryError(
-                code="control_review_task_missing",
-                message="host review step is missing task_id",
-                exit_code=2,
-                details={"step": step},
-            )
-        payload, loaded_input_path = load_stage_payload(project_root, "code-review", input_path_value, expected_type=dict)
+            raise DeliveryError(code="control_review_task_missing", message="host review step is missing task_id", exit_code=2, details={"step": step})
+        payload, loaded_input_path = load_stage_payload(project_root, "code-review", str(input_path), expected_type=dict)
         assert isinstance(payload, dict)
         exit_code = import_task_review(project_root, task_id, payload, loaded_input_path)
     elif skill == "final-review":
-        payload, loaded_input_path = load_stage_payload(project_root, "final-review", input_path_value, expected_type=dict)
+        payload, loaded_input_path = load_stage_payload(project_root, "final-review", str(input_path), expected_type=dict)
         assert isinstance(payload, dict)
         exit_code = import_final_review(project_root, payload, loaded_input_path)
     elif skill == "spec-review":
-        payload, loaded_input_path = load_stage_payload(
-            project_root,
-            "spec-review",
-            input_path_value,
-            expected_type=dict,
-            required_fields=["requirements", "acceptance_scenarios"],
-        )
+        payload, loaded_input_path = load_stage_payload(project_root, "spec-review", str(input_path), expected_type=dict, required_fields=["requirements", "acceptance_scenarios"])
         assert isinstance(payload, dict)
         exit_code = import_spec_review(project_root, payload, loaded_input_path)
     elif skill == "arch-design":
-        payload, loaded_input_path = load_stage_payload(
-            project_root,
-            "arch-design",
-            input_path_value,
-            expected_type=dict,
-            required_fields=["architecture_md", "shared_components_md", "ui_required"],
-        )
+        payload, loaded_input_path = load_stage_payload(project_root, "arch-design", str(input_path), expected_type=dict, required_fields=["architecture_md", "shared_components_md", "ui_required"])
         assert isinstance(payload, dict)
         exit_code = import_arch_design(project_root, payload, loaded_input_path)
     elif skill == "ui-design":
-        payload, loaded_input_path = load_stage_payload(
-            project_root,
-            "ui-design",
-            input_path_value,
-            expected_type=dict,
-            required_fields=["template_selection_md", "design_system_md", "page_archetypes_md", "states_md"],
-        )
+        payload, loaded_input_path = load_stage_payload(project_root, "ui-design", str(input_path), expected_type=dict, required_fields=["template_selection_md", "design_system_md", "page_archetypes_md", "states_md"])
         assert isinstance(payload, dict)
         exit_code = import_ui_design(project_root, payload, loaded_input_path)
     elif skill == "project-context-sync":
-        payload, loaded_input_path = load_stage_payload(
-            project_root,
-            "project-context-sync",
-            input_path_value,
-            expected_type=dict,
-            required_fields=["test_plan"],
-        )
+        payload, loaded_input_path = load_stage_payload(project_root, "project-context-sync", str(input_path), expected_type=dict, required_fields=["test_plan"])
         assert isinstance(payload, dict)
         exit_code = import_context_sync(project_root, payload, loaded_input_path)
     elif skill == "task-decompose":
-        payload, loaded_input_path = load_stage_payload(
-            project_root,
-            "task-decompose",
-            input_path_value,
-            expected_type=dict,
-            required_fields=["items", "validation_gates", "delivery_complexity"],
-        )
+        payload, loaded_input_path = load_stage_payload(project_root, "task-decompose", str(input_path), expected_type=dict, required_fields=["items", "validation_gates", "delivery_complexity"])
         assert isinstance(payload, dict)
         exit_code = import_decompose(project_root, payload, loaded_input_path)
     else:
         return None
 
-    result: dict[str, Any] = {
-        "status": "imported",
-        "skill": skill,
-        "input_path": str(loaded_input_path),
-        "exit_code": exit_code,
-    }
+    result: dict[str, Any] = {"status": "imported", "skill": skill, "input_path": str(loaded_input_path), "exit_code": exit_code}
     if task_id:
         result["task_id"] = task_id
     return result
@@ -742,11 +592,7 @@ def _execute_host_control_step(step: dict[str, Any], project_root: Path) -> dict
     except DeliveryError as exc:
         result = _execute_host_control_step_if_ready(step, project_root)
         if result is not None:
-            result["host_execution"] = {
-                "status": "failed_but_existing_artifact_imported",
-                "code": exc.code,
-                "message": exc.message,
-            }
+            result["host_execution"] = {"status": "failed_but_existing_artifact_imported", "code": exc.code, "message": exc.message}
             return result
         raise
     if host_execution is None:
@@ -757,22 +603,53 @@ def _execute_host_control_step(step: dict[str, Any], project_root: Path) -> dict
             code="host_skill_output_missing",
             message=f"host skill {step.get('skill')} completed but did not produce an importable artifact",
             exit_code=2,
-            details={
-                "project": str(project_root),
-                "step": step,
-                "host_execution": host_execution,
-            },
+            details={"step": step, "host_execution": host_execution},
             suggested_action="Check the host skill output and ensure it writes the canonical JSON artifact to expected_input_path.",
         )
     result["host_execution"] = host_execution
     return result
 
 
+def _execute_framework_control_step(step: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
+    action = str(step.get("action") or "").strip()
+    project_root = resolve_project_root(args.project)
+    if action == "run_scaffold":
+        return _run_scaffold_once(project_root)
+    if action == "run_resume":
+        return _run_resume_once(
+            project_root,
+            runtime=getattr(args, "runtime", None),
+            max_auto_tasks=getattr(args, "max_auto_tasks", None),
+            spawn_watchdog_after=False,
+        )
+    if action == "run_final_verify":
+        return _run_verify_once(project_root, runtime=getattr(args, "runtime", None), mode="all")
+    if action == "auto_repair_exception":
+        task_id = str(step.get("task_id") or "").strip()
+        if not task_id:
+            raise DeliveryError(code="auto_repair_task_missing", message="auto exception repair step is missing task_id", exit_code=2, details={"step": step})
+        mark_auto_exception_repair_attempted(project_root, task_id)
+        return _run_fix_once(
+            project_root,
+            task_id=task_id,
+            runtime=getattr(args, "runtime", None),
+            no_start=True,
+            spawn_watchdog_after=False,
+        )
+    raise DeliveryError(
+        code="control_step_unsupported",
+        message=f"unsupported framework control action: {action}",
+        exit_code=2,
+        details={"step": step},
+    )
+
+
 def cmd_control(args: argparse.Namespace) -> int:
     project_root = resolve_project_root(args.project)
     goal = str(args.goal or "auto").strip().lower()
+    control_goal = "auto" if goal == "step" else goal
 
-    if goal == "repair" and not str(getattr(args, "task_id", "") or "").strip():
+    if control_goal == "repair" and not str(getattr(args, "task_id", "") or "").strip():
         raise DeliveryError(
             code="repair_task_missing",
             message="control goal=repair requires --task-id",
@@ -781,7 +658,7 @@ def cmd_control(args: argparse.Namespace) -> int:
 
     executed_steps: list[dict[str, Any]] = []
 
-    if goal == "repair":
+    if control_goal == "repair":
         repair_result = _run_fix_once(
             project_root,
             task_id=str(args.task_id).strip(),
@@ -795,18 +672,18 @@ def cmd_control(args: argparse.Namespace) -> int:
             "task_id": str(args.task_id).strip(),
             "result": repair_result,
         })
-        goal = "auto"
+        control_goal = "auto"
 
     snapshot = run_control(
         project_root,
-        goal=goal,
+        goal=control_goal,
         requirements_path=getattr(args, "requirements", None),
         repair_task_id=getattr(args, "task_id", None),
     )
     executed_steps.extend(snapshot.pop("executed_steps", []))
 
     safety = 0
-    while goal == "auto" and snapshot.get("must_continue"):
+    while goal in {"auto", "step"} and snapshot.get("must_continue"):
         safety += 1
         if safety > int(getattr(args, "max_control_steps", CONTROL_STEP_LIMIT) or CONTROL_STEP_LIMIT):
             raise DeliveryError(
@@ -834,31 +711,48 @@ def cmd_control(args: argparse.Namespace) -> int:
                 "action": action,
                 "result": result,
             })
-        else:
-            result = _execute_framework_control_step(next_step, args)
-            executed_steps.append({
-                "owner": owner,
-                "action": action,
-                "result": result,
-            })
+            snapshot = run_control(
+                project_root,
+                goal="auto",
+                requirements_path=getattr(args, "requirements", None),
+            )
+            executed_steps.extend(snapshot.pop("executed_steps", []))
+            if goal == "step":
+                break
+            continue
+        if owner != "framework":
+            break
+        result = _execute_framework_control_step(next_step, args)
+        executed_steps.append({
+            "owner": "framework",
+            "action": action,
+            "result": result,
+        })
         snapshot = run_control(
             project_root,
             goal="auto",
             requirements_path=getattr(args, "requirements", None),
         )
         executed_steps.extend(snapshot.pop("executed_steps", []))
+        if goal == "step":
+            break
 
     if executed_steps:
         snapshot["executed_steps"] = executed_steps
 
-    _refresh_project_summary_best_effort(project_root)
-
-    if goal in {"auto", "repair"} and _watchdog_enabled_for(project_root):
-        control_status = str(snapshot.get("control_status") or "").strip()
-        if control_status in {"in_progress", "running"}:
-            spawn_watchdog(project_root)
+    deferred_to_host = any(step.get("deferred_to_host") for step in executed_steps)
+    if control_goal in {"auto", "repair"} and _watchdog_enabled_for(project_root):
+        next_step = snapshot.get("next_step") if isinstance(snapshot.get("next_step"), dict) else {}
+        if deferred_to_host:
+            _save_waiting_for_host_step(project_root, next_step)
+        else:
+            control_status = str(snapshot.get("control_status") or "").strip()
+            if control_status in {"in_progress", "running"}:
+                spawn_watchdog(project_root)
 
     print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+    if goal in {"auto", "step"} and deferred_to_host:
+        return 1
     return 0 if str(snapshot.get("control_status") or "") not in {"blocked"} else 1
 
 
@@ -887,8 +781,114 @@ def cmd_verify(args: argparse.Namespace) -> int:
         mode=args.mode,
         locked=_command_locked(args),
     )
+    if str(result.get("status") or "").strip() == "deferred":
+        raise DeliveryError(
+            code="verify_project_incomplete",
+            message=str(result.get("summary") or "final verification deferred until all non-final tasks are verified"),
+            exit_code=2,
+            details=result,
+        )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result.get("passed") else 1
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root(args.project)
+    with _project_execution_guard(project_root, already_locked=_command_locked(args)):
+        payload = accept_gate(project_root, args.gate_id, reason=args.reason, actor="host")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root(args.project)
+    task_id = str(args.task_id or "").strip()
+    action = str(args.action or "").strip()
+    reason = str(args.reason or "").strip()
+    if not reason:
+        raise DeliveryError(
+            code="manual_task_action_reason_required",
+            message="manual task actions require --reason",
+            exit_code=2,
+            details={"project": str(project_root), "task_id": task_id, "action": action},
+        )
+    with _project_execution_guard(project_root, already_locked=_command_locked(args)):
+        tasks = all_tasks(project_root)
+        task = next((row for row in tasks if row.id == task_id), None)
+        if task is None:
+            raise DeliveryError(
+                code="task_missing",
+                message=f"task does not exist: {task_id}",
+                exit_code=2,
+                details={"project": str(project_root), "task_id": task_id},
+            )
+        now = utc_now_iso()
+        if action == "accept":
+            tasks = mark_task(
+                tasks,
+                task_id,
+                "verified",
+                review_status=task.review_status or "pass",
+                reviewed_at=task.reviewed_at or now,
+                verified_at=now,
+                completed_at=task.completed_at or now,
+                blocked_reason=f"manual host acceptance: {reason}",
+                attempts=max(task.attempts, 1),
+            )
+            save_tasks(project_root, tasks)
+            save_task_runtime_state(
+                project_root,
+                task_id,
+                {
+                    "manual_override": {"action": "accept", "reason": reason, "actor": "host", "accepted_at": now},
+                    "review_repair_limit_reached": False,
+                    "final_repair_limit_reached": False,
+                    "review_changes_requested_count": 0,
+                    "failure_count": 0,
+                    "failure_signature": "",
+                    "failure_kind": "",
+                    "failure_message": "",
+                },
+            )
+        elif action == "reset-repair":
+            if task.status == "verified" and task.task_kind != "repair":
+                raise DeliveryError(
+                    code="verified_task_repair_forbidden",
+                    message=(
+                        f"task {task_id} is already verified; do not reopen verified feature tasks. "
+                        "Repair regressions from the current task or a dedicated repair bundle instead."
+                    ),
+                    exit_code=2,
+                    details={"task_id": task_id, "status": task.status, "task_kind": task.task_kind},
+                )
+            tasks = reset_task(tasks, task_id, blocked_reason=f"manual repair reset: {reason}")
+            save_tasks(project_root, tasks)
+            save_task_runtime_state(
+                project_root,
+                task_id,
+                {
+                    "manual_override": {"action": "reset-repair", "reason": reason, "actor": "host", "reset_at": now},
+                    "review_repair_limit_reached": False,
+                    "final_repair_limit_reached": False,
+                    "review_changes_requested_count": 0,
+                    "review_repair_limit_report": None,
+                    "failure_count": 0,
+                    "failure_signature": "",
+                    "failure_kind": "",
+                    "failure_message": "",
+                },
+            )
+            reapply_task_exception_patch(project_root, task_id)
+        else:
+            raise DeliveryError(
+                code="manual_task_action_invalid",
+                message=f"unsupported task action: {action}",
+                exit_code=2,
+                details={"supported_actions": ["accept", "reset-repair"]},
+            )
+        runtime_state = load_task_runtime_state(project_root, task_id)
+    print(json.dumps({"status": "ok", "task_id": task_id, "action": action, "runtime_state": runtime_state}, indent=2, ensure_ascii=False))
+    return 0
 
 
 def cmd_code_review(args: argparse.Namespace) -> int:
@@ -896,7 +896,10 @@ def cmd_code_review(args: argparse.Namespace) -> int:
     with _project_execution_guard(project_root, already_locked=_command_locked(args)):
         payload, input_path = load_stage_payload(project_root, "code-review", args.input, expected_type=dict)
         assert isinstance(payload, dict)
-        return import_task_review(project_root, args.task_id, payload, input_path)
+        import_exit_code = import_task_review(project_root, args.task_id, payload, input_path)
+        _refresh_project_summary_best_effort(project_root)
+    print(json.dumps({"status": "imported", "stage": "code-review", "task_id": args.task_id, "input_path": str(input_path), "import_exit_code": import_exit_code}, indent=2, ensure_ascii=False))
+    return 0
 
 
 def cmd_final_review(args: argparse.Namespace) -> int:
@@ -904,7 +907,9 @@ def cmd_final_review(args: argparse.Namespace) -> int:
     with _project_execution_guard(project_root, already_locked=_command_locked(args)):
         payload, input_path = load_stage_payload(project_root, "final-review", args.input, expected_type=dict)
         assert isinstance(payload, dict)
-        return import_final_review(project_root, payload, input_path)
+        import_exit_code = import_final_review(project_root, payload, input_path)
+    print(json.dumps({"status": "imported", "stage": "final-review", "input_path": str(input_path), "import_exit_code": import_exit_code}, indent=2, ensure_ascii=False))
+    return 0
 
 
 def cmd_spec_review(args: argparse.Namespace) -> int:
@@ -1018,6 +1023,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
             goal="pause",
             requirements=None,
             task_id=None,
+            hermes_bin="hermes",
             runtime=getattr(args, "runtime", None),
             max_auto_tasks=None,
             max_control_steps=CONTROL_STEP_LIMIT,
@@ -1035,6 +1041,17 @@ def cmd_resume(args: argparse.Namespace) -> int:
     )
     if result is None:
         return 0
+    if str(result.get("status") or "").strip() == "exception":
+        result.setdefault("fix_status", "not_resumed")
+        result.setdefault(
+            "next_actions",
+            [
+                "Inspect the exception task status and review artifact.",
+                "Use `app-delivery task --action reset-repair --reason ...` only after deciding another repair attempt is justified.",
+            ],
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 1
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
@@ -1056,30 +1073,6 @@ def cmd_watchdog_run(args: argparse.Namespace) -> int:
     while True:
         payload = routed_status(project_root)
         control_status = str(payload.get("control_status") or "").strip()
-        active_task = payload.get("active_task") if isinstance(payload.get("active_task"), dict) else None
-        runtime_attention = payload.get("runtime_attention") if isinstance(payload.get("runtime_attention"), dict) else None
-        if control_status == "running" and active_task is not None and runtime_attention and runtime_attention.get("suspected"):
-            task_id = str(active_task.get("id") or "").strip()
-            if task_id:
-                save_watchdog_state(
-                    project_root,
-                    {
-                        "pid": os.getpid(),
-                        "project": str(project_root),
-                        "status": "running",
-                        "last_action": "recover_stalled",
-                        "task_id": task_id,
-                        "attention_kind": runtime_attention.get("kind"),
-                    },
-                )
-                _run_stalled_recovery_once(
-                    project_root,
-                    task_id=task_id,
-                    runtime=None,
-                    runtime_attention=runtime_attention,
-                    spawn_watchdog_after=False,
-                )
-                continue
         if control_status == "paused":
             save_watchdog_state(project_root, {"pid": os.getpid(), "project": str(project_root), "status": "paused", "last_action": "paused"})
             return 0
@@ -1089,19 +1082,28 @@ def cmd_watchdog_run(args: argparse.Namespace) -> int:
         if control_status == "blocked":
             save_watchdog_state(project_root, {"pid": os.getpid(), "project": str(project_root), "status": "blocked", "last_action": "blocked"})
             return 0
+        runtime_attention = payload.get("runtime_attention") if isinstance(payload.get("runtime_attention"), dict) else None
+        active_task = payload.get("active_task") if isinstance(payload.get("active_task"), dict) else None
+        if runtime_attention and runtime_attention.get("suspected") and active_task:
+            task_id = str(active_task.get("id") or "").strip()
+            if task_id:
+                save_watchdog_state(project_root, {"pid": os.getpid(), "project": str(project_root), "status": "running", "last_action": "stalled_recovery", "task_id": task_id})
+                _run_stalled_recovery_once(project_root, task_id=task_id, runtime=None, runtime_attention=runtime_attention, spawn_watchdog_after=False)
+                continue
         if payload.get("must_continue"):
             next_step = payload.get("next_step") if isinstance(payload.get("next_step"), dict) else {}
-            if str(next_step.get("owner") or "").strip() == "host" and not _host_step_can_autorun(next_step, project_root):
-                save_watchdog_state(project_root, {"pid": os.getpid(), "project": str(project_root), "status": "blocked", "last_action": "host_step_required"})
+            owner = str(next_step.get("owner") or "framework").strip()
+            if owner == "host":
+                _save_waiting_for_host_step(project_root, next_step)
                 return 0
-            last_action = "host_step" if str(next_step.get("owner") or "").strip() == "host" else "resume"
-            save_watchdog_state(project_root, {"pid": os.getpid(), "project": str(project_root), "status": "running", "last_action": last_action})
+            save_watchdog_state(project_root, {"pid": os.getpid(), "project": str(project_root), "status": "running", "last_action": "resume"})
             cmd_control(
                 argparse.Namespace(
                     project=str(project_root),
                     goal="auto",
                     requirements=None,
                     task_id=None,
+                    hermes_bin=getattr(args, "hermes_bin", "hermes"),
                     runtime=None,
                     max_auto_tasks=None,
                     max_control_steps=CONTROL_STEP_LIMIT,
@@ -1122,20 +1124,18 @@ def cmd_fix(args: argparse.Namespace) -> int:
     )
     if result is None:
         return 0
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
-
-
-def cmd_recover_stalled(args: argparse.Namespace) -> int:
-    result = _run_stalled_recovery_once(
-        args.project,
-        task_id=args.task_id,
-        runtime=getattr(args, "runtime", None),
-        runtime_attention=None,
-        spawn_watchdog_after=True,
-    )
-    if result is not None:
+    if str(result.get("status") or "").strip() == "exception":
+        result.setdefault("fix_status", "not_resumed")
+        result.setdefault(
+            "next_actions",
+            [
+                "Inspect the exception task status and review artifact.",
+                "Use `app-delivery task --action reset-repair --reason ...` only after deciding another repair attempt is justified.",
+            ],
+        )
         print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 1
+    print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -1185,6 +1185,20 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--mode", choices=["all", "non-verified"], default="all")
     verify.set_defaults(func=cmd_verify)
 
+    gate = subparsers.add_parser("gate")
+    gate.add_argument("--project", required=True)
+    gate.add_argument("--gate-id", required=True)
+    gate.add_argument("--action", choices=["accept"], default="accept")
+    gate.add_argument("--reason", required=True)
+    gate.set_defaults(func=cmd_gate)
+
+    task_action = subparsers.add_parser("task")
+    task_action.add_argument("--project", required=True)
+    task_action.add_argument("--task-id", required=True)
+    task_action.add_argument("--action", choices=["accept", "reset-repair"], required=True)
+    task_action.add_argument("--reason", required=True)
+    task_action.set_defaults(func=cmd_task)
+
     code_review = subparsers.add_parser("code-review")
     code_review.add_argument("--project", required=True)
     code_review.add_argument("--task-id", required=True)
@@ -1206,10 +1220,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     control = subparsers.add_parser("control")
     control.add_argument("--project", required=True)
-    control.add_argument("--goal", choices=["auto", "status", "pause", "repair"], default="auto")
+    control.add_argument("--goal", choices=["auto", "status", "pause", "repair", "step"], default="auto")
     control.add_argument("--requirements")
     control.add_argument("--task-id")
     control.add_argument("--runtime")
+    control.add_argument("--hermes-bin", default=os.environ.get("APP_DELIVERY_HERMES_BIN", "hermes"))
     control.add_argument("--max-auto-tasks", type=int)
     control.add_argument("--max-control-steps", type=int, default=CONTROL_STEP_LIMIT)
     control.set_defaults(func=cmd_control)
@@ -1240,7 +1255,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_project.add_argument("--stack", default="python-react")
     init_project.add_argument("--framework-root")
     init_project.add_argument("--force", action="store_true")
-    init_project.add_argument("--watchdog", action=argparse.BooleanOptionalAction, default=True)
+    init_project.add_argument("--watchdog", action=argparse.BooleanOptionalAction, default=False)
     init_project.set_defaults(func=cmd_init_project)
 
     pause = subparsers.add_parser("pause")
@@ -1259,12 +1274,6 @@ def build_parser() -> argparse.ArgumentParser:
     fix.add_argument("--runtime")
     fix.add_argument("--no-start", action="store_true")
     fix.set_defaults(func=cmd_fix)
-
-    recover_stalled = subparsers.add_parser("recover-stalled")
-    recover_stalled.add_argument("--project", required=True)
-    recover_stalled.add_argument("--task-id", required=True)
-    recover_stalled.add_argument("--runtime")
-    recover_stalled.set_defaults(func=cmd_recover_stalled)
 
     status = subparsers.add_parser("status")
     status.add_argument("--project", required=True)

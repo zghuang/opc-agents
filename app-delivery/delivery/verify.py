@@ -20,6 +20,7 @@ from .state import (
     utc_now_iso,
     write_active_task_record,
 )
+from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
 from .test_env import ensure_task_test_environment, frontend_e2e_env_prefix
 from .task import FINAL_VERIFY_TASK_ID, SHARED_FOUNDATION_TASK_ID, SCAFFOLD_TASK_ID, all_tasks
 
@@ -345,25 +346,40 @@ def weak_test_file_reason(project_root: Path | str, spec: str) -> str:
 
 def infer_test_types(test_files: list[str]) -> list[str]:
     kinds: list[str] = []
-    for path in test_files:
-        lowered = path.lower()
+    backend_tests = backend_test_root(PYTHON_REACT_CONTRACT) + "/"
 
-        if lowered.startswith("backend/src/tests/test_") and not lowered.startswith("backend/src/tests/test_health.py") and not lowered.startswith("backend/src/tests/test_core"):
-            if "api" not in kinds:
-                kinds.append("api")
-        elif lowered.startswith("backend/src/tests/") or lowered.startswith("backend/tests/core/"):
-            if "unit" not in kinds:
-                kinds.append("unit")
-        elif lowered.startswith("backend/tests/"):
-            if "api" not in kinds:
-                kinds.append("api")
-            if "integration" not in kinds:
-                kinds.append("integration")
-        if lowered.startswith("frontend/e2e/") and "browser" not in kinds:
-            kinds.append("browser")
+    def add(kind: str) -> None:
+        if kind not in kinds:
+            kinds.append(kind)
+
+    for path in test_files:
+        lowered = path.lower().replace("\\", "/")
+
+        if lowered.startswith(backend_tests):
+            relative = lowered[len(backend_tests):]
+            filename = Path(relative).name
+            if "performance" in relative or "benchmark" in relative:
+                add("performance")
+            if relative.startswith(("core/", "test_core/", "test_agents/", "test_memory/", "test_knowledge/")):
+                add("unit")
+            elif relative.startswith(("test_api/", "api/")) or "/api/" in relative or filename.startswith("test_api_"):
+                add("api")
+                add("integration")
+            elif relative.startswith(("integration/", "test_integration/", "test_workflows/", "workflows/", "test_infrastructure/")):
+                add("integration")
+            elif relative.startswith(("scenarios/", "test_scenarios/")):
+                add("integration")
+                add("e2e")
+            else:
+                add("unit")
+        elif lowered.startswith("backend/src/tests/"):
+            add("unit")
+        if lowered.startswith("frontend/e2e/"):
+            add("browser")
+            add("e2e")
+            add("integration")
         if lowered.startswith("mock-server/tests/") and "contract" in Path(lowered).name:
-            if "contract" not in kinds:
-                kinds.append("contract")
+            add("contract")
 
         mapping = (
             ("mock-server/tests/", "integration"),
@@ -410,10 +426,11 @@ def infer_test_types(test_files: list[str]) -> list[str]:
             ("yarn e2e", "e2e"),
         )
         for marker, kind in mapping:
-            if marker in lowered and kind not in kinds:
-                kinds.append(kind)
-        if any(marker in lowered for marker in ("npm run e2e", "pnpm run e2e", "yarn e2e")) and "browser" not in kinds:
-            kinds.append("browser")
+            if marker in lowered:
+                add(kind)
+        if any(marker in lowered for marker in ("npm run e2e", "pnpm run e2e", "yarn e2e")):
+            add("browser")
+            add("integration")
     return kinds or ["unit"]
 
 
@@ -745,7 +762,21 @@ def run_task_tests(project_root: Path | str, task: dict[str, Any], *, attempt: i
     overall_passed = True
     observed_test_specs = list(test_specs)
     for spec in test_specs:
-        env_result = ensure_task_test_environment(project_dir, task, spec)
+        try:
+            env_result = ensure_task_test_environment(project_dir, task, spec)
+        except RuntimeError as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            overall_passed = False
+            failed_count += 1
+            failures.append(
+                TestFailure(
+                    test=spec,
+                    message=f"test environment preparation failed: {message[:300]}",
+                    traceback=message[:4000],
+                    failure_kind="environment_prepare_error",
+                )
+            )
+            continue
         if not env_result.ready:
             overall_passed = False
             failed_count += 1

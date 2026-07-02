@@ -15,23 +15,10 @@ services:
       timeout: 5s
       retries: 10
 
-  backend:
-    build: ./backend
-    ports:
-      - "${BACKEND_HOST_PORT:-18000}:8000"
-    env_file: backend/.env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://opc_user:${DB_PASSWORD:-password}@postgres:5432/app_db
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   frontend:
     build: ./frontend
     ports:
       - "${FRONTEND_HOST_PORT:-15080}:8080"
-    depends_on:
-      - backend
 
   mocks:
     build: ./mock-server

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .stack_contracts import PYTHON_REACT_CONTRACT, optional_stack_paths
 from .task import FINAL_VERIFY_TASK_ID, Task, next_generated_task_id
 
 
@@ -59,8 +60,7 @@ def default_python_react_environment_repair_scope_paths(project_root: Path | str
         "docker-compose.yml",
         "docker/",
         "backend/.env",
-        "backend/src/main.py",
-        "backend/src/runtime/",
+        *optional_stack_paths(PYTHON_REACT_CONTRACT.backend_entrypoint, f"{PYTHON_REACT_CONTRACT.backend_runtime_root}/"),
         "frontend/package.json",
         "frontend/package-lock.json",
         "frontend/pnpm-lock.yaml",
@@ -68,7 +68,7 @@ def default_python_react_environment_repair_scope_paths(project_root: Path | str
         "frontend/playwright.config.ts",
         "frontend/vite.config.ts",
         "frontend/src/api/",
-        "mock-server/",
+        f"{PYTHON_REACT_CONTRACT.mock_server_root}/",
         "scripts/",
         "docs/reviews/final-repair-report.md",
     ]

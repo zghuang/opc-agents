@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
 from .requirements_context import format_acceptance_context, format_requirement_context
-from .runtime_config import load_project_metadata
 from .state import load_gates, load_test_results, project_paths
+from .test_env import frontend_e2e_env_prefix
 from .builtin_task_prompts import render_frontend_api_audit_prompt, render_prefinal_audit_prompt
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, SHARED_FOUNDATION_TASK_ID
-from .task import Task, lint_task_contract
+from .loop_gitops import repair_invalid_verified_tasks
+from .task import Task, all_tasks, lint_task_contract
 
 
 FINAL_REPAIR_REPORT_PATH = "docs/reviews/final-repair-report.md"
@@ -117,91 +117,36 @@ def _append_python_package_placement_rule(lines: list[str], task: Task) -> None:
     )
 
 
-def _dependency_hint_tokens(name: str) -> list[str]:
-    return [token for token in re.split(r"[^A-Za-z0-9]+", str(name or "").casefold()) if len(token) >= 3]
+def _append_validation_command_guidance(lines: list[str], project_root: Path | str, task: Task, *, has_backend_specs: bool, has_frontend_specs: bool) -> None:
+    if has_backend_specs:
+        lines.append("- Backend validation: prefer package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`, using the repository environment rather than bare system python.")
+    if has_frontend_specs:
+        lines.append("- Frontend validation: prefer the scripts declared in `frontend/package.json` (`npm run test`, `typecheck`, `lint`, `build`, `e2e`) instead of custom one-off commands.")
+    if has_frontend_specs and _has_browser_style_test(task):
+        e2e_prefix = frontend_e2e_env_prefix(project_root).strip()
+        if e2e_prefix:
+            lines.append(f"- Browser/e2e validation: if you manually run Playwright or `npm run e2e`, prefix it with `{e2e_prefix}` so the local backend is started for Vite API proxy requests.")
 
 
-def _task_hint_context(task: Task, requirement_context: list[str], acceptance_context: list[str]) -> str:
-    parts = [
-        task.title,
-        " ".join(task.requirements),
-        " ".join(task.acceptance_scenarios),
-        " ".join(task.output_paths),
-        " ".join(task.output_tests),
-        " ".join(requirement_context),
-        " ".join(acceptance_context),
-    ]
-    return "\n".join(parts).casefold()
-
-
-def _task_touches_manifest_for_ecosystem(task: Task, ecosystem: str) -> bool:
-    paths = set(task.output_paths)
-    if ecosystem == "backend":
-        return bool(paths.intersection({"backend/pyproject.toml", "backend/uv.lock"}))
-    if ecosystem == "frontend":
-        return bool(paths.intersection({"frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}))
-    if ecosystem in {"infra", "project"}:
-        return any(path in paths for path in {"docker-compose.yml", "README.md"})
-    return False
-
-
-def _dependency_hint_relevant(task: Task, hint: dict[str, str], context: str) -> bool:
-    ecosystem = str(hint.get("ecosystem") or "project").strip().lower() or "project"
-    if task.id != SHARED_FOUNDATION_TASK_ID and _task_touches_manifest_for_ecosystem(task, ecosystem):
-        return True
-    name = str(hint.get("name") or "").strip()
-    if not name:
-        return False
-    if name.casefold() in context:
-        return True
-    tokens = _dependency_hint_tokens(name)
-    return bool(tokens) and any(token in context for token in tokens)
-
-
-def _relevant_dependency_hints(project_root: Path | str, task: Task, requirement_context: list[str] | None = None, acceptance_context: list[str] | None = None) -> list[dict[str, str]]:
-    metadata = load_project_metadata(project_root)
-    raw_hints = metadata.get("dependency_hints") if isinstance(metadata.get("dependency_hints"), list) else []
-    ecosystems = {"project"}
-    if any(path.startswith("backend/") for path in task.output_paths):
-        ecosystems.add("backend")
-    if any(path.startswith("frontend/") for path in task.output_paths):
-        ecosystems.add("frontend")
-    result: list[dict[str, str]] = []
-    for row in raw_hints:
-        if not isinstance(row, dict):
-            continue
-        ecosystem = str(row.get("ecosystem") or "project").strip().lower() or "project"
-        if ecosystem not in ecosystems:
-            continue
-        name = str(row.get("name") or "").strip()
+def _append_technology_constraints_section(lines: list[str], constraints: list[dict[str, Any]] | None) -> None:
+    if not constraints:
+        return
+    lines.append("Required technology constraints for this task:")
+    for constraint in constraints:
+        name = str(constraint.get("name") or "").strip()
         if not name:
             continue
-        hint = {
-            "ecosystem": ecosystem,
-            "name": name,
-            "reason": str(row.get("reason") or "").strip(),
-            "source": str(row.get("source") or "").strip(),
-            "evidence": str(row.get("evidence") or "").strip(),
-        }
-        context = _task_hint_context(task, requirement_context or [], acceptance_context or [])
-        if _dependency_hint_relevant(task, hint, context):
-            result.append(hint)
-    return result
-
-
-def _append_dependency_hint_section(lines: list[str], dependency_hints: list[dict[str, str]]) -> None:
-    if not dependency_hints:
-        return
-    lines.append("Project technology constraints for this task:")
-    for hint in dependency_hints:
-        suffix = ""
-        evidence = str(hint.get("evidence") or "").strip()
-        source = str(hint.get("source") or "").strip()
-        if evidence or source:
-            suffix = f" [{'; '.join(part for part in [source, evidence] if part)}]"
-        reason = str(hint.get("reason") or "").strip() or "Required by project planning artifacts."
-        lines.append(f"- {hint['name']} ({hint['ecosystem']}): {reason}{suffix}")
-    lines.append("- Use these technologies unless an ADR or clarification supersedes them.")
+        ecosystem = str(constraint.get("ecosystem") or "project").strip() or "project"
+        requirement = str(constraint.get("requirement") or "must_use").strip() or "must_use"
+        reason = str(constraint.get("reason") or "").strip() or "Required by planning artifacts."
+        source = str(constraint.get("source") or "").strip()
+        suffix = f" [source: {source}]" if source else ""
+        lines.append(f"- {name} ({ecosystem}, {requirement}): {reason}{suffix}")
+        expected_evidence = [str(value).strip() for value in constraint.get("expected_evidence", []) if str(value).strip()] if isinstance(constraint.get("expected_evidence"), list) else []
+        if expected_evidence:
+            lines.append("  Expected evidence:")
+            lines.extend(f"  - {value}" for value in expected_evidence)
+    lines.append("- Treat these as task-scoped implementation requirements unless a superseding ADR or clarification is explicit.")
     lines.append("")
 
 
@@ -272,6 +217,29 @@ def _append_repair_focus_section(lines: list[str], project_root: Path | str, tas
         lines.append(f"- Repair summary: {task.blocked_reason}")
     if _is_final_repair_task(task):
         lines.append("- For final repair bundles, close listed final failures only.")
+    lines.append("")
+
+
+def _append_invalid_verified_context(lines: list[str], project_root: Path | str) -> None:
+    tasks = all_tasks(project_root)
+    task_by_id = {task.id: task for task in tasks}
+    _, issues = repair_invalid_verified_tasks(project_root, tasks)
+    if not issues:
+        return
+    lines.append("Verified upstream evidence issues:")
+    for task_id, issue in list(issues.items())[:5]:
+        upstream_task = task_by_id.get(task_id)
+        context_paths = [f".app-delivery-runtime/prompts/{task_id}.md"]
+        if upstream_task is not None and upstream_task.review_artifact:
+            context_paths.append(upstream_task.review_artifact)
+        test_report = f"docs/reviews/test-report-{task_id}.md"
+        if (Path(project_root).expanduser().resolve() / test_report).exists():
+            context_paths.append(test_report)
+        lines.append(f"- {task_id}: {issue}")
+        lines.append(f"  Context: {', '.join(context_paths)}")
+    lines.append("- Do not reopen, reset, or re-run verified feature tasks to repair these issues.")
+    lines.append("- If the current task already touches the affected behavior, repair it here as a necessary adjacent support change and validate it under the current task's evidence.")
+    lines.append("- If the issue is outside the current task's scope, leave the verified task unchanged and report that a dedicated repair bundle is needed.")
     lines.append("")
 
 
@@ -349,8 +317,7 @@ def build_review_repair_prompt(project_root: Path | str, task: Task) -> str:
     _append_task_intent_section(lines, task)
     requirement_context = format_requirement_context(project_root, task.requirements) or []
     acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
-    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
-    _append_dependency_hint_section(lines, dependency_hints)
+    _append_technology_constraints_section(lines, task.technology_constraints)
     _append_review_repair_context(
         lines,
         project_root,
@@ -360,6 +327,7 @@ def build_review_repair_prompt(project_root: Path | str, task: Task) -> str:
         gate_rows=gate_rows,
         failed_summary=failed_summary,
     )
+    _append_invalid_verified_context(lines, project_root)
     has_backend_specs = any(spec.startswith("backend/") for spec in task.output_tests)
     has_frontend_specs = any(spec.startswith("frontend/") for spec in task.output_tests)
     has_frontend_paths = any(path.startswith("frontend/") for path in task.output_paths)
@@ -377,10 +345,7 @@ def build_review_repair_prompt(project_root: Path | str, task: Task) -> str:
         if not has_browser_specs:
             lines.append("- No browser/e2e test is currently declared for this frontend acceptance slice. Add one now unless the downstream validation owner is explicit in the task graph.")
     lines.append("- Complete only the current task. Do not start the next task, pre-implement future work, or widen scope after the review issues are repaired.")
-    if has_backend_specs:
-        lines.append("- Backend validation: prefer package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`, using the repository environment rather than bare system python.")
-    if has_frontend_specs:
-        lines.append("- Frontend validation: prefer the scripts declared in `frontend/package.json` (`npm run test`, `typecheck`, `lint`, `build`, `e2e`) instead of custom one-off commands.")
+    _append_validation_command_guidance(lines, project_root, task, has_backend_specs=has_backend_specs, has_frontend_specs=has_frontend_specs)
     if touches_dependency_manifest:
         lines.append("- This task touches dependency manifests. Consult the `Tech Design` section in AGENTS.md / CLAUDE.md plus `docs/architecture.md` before changing project-wide stack choices.")
         lines.append("- Resolve exact packages deliberately; do not dump unused stack dependencies into manifests.")
@@ -445,8 +410,7 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         lines.append("")
     else:
         acceptance_context = []
-    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
-    _append_dependency_hint_section(lines, dependency_hints)
+    _append_technology_constraints_section(lines, task.technology_constraints)
     if task.output_paths:
         lines.append(f"Paths: {', '.join(task.output_paths)}")
         lines.append("")
@@ -476,6 +440,7 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
                 f"- {str(gate.get('id') or '-').strip()}: status={str(gate.get('status') or '-').strip()} required={required} observed={observed} missing={missing} reason={reason} report={report_artifact}"
             )
         lines.append("")
+    _append_invalid_verified_context(lines, project_root)
     touches_dependency_manifest = any(
         path in {"backend/pyproject.toml", "frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}
         for path in task.output_paths
@@ -500,10 +465,7 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         if not has_browser_specs:
             lines.append("- No browser/e2e test is currently declared for this frontend acceptance slice. Add one now unless the downstream validation owner is explicit in the task graph.")
     lines.append("- Complete only the current task. Do not start the next task, pre-implement future work, or widen scope after this task's declared tests pass.")
-    if has_backend_specs:
-        lines.append("- Backend validation: prefer package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`, using the repository environment rather than bare system python.")
-    if has_frontend_specs:
-        lines.append("- Frontend validation: prefer the scripts declared in `frontend/package.json` (`npm run test`, `typecheck`, `lint`, `build`, `e2e`) instead of custom one-off commands.")
+    _append_validation_command_guidance(lines, project_root, task, has_backend_specs=has_backend_specs, has_frontend_specs=has_frontend_specs)
     if touches_dependency_manifest:
         lines.append("- This task touches dependency manifests. Consult the `Tech Design` section in AGENTS.md / CLAUDE.md plus `docs/architecture.md` before changing project-wide stack choices.")
         lines.append("- Resolve exact packages deliberately; do not dump unused stack dependencies into manifests.")
@@ -549,8 +511,7 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
         lines.append("")
     else:
         acceptance_context = []
-    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
-    _append_dependency_hint_section(lines, dependency_hints)
+    _append_technology_constraints_section(lines, task.technology_constraints)
     if task.output_paths:
         lines.append(f"Paths: {', '.join(task.output_paths)}")
         lines.append("")
@@ -580,6 +541,7 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
                 f"- {str(gate.get('id') or '-').strip()}: status={str(gate.get('status') or '-').strip()} required={required} observed={observed} missing={missing} reason={reason} report={report_artifact}"
             )
         lines.append("")
+    _append_invalid_verified_context(lines, project_root)
     if str(task.review_status or "").strip().casefold() == "changes_requested":
         lines.append("Review repair context:")
         if task.blocked_reason:
@@ -616,10 +578,7 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
         if not has_browser_specs:
             lines.append("- No browser/e2e test is currently declared for the frontend-facing scenarios in this validation task. Add one unless the task contract is explicitly wrong and must be corrected upstream.")
     lines.append("- Complete only the current task. Do not start the next task, pre-implement future work, or widen scope after this task's declared tests pass.")
-    if has_backend_specs:
-        lines.append("- Backend validation: prefer package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`, using the repository environment rather than bare system python.")
-    if has_frontend_specs:
-        lines.append("- Frontend validation: prefer the scripts declared in `frontend/package.json` (`npm run test`, `typecheck`, `lint`, `build`, `e2e`) instead of custom one-off commands.")
+    _append_validation_command_guidance(lines, project_root, task, has_backend_specs=has_backend_specs, has_frontend_specs=has_frontend_specs)
     lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
     prompt = "\n".join(lines)
     write_task_prompt(project_root, task, prompt)
@@ -650,8 +609,17 @@ def build_fix_prompt(project_root: Path | str, task: Task, test_summary: str) ->
             "Repair guidance:",
             "- Stay inside this project root and task contract. Do not search sibling projects or the framework repo unless you have concrete evidence of a framework defect.",
             "- Start from the failing declared tests and the declared output paths above. Prefer fixing project-local implementation and test wiring before broad exploration.",
-            "- Backend validation: run package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`.",
-            "- Frontend validation: run the scripts declared in `frontend/package.json`, including Playwright from `frontend/` when the failing spec is under `frontend/e2e/`.",
+        ]
+    )
+    _append_validation_command_guidance(
+        lines,
+        project_root,
+        task,
+        has_backend_specs=any(spec.startswith("backend/") for spec in task.output_tests),
+        has_frontend_specs=any(spec.startswith("frontend/") for spec in task.output_tests),
+    )
+    lines.extend(
+        [
             "- If the failure is in browser/e2e coverage, inspect the project-local route/auth wiring, Playwright config, and backend startup assumptions before searching generic framework files.",
             "- Repair the implementation or the tests if they are brittle, then stop as soon as the current task is complete, blocked, or ready for review.",
         ]
@@ -702,11 +670,16 @@ def build_stalled_recovery_prompt(
             "- Continue from the existing implementation already on disk. Inspect current task-scoped changes before creating new files or restarting broad exploration.",
             "- Do not re-scan the whole repository from scratch. Start from the declared output paths, declared output tests, and the stall evidence above.",
             "- If the current worktree already contains task-relevant changes, reconcile those changes with the failing tests before adding more code.",
-            "- Backend validation: run package-relative commands from `backend/`, for example `cd backend && uv run pytest ...`.",
-            "- Frontend validation: run the scripts declared in `frontend/package.json`, including Playwright from `frontend/` when a failing spec is under `frontend/e2e/`.",
-            "- When the task is complete, blocked, or ready for review, stop immediately and let the framework route the next step.",
         ]
     )
+    _append_validation_command_guidance(
+        lines,
+        project_root,
+        task,
+        has_backend_specs=any(spec.startswith("backend/") for spec in task.output_tests),
+        has_frontend_specs=any(spec.startswith("frontend/") for spec in task.output_tests),
+    )
+    lines.append("- When the task is complete, blocked, or ready for review, stop immediately and let the framework route the next step.")
     return "\n".join(lines)
 
 

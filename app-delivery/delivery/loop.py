@@ -15,6 +15,7 @@ from .production_semantics import SemanticFinding, scan_production_semantics, wr
 from .runtime_config import resolve_runtime
 from .scaffold import scaffold_project
 from .session import RuntimeErrorResponse, RuntimeSession, current_session, execute_in_session, retire_session, save_current_session, start_task_session, touch_session
+from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID
 from .config_validation import config_validation_summary, validate_project_config_files
 from .state import (
@@ -54,6 +55,13 @@ MAX_STALLED_RUNTIME_RECOVERIES = 2
 MAX_FINAL_REPAIR_ITERATIONS = 3
 FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
+
+
+def _refresh_project_summary_after_task_update(project_root: Path | str) -> None:
+    try:
+        project_summary(project_root)
+    except Exception:
+        return
 
 
 def _write_exception_report(project_root: Path | str, task: Task, summary: str, *, patch_relative_path: str | None = None) -> str:
@@ -236,10 +244,11 @@ def _supplement_test_specs_for_missing_types(project_root: Path | str, missing_t
         if "browser" in missing_types or "e2e" in missing_types:
             add_supplemental("npm run e2e")
 
-    if "integration" in missing_types and project_dir.joinpath("backend", "tests").exists():
-        add_supplemental("backend/tests/")
-    if "contract" in missing_types and project_dir.joinpath("mock-server", "tests").exists():
-        add_supplemental("mock-server/tests/")
+    backend_tests_root = backend_test_root(PYTHON_REACT_CONTRACT)
+    if "integration" in missing_types and project_dir.joinpath(*backend_tests_root.split("/")).exists():
+        add_supplemental(f"{backend_tests_root}/")
+    if "contract" in missing_types and project_dir.joinpath(PYTHON_REACT_CONTRACT.mock_server_root, "tests").exists():
+        add_supplemental(f"{PYTHON_REACT_CONTRACT.mock_server_root}/tests/")
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -821,6 +830,7 @@ class DeliveryLoop:
                     )
                     save_tasks(self.project_root, tasks)
                     clear_task_runtime_failure(self.project_root, current.id)
+                    _refresh_project_summary_after_task_update(self.project_root)
                     return False, "review_pending"
                 fix_prompt = build_fix_prompt(self.project_root, current, test_results_to_summary([test_result]))
                 last_block_reason = test_results_to_summary([test_result]) or "tests failed after retry"

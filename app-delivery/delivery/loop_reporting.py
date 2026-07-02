@@ -10,6 +10,7 @@ from .gates import refresh_gates
 from .loop_gitops import repair_invalid_verified_tasks
 from .runtime_liveness import running_runtime_task_payload, runtime_attention_payload
 from .runtime_config import resolve_project_root
+from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
 from .session import current_session
 from .state import latest_task_log_event, load_active_task_records, load_stale_active_task_records, load_task_runtime_state, load_test_results, normalize_task_runtime_state, process_alive, prune_stale_active_task_records, read_lock_metadata, save_task_runtime_state, utc_now_iso
 from .task import FINAL_VERIFY_TASK_ID, Task, all_tasks, load_requirement_ids, next_generated_task_id, pick_next_task, save_tasks
@@ -290,10 +291,11 @@ def _supplement_test_specs_for_missing_types(project_root: Path, missing_types: 
             add_supplemental("npm run build")
         if "browser" in missing_types or "e2e" in missing_types:
             add_supplemental("npm run e2e")
-    if "integration" in missing_types and project_root.joinpath("backend", "tests").exists():
-        add_supplemental("backend/tests/")
-    if "contract" in missing_types and project_root.joinpath("mock-server", "tests").exists():
-        add_supplemental("mock-server/tests/")
+    backend_tests_root = backend_test_root(PYTHON_REACT_CONTRACT)
+    if "integration" in missing_types and project_root.joinpath(*backend_tests_root.split("/")).exists():
+        add_supplemental(f"{backend_tests_root}/")
+    if "contract" in missing_types and project_root.joinpath(PYTHON_REACT_CONTRACT.mock_server_root, "tests").exists():
+        add_supplemental(f"{PYTHON_REACT_CONTRACT.mock_server_root}/tests/")
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -456,8 +458,49 @@ def _task_log_usage_from_runtime_state(runtime_state: dict[str, Any]) -> dict[st
         return None
 
 
+def _task_log_first_started_at(project_root: Path, task_id: str) -> dt.datetime | None:
+    task_label = str(task_id or "").strip()
+    if not task_label:
+        return None
+    task_log = project_root / ".app-delivery-runtime" / "task-log.jsonl"
+    try:
+        lines = task_log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    starts: list[dt.datetime] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("task_id") or "").strip() != task_label:
+            continue
+        if str(payload.get("message") or "").strip() != f"Started implementation {task_label}":
+            continue
+        started_at = _parse_iso_datetime(payload.get("ts"))
+        if started_at is not None:
+            starts.append(started_at)
+    return min(starts) if starts else None
+
+
+def _task_started_at_for_metrics(project_root: Path, task: Any, runtime_state: dict[str, Any]) -> dt.datetime | None:
+    candidates = [
+        _parse_iso_datetime(runtime_state.get("first_started_at")),
+        _task_log_first_started_at(project_root, task.id),
+        _parse_iso_datetime(task.started_at),
+        _parse_iso_datetime(runtime_state.get("started_at")),
+    ]
+    return min((candidate for candidate in candidates if candidate is not None), default=None)
+
+
 def _task_metrics(project_root: Path, task: Any) -> dict[str, Any]:
-    started_at = _parse_iso_datetime(task.started_at)
+    runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
+    started_at = _task_started_at_for_metrics(project_root, task, runtime_state)
     completed_at = _parse_iso_datetime(task.verified_at or task.completed_at)
     duration_minutes, duration_formatted = _duration_between(started_at, completed_at)
     records = execution_token_records_for_task(project_root, task.id)
@@ -472,7 +515,6 @@ def _task_metrics(project_root: Path, task: Any) -> dict[str, Any]:
         completion_tokens += safe_int(record.get("completion_tokens"))
         total_tokens += safe_int(record.get("total_tokens"))
         cache_read_tokens += safe_int(record.get("cache_read_tokens"))
-    runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
     if records_count == 0 and runtime_state:
         fallback = _task_log_usage_from_runtime_state(runtime_state)
         if fallback:
@@ -1066,7 +1108,7 @@ def project_summary(project_root: Path | str) -> dict[str, Any]:
             candidate
             for candidate in [
                 _parse_iso_datetime(active.created_at) if active is not None else None,
-                *(_parse_iso_datetime(task.started_at) for task in tasks if getattr(task, "started_at", None)),
+                *(_parse_iso_datetime(row.get("started_at")) for row in task_metrics if isinstance(row.get("started_at"), str)),
             ]
             if candidate is not None
         ),

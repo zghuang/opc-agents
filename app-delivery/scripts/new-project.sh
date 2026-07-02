@@ -110,6 +110,34 @@ print(f"Mock server:    {payload.get('mock_server_path', '')}")
 PY
 }
 
+render_init_project_error() {
+  local report_file="$1"
+  "$PYTHON_BIN" - <<'PY' "$report_file"
+import json
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+try:
+  payload = json.loads(text)
+except json.JSONDecodeError:
+  print(text.strip() or "init-project failed without output")
+  raise SystemExit(0)
+if not isinstance(payload, dict):
+  print(text.strip() or "init-project failed without output")
+  raise SystemExit(0)
+message = str(payload.get("message") or "init-project failed").strip()
+code = str(payload.get("code") or "").strip()
+suggested = str(payload.get("suggested_action") or "").strip()
+if code:
+  print(f"{code}: {message}")
+else:
+  print(message)
+if suggested:
+  print(f"Suggested action: {suggested}")
+PY
+}
+
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --runtime)
@@ -205,7 +233,12 @@ if [[ "$WATCHDOG" == "1" ]]; then
   ARGS+=(--watchdog)
 fi
 INIT_REPORT_FILE="$(mktemp)"
-"$PYTHON_BIN" -m delivery "${ARGS[@]}" > "$INIT_REPORT_FILE"
+if ! "$PYTHON_BIN" -m delivery "${ARGS[@]}" > "$INIT_REPORT_FILE" 2>&1; then
+  render_init_project_error "$INIT_REPORT_FILE" >&2
+  rm -f "$INIT_REPORT_FILE"
+  popd >/dev/null
+  exit 1
+fi
 render_init_project_report "$INIT_REPORT_FILE"
 rm -f "$INIT_REPORT_FILE"
 popd >/dev/null
@@ -286,5 +319,5 @@ RUNTIME: $RUNTIME
 Next:
   1. Prepare requirements input
   2. Run app-delivery-preflight.sh --project "$PROJECT_ROOT" --requirements <requirements-file>
-  3. Use /app-delivery or run: app-delivery control --goal auto --project "$PROJECT_ROOT" --requirements <requirements-file>
+  3. Use /app-delivery-start or run: app-delivery start --project "$PROJECT_ROOT" --requirements <requirements-file>
 EOF

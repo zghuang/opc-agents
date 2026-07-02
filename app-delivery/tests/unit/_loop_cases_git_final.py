@@ -202,6 +202,7 @@ def test_gate_report_paths_are_treated_as_framework_managed() -> None:
     from delivery.loop_gitops import _is_always_allowed_framework_path
 
     assert _is_always_allowed_framework_path("docs/reviews/gate-report-gate-auth.md") is True
+    assert _is_always_allowed_framework_path("docs/reviews/exception-report-T007.md") is True
 
 def test_project_summary_reports_unplanned_requirements(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
@@ -245,6 +246,66 @@ def test_project_summary_reports_unplanned_requirements(tmp_path: Path) -> None:
     assert "planning" in payload
     assert "tokens" in payload
     assert "task_metrics" in payload
+
+
+def test_project_summary_task_duration_uses_first_runtime_start_across_review_repairs(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": [], "started_at": "2026-06-24T00:00:00Z", "completed_at": "2026-06-24T00:01:00Z", "verified_at": "2026-06-24T00:01:00Z"},
+                {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": [], "started_at": "2026-06-24T00:20:00Z", "completed_at": "2026-06-24T00:30:00Z", "review_status": "pass", "reviewed_at": "2026-06-24T00:40:00Z", "verified_at": "2026-06-24T00:40:00Z"},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "started_at": "2026-06-24T00:20:00Z",
+            "completed_at": "2026-06-24T00:30:00Z",
+        },
+    )
+    task_log = tmp_path / ".app-delivery-runtime" / "task-log.jsonl"
+    task_log.parent.mkdir(parents=True, exist_ok=True)
+    task_log.write_text(
+        json.dumps({"ts": "2026-06-24T00:05:00Z", "runtime": "opencode", "level": "INFO", "message": "Started implementation T002", "task_id": "T002", "phase": "implementation"}) + "\n"
+        + json.dumps({"ts": "2026-06-24T00:20:00Z", "runtime": "opencode", "level": "INFO", "message": "Started implementation T002", "task_id": "T002", "phase": "implementation"}) + "\n",
+        encoding="utf-8",
+    )
+    save_test_results(tmp_path, {"schema_version": "1", "project": "demo", "generated_at": "2026-06-24T00:00:00Z", "results": [], "full_suite_results": {"passed": True, "scores": {}}})
+
+    payload = project_summary(tmp_path)
+    metrics = {row["task_id"]: row for row in payload["task_metrics"]}
+
+    assert metrics["T002"]["started_at"] == "2026-06-24T00:05:00Z"
+    assert metrics["T002"]["completed_at"] == "2026-06-24T00:40:00Z"
+    assert metrics["T002"]["duration_minutes"] == 35
+    assert payload["duration"]["started_at"] == "2026-06-24T00:00:00Z"
+
+
+def test_save_task_runtime_state_preserves_first_start_when_started_at_is_overwritten(tmp_path: Path) -> None:
+    save_task_runtime_state(tmp_path, "T002", {"started_at": "2026-06-24T00:05:00Z", "status": "running"})
+    save_task_runtime_state(tmp_path, "T002", {"started_at": "2026-06-24T00:20:00Z", "status": "running"})
+
+    state = load_task_runtime_state(tmp_path, "T002")
+    assert state["started_at"] == "2026-06-24T00:20:00Z"
+    assert state["first_started_at"] == "2026-06-24T00:05:00Z"
 
 def test_project_summary_prefers_active_task_record_phase(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
@@ -559,6 +620,10 @@ def test_git_commit_task_allows_feature_support_files_for_declared_services_and_
             "backend/src/station/services/pick_service.py",
             "backend/src/station/services/handoff_service.py",
             "backend/src/station/services/readiness_service.py",
+                "backend/src/station/services/station_service.py",
+                "backend/src/station/router.py",
+                "backend/src/station/models/station_operations.py",
+                "backend/src/station/schemas/operations.py",
             "frontend/src/features/station/pages/PickPage.tsx",
             "frontend/src/features/station/pages/StationDetailPage.tsx",
         ],

@@ -24,6 +24,7 @@ Prepares an app-delivery runtime under OPC_HOME:
 - copies framework runtime assets into OPC_HOME/opc-agents/app-delivery
 - deploys Hermes skills into ~/.hermes/skills/opc-agents
 - creates wrapper commands under OPC_HOME/bin
+
 EOF
 }
 
@@ -244,6 +245,11 @@ rm -rf "$SKILLS_DST"
 mkdir -p "$SKILLS_DST"
 cp -R "$INSTALL_ROOT/skills/." "$SKILLS_DST/"
 ok "Hermes skills deployed to $SKILLS_DST"
+
+# Experimental only: scripts/opencode-heartbeat-patch.py can build a patched
+# OpenCode binary offline for investigation, but setup-opc intentionally does
+# not enable it. Runtime tasks use the machine-level `opencode` command unless
+# an operator explicitly sets APP_DELIVERY_OPENCODE_BIN outside this script.
 
 printf '%s\n' "$RUNTIME" > "$STATE_DIR/active-runtime"
 if [[ "$CHANNEL" == "telegram" ]]; then

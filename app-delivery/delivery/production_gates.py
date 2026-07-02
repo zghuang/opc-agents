@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
+
+
+BACKEND_TEST_ROOT = backend_test_root(PYTHON_REACT_CONTRACT)
+
 
 @dataclass(frozen=True)
 class ProductionGateSpec:
@@ -45,12 +50,10 @@ SECURITY_GATE = ProductionGateSpec(
     title="Production Gate: Security and RBAC enforcement",
     reason="Requirements mention roles, permissions, authentication, authorization, or data isolation.",
     keywords=("rbac", "auth", "authentication", "authorization", "security", "permission", "role", "角色", "权限", "认证", "授权", "安全", "数据隔离", "脱敏"),
-    output_tests=("backend/tests/security/",),
+    output_tests=(f"{BACKEND_TEST_ROOT}/security/",),
     output_paths=(
-        "backend/src/core/auth.py",
-        "backend/src/api/",
-        "backend/src/domains/",
-        "backend/tests/security/",
+        f"{PYTHON_REACT_CONTRACT.backend_source_root}/",
+        f"{BACKEND_TEST_ROOT}/security/",
         "docs/reviews/production-gate-security-rbac.md",
     ),
 )
@@ -61,13 +64,11 @@ AGENT_REALITY_GATE = ProductionGateSpec(
     title="Production Gate: Real agent integration",
     reason="Requirements mention AI agents, orchestration, model gateway, skills, or MCP/tools.",
     keywords=("agent", "ai agent", "orchestrator", "langgraph", "llm", "model gateway", "mcp", "skill", "智能体", "模型网关", "编排", "工具调用"),
-    output_tests=("backend/tests/integration/agents/test_real_agent_inputs.py",),
+    output_tests=(f"{BACKEND_TEST_ROOT}/integration/agents/test_real_agent_inputs.py",),
     output_paths=(
-        "backend/src/agents/",
-        "backend/src/infra/model_gateway/",
-        "backend/src/knowledge/",
-        "mock-server/mcp_servers/",
-        "backend/tests/integration/agents/test_real_agent_inputs.py",
+        f"{PYTHON_REACT_CONTRACT.backend_source_root}/",
+        f"{PYTHON_REACT_CONTRACT.mock_server_root}/mcp_servers/",
+        f"{BACKEND_TEST_ROOT}/integration/agents/test_real_agent_inputs.py",
         "docs/reviews/production-gate-agent-reality.md",
     ),
 )
@@ -78,11 +79,10 @@ EXECUTION_LOOP_GATE = ProductionGateSpec(
     title="Production Gate: Approval and execution loop",
     reason="Requirements mention approvals, action dispatch, execution tracking, rollback, or manual override.",
     keywords=("approval", "approve", "execution", "dispatch", "rollback", "manual override", "action", "审批", "执行", "派发", "回滚", "人工覆盖", "动作"),
-    output_tests=("backend/tests/scenarios/test_execution_dispatch_to_external_system.py",),
+    output_tests=(f"{BACKEND_TEST_ROOT}/scenarios/test_execution_dispatch_to_external_system.py",),
     output_paths=(
-        "backend/src/actions/",
-        "backend/src/services/notification/",
-        "backend/tests/scenarios/test_execution_dispatch_to_external_system.py",
+        f"{PYTHON_REACT_CONTRACT.backend_source_root}/",
+        f"{BACKEND_TEST_ROOT}/scenarios/test_execution_dispatch_to_external_system.py",
         "docs/reviews/production-gate-execution-loop.md",
     ),
 )
@@ -167,7 +167,8 @@ def _has_frontend_surface(project_root: Path | str, tasks: list[Any]) -> bool:
 
 def _has_backend_surface(project_root: Path | str, tasks: list[Any]) -> bool:
     project_dir = Path(project_root).expanduser().resolve()
-    return any((project_dir / path).exists() for path in ("backend/src", "backend/app", "mock-server")) or any(re.search(r"\bbackend/|\bapi\b|mock-server/", _task_text(task)) for task in tasks if _is_user_task(task))
+    candidate_roots = [path for path in (PYTHON_REACT_CONTRACT.backend_source_root, PYTHON_REACT_CONTRACT.legacy_backend_app_root, PYTHON_REACT_CONTRACT.mock_server_root) if path]
+    return any((project_dir / path).exists() for path in candidate_roots) or any(re.search(rf"\bbackend/|\bapi\b|{re.escape(PYTHON_REACT_CONTRACT.mock_server_root)}/", _task_text(task)) for task in tasks if _is_user_task(task))
 
 
 def _project_text(project_root: Path | str, tasks: list[Any]) -> str:

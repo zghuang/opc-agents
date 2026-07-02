@@ -6,7 +6,7 @@ from typing import Any
 from .builtin_task_prompts import render_frontend_api_audit_review_request, render_prefinal_audit_review_request
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from .requirements_context import format_acceptance_context, format_requirement_context
-from .runtime_config import load_project_metadata, resolve_project_root
+from .runtime_config import resolve_project_root
 from .task import FINAL_VERIFY_TASK_ID, Task
 
 
@@ -95,93 +95,26 @@ def _append_scope_observations(lines: list[str], scope_report: dict[str, Any] | 
     lines.append("")
 
 
-def _dependency_hint_tokens(name: str) -> list[str]:
-    import re
-
-    return [token for token in re.split(r"[^A-Za-z0-9]+", str(name or "").casefold()) if len(token) >= 3]
-
-
-def _task_hint_context(task: Task, requirement_context: list[str], acceptance_context: list[str]) -> str:
-    parts = [
-        task.title,
-        " ".join(task.requirements),
-        " ".join(task.acceptance_scenarios),
-        " ".join(task.output_paths),
-        " ".join(task.output_tests),
-        " ".join(requirement_context),
-        " ".join(acceptance_context),
-    ]
-    return "\n".join(parts).casefold()
-
-
-def _task_touches_manifest_for_ecosystem(task: Task, ecosystem: str) -> bool:
-    paths = set(task.output_paths)
-    if ecosystem == "backend":
-        return bool(paths.intersection({"backend/pyproject.toml", "backend/uv.lock"}))
-    if ecosystem == "frontend":
-        return bool(paths.intersection({"frontend/package.json", "frontend/package-lock.json", "frontend/pnpm-lock.yaml", "frontend/yarn.lock"}))
-    if ecosystem in {"infra", "project"}:
-        return any(path in paths for path in {"docker-compose.yml", "README.md"})
-    return False
-
-
-def _dependency_hint_relevant(task: Task, hint: dict[str, str], context: str) -> bool:
-    ecosystem = str(hint.get("ecosystem") or "project").strip().lower() or "project"
-    if _task_touches_manifest_for_ecosystem(task, ecosystem):
-        return True
-    name = str(hint.get("name") or "").strip()
-    if not name:
-        return False
-    if name.casefold() in context:
-        return True
-    tokens = _dependency_hint_tokens(name)
-    return bool(tokens) and any(token in context for token in tokens)
-
-
-def _relevant_dependency_hints(project_root: Path | str, task: Task, requirement_context: list[str] | None = None, acceptance_context: list[str] | None = None) -> list[dict[str, str]]:
-    metadata = load_project_metadata(project_root)
-    raw_hints = metadata.get("dependency_hints") if isinstance(metadata.get("dependency_hints"), list) else []
-    ecosystems = {"project"}
-    if any(path.startswith("backend/") for path in task.output_paths):
-        ecosystems.add("backend")
-    if any(path.startswith("frontend/") for path in task.output_paths):
-        ecosystems.add("frontend")
-    result: list[dict[str, str]] = []
-    for row in raw_hints:
-        if not isinstance(row, dict):
-            continue
-        ecosystem = str(row.get("ecosystem") or "project").strip().lower() or "project"
-        if ecosystem not in ecosystems:
-            continue
-        name = str(row.get("name") or "").strip()
+def _append_technology_constraints_review_section(lines: list[str], constraints: list[dict[str, Any]] | None) -> None:
+    if not constraints:
+        return
+    lines.append("Technology constraints to verify:")
+    for constraint in constraints:
+        name = str(constraint.get("name") or "").strip()
         if not name:
             continue
-        hint = {
-            "ecosystem": ecosystem,
-            "name": name,
-            "reason": str(row.get("reason") or "").strip(),
-            "source": str(row.get("source") or "").strip(),
-            "evidence": str(row.get("evidence") or "").strip(),
-        }
-        context = _task_hint_context(task, requirement_context or [], acceptance_context or [])
-        if _dependency_hint_relevant(task, hint, context):
-            result.append(hint)
-    return result
-
-
-def _append_dependency_hint_review_section(lines: list[str], dependency_hints: list[dict[str, str]]) -> None:
-    if not dependency_hints:
-        return
-    lines.append("Project technology constraints to verify:")
-    for hint in dependency_hints:
-        suffix = ""
-        evidence = str(hint.get("evidence") or "").strip()
-        source = str(hint.get("source") or "").strip()
-        if evidence or source:
-            suffix = f" [{'; '.join(part for part in [source, evidence] if part)}]"
-        reason = str(hint.get("reason") or "").strip() or "Required by project planning artifacts."
-        lines.append(f"- {hint['name']} ({hint['ecosystem']}): {reason}{suffix}")
-    lines.append("- Require implementation evidence or an explicit superseding ADR/clarification.")
+        ecosystem = str(constraint.get("ecosystem") or "project").strip() or "project"
+        requirement = str(constraint.get("requirement") or "must_use").strip() or "must_use"
+        reason = str(constraint.get("reason") or "").strip() or "Required by planning artifacts."
+        source = str(constraint.get("source") or "").strip()
+        suffix = f" [source: {source}]" if source else ""
+        lines.append(f"- {name} ({ecosystem}, {requirement}): {reason}{suffix}")
+        expected_evidence = [str(value).strip() for value in constraint.get("expected_evidence", []) if str(value).strip()] if isinstance(constraint.get("expected_evidence"), list) else []
+        if expected_evidence:
+            lines.append("  Expected evidence:")
+            lines.extend(f"  - {value}" for value in expected_evidence)
+    lines.append("- For each listed constraint, include exactly one `technology_assessment` row with name, status, evidence, and notes.")
+    lines.append("- A `must_use` constraint without implementation evidence or explicit superseding ADR/clarification requires status=changes_requested.")
     lines.append("")
 
 
@@ -244,8 +177,7 @@ def build_code_review_request(
     acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
     lines.extend(acceptance_context or ["- none"])
     lines.append("")
-    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
-    _append_dependency_hint_review_section(lines, dependency_hints)
+    _append_technology_constraints_review_section(lines, task.technology_constraints)
     _append_review_contract(lines, task)
     lines.append("Feature review checks:")
     lines.append("- Judge declared requirements, acceptance scenarios, output_paths, output_tests, and necessary support edits.")
@@ -289,8 +221,7 @@ def build_validation_code_review_request(
     acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
     lines.extend(acceptance_context or ["- none"])
     lines.append("")
-    dependency_hints = _relevant_dependency_hints(project_root, task, requirement_context, acceptance_context)
-    _append_dependency_hint_review_section(lines, dependency_hints)
+    _append_technology_constraints_review_section(lines, task.technology_constraints)
     _append_review_contract(lines, task)
     lines.append("Validation review checks:")
     lines.append("- Declared output_tests are contractual validation entrypoints.")

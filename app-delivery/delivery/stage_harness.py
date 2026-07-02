@@ -10,6 +10,7 @@ from .errors import DeliveryError
 from .runtime_config import load_project_metadata, load_project_runtime, root_context_filename
 from .scaffold import write_project_structure_snapshot
 from .gates import sync_gates
+from .stack_contracts import PYTHON_REACT_CONTRACT
 from .state import ensure_runtime_dirs, load_architecture_meta, project_paths, save_architecture_meta, save_test_plan, save_work_items, utc_now_iso
 from .task import Task, decompose_tasks, lint_task_contracts, parse_task_json
 
@@ -55,14 +56,14 @@ STAGE_CLI_COMMANDS: dict[str, str] = {
 MODULE_ARCHITECTURE_HEADING_RE = re.compile(r"^##+\s+(?:\d+\.\s*)?(?:Module Architecture|模块架构)\s*$", re.IGNORECASE | re.MULTILINE)
 FENCED_BLOCK_RE = re.compile(r"```(?:text|plaintext|txt)?\n(?P<body>.*?)\n```", re.DOTALL | re.IGNORECASE)
 NON_CANONICAL_BACKEND_PACKAGE_RE = re.compile(
-    r"\bbackend/(?:api|agents|orchestration|mcp|simulation|models|core|services|actions|infra|knowledge)(?:/|\b)",
+    rf"\bbackend/(?:{'|'.join(PYTHON_REACT_CONTRACT.noncanonical_backend_root_dirs)})(?:/|\b)",
     re.IGNORECASE,
-)
+) if PYTHON_REACT_CONTRACT.noncanonical_backend_root_dirs else None
 NON_CANONICAL_BACKEND_TREE_CHILD_RE = re.compile(
-    r"^(?:│   |    )(?:├──|└──)\s*(?:api|agents|orchestration|mcp|simulation|models|core|services|actions|infra|knowledge)/",
+    rf"^(?:│   |    )(?:├──|└──)\s*(?:{'|'.join(PYTHON_REACT_CONTRACT.noncanonical_backend_root_dirs)})/",
     re.IGNORECASE | re.MULTILINE,
-)
-UNSUPPORTED_TOP_LEVEL_MCP_SERVER_RE = re.compile(r"\bmcp-server(?:/|\b)", re.IGNORECASE)
+) if PYTHON_REACT_CONTRACT.noncanonical_backend_root_dirs else None
+UNSUPPORTED_TOP_LEVEL_MCP_SERVER_RE = re.compile(rf"\b(?:{'|'.join(PYTHON_REACT_CONTRACT.unsupported_top_level_roots)})(?:/|\b)", re.IGNORECASE) if PYTHON_REACT_CONTRACT.unsupported_top_level_roots else None
 TREE_FILE_ENTRY_RE = re.compile(
     r"^(?:[│ ]+)?(?:├──|└──)\s*(?P<name>[^\s#]+)(?:\s|$)",
     re.IGNORECASE | re.MULTILINE,
@@ -107,6 +108,49 @@ IMPLEMENTATION_TREE_FILE_RE = re.compile(
     re.IGNORECASE,
 )
 MAX_MODULE_TREE_IMPLEMENTATION_FILE_ENTRIES = 20
+CANONICAL_REQUIREMENT_ID_RE = re.compile(r"^(?:REQ|NFR)-\d{3,}$")
+ACCEPTANCE_ID_RE = re.compile(r"^AS-\d{3,}$")
+
+
+def _validate_spec_review_ids(input_path: Path, requirements: list[Any], acceptance_scenarios: list[Any]) -> None:
+    requirement_ids: set[str] = set()
+    invalid_requirement_ids: list[str] = []
+    duplicate_requirement_ids: list[str] = []
+    for row in requirements:
+        if not isinstance(row, dict):
+            continue
+        requirement_id = str(row.get("id") or "").strip()
+        if not CANONICAL_REQUIREMENT_ID_RE.fullmatch(requirement_id):
+            invalid_requirement_ids.append(requirement_id or "<empty>")
+            continue
+        if requirement_id in requirement_ids:
+            duplicate_requirement_ids.append(requirement_id)
+            continue
+        requirement_ids.add(requirement_id)
+    invalid_acceptance_ids: list[str] = []
+    missing_requirement_refs: list[str] = []
+    for row in acceptance_scenarios:
+        if not isinstance(row, dict):
+            continue
+        scenario_id = str(row.get("id") or "").strip()
+        if not ACCEPTANCE_ID_RE.fullmatch(scenario_id):
+            invalid_acceptance_ids.append(scenario_id or "<empty>")
+        for requirement_id in row.get("source_requirement_ids", []):
+            normalized = str(requirement_id or "").strip()
+            if normalized and normalized not in requirement_ids:
+                missing_requirement_refs.append(f"{scenario_id or '<unknown>'}->{normalized}")
+    if invalid_requirement_ids or duplicate_requirement_ids or invalid_acceptance_ids or missing_requirement_refs:
+        raise _shape_error(
+            "spec-review",
+            input_path,
+            "spec-review must use canonical requirement IDs REQ-###/NFR-### and acceptance IDs AS-###, with acceptance_scenarios referencing existing canonical requirement IDs",
+            details={
+                "invalid_requirement_ids": invalid_requirement_ids[:50],
+                "duplicate_requirement_ids": duplicate_requirement_ids[:50],
+                "invalid_acceptance_ids": invalid_acceptance_ids[:50],
+                "missing_requirement_refs": missing_requirement_refs[:50],
+            },
+        )
 
 
 def _looks_like_adr_doc(path: str, content: str) -> bool:
@@ -236,19 +280,19 @@ def _validate_architecture_markdown(input_path: Path, architecture_md: str) -> N
             "arch-design Module Architecture section must include a fenced code block showing the repository/module tree",
         )
     tree_body = str(fenced.group("body") or "")
-    invalid_backend_paths = sorted(set(NON_CANONICAL_BACKEND_PACKAGE_RE.findall(tree_body)))
-    invalid_backend_tree_children = NON_CANONICAL_BACKEND_TREE_CHILD_RE.findall(tree_body)
+    invalid_backend_paths = sorted(set(NON_CANONICAL_BACKEND_PACKAGE_RE.findall(tree_body))) if NON_CANONICAL_BACKEND_PACKAGE_RE else []
+    invalid_backend_tree_children = NON_CANONICAL_BACKEND_TREE_CHILD_RE.findall(tree_body) if NON_CANONICAL_BACKEND_TREE_CHILD_RE else []
     if invalid_backend_paths or invalid_backend_tree_children:
         raise _shape_error(
             "arch-design",
             input_path,
-            "python-react architecture must place backend Python packages under backend/src/...; found unsupported backend package roots in the Module Architecture tree",
+            f"{PYTHON_REACT_CONTRACT.id} architecture must place backend Python packages under {PYTHON_REACT_CONTRACT.backend_source_root}/...; found unsupported backend package roots in the Module Architecture tree",
         )
-    if UNSUPPORTED_TOP_LEVEL_MCP_SERVER_RE.search(tree_body):
+    if UNSUPPORTED_TOP_LEVEL_MCP_SERVER_RE and UNSUPPORTED_TOP_LEVEL_MCP_SERVER_RE.search(tree_body):
         raise _shape_error(
             "arch-design",
             input_path,
-            "python-react architecture must use the selected stack's canonical service roots; found an unsupported extra service root in the Module Architecture tree",
+            f"{PYTHON_REACT_CONTRACT.id} architecture must use the selected stack's canonical service roots; found an unsupported extra service root in the Module Architecture tree",
         )
     implementation_files = []
     for match in TREE_FILE_ENTRY_RE.finditer(tree_body):
@@ -381,6 +425,7 @@ def import_spec_review(project_root: Path | str, payload: dict[str, Any], input_
     source_requirements_path = str(payload.get("source_requirements_path") or "").strip()
     if not isinstance(requirements, list) or not isinstance(acceptance_scenarios, list):
         raise _shape_error("spec-review", input_path, "spec-review payload must contain requirements[] and acceptance_scenarios[] arrays")
+    _validate_spec_review_ids(input_path, requirements, acceptance_scenarios)
     project_root = Path(project_root).expanduser().resolve()
     clarifications = [item for item in clarifications if isinstance(item, dict)]
     _persist_stage_input(project_root, "spec-review", payload)
@@ -521,8 +566,52 @@ def import_context_sync(project_root: Path | str, payload: dict[str, Any], input
     return 0
 
 
+def _validate_decompose_technology_constraints(payload: dict[str, Any], input_path: Path) -> None:
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    errors: list[str] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or f"item[{index}]").strip()
+        if "technology_constraints" not in item:
+            errors.append(f"{title}: missing required technology_constraints array")
+            continue
+        constraints = item.get("technology_constraints")
+        if not isinstance(constraints, list):
+            errors.append(f"{title}: technology_constraints must be an array")
+            continue
+        for constraint_index, constraint in enumerate(constraints):
+            if not isinstance(constraint, dict):
+                errors.append(f"{title}: technology_constraints[{constraint_index}] must be an object")
+                continue
+            name = str(constraint.get("name") or "").strip()
+            ecosystem = str(constraint.get("ecosystem") or "").strip()
+            requirement = str(constraint.get("requirement") or "").strip()
+            if not name:
+                errors.append(f"{title}: technology_constraints[{constraint_index}].name is required")
+            if not ecosystem:
+                errors.append(f"{title}: technology_constraints[{constraint_index}].ecosystem is required")
+            if requirement not in {"must_use", "should_use", "avoid"}:
+                errors.append(f"{title}: technology_constraints[{constraint_index}].requirement must be must_use, should_use, or avoid")
+            if not str(constraint.get("reason") or "").strip():
+                errors.append(f"{title}: technology_constraints[{constraint_index}].reason is required")
+            if not str(constraint.get("source") or "").strip():
+                errors.append(f"{title}: technology_constraints[{constraint_index}].source is required")
+            expected = constraint.get("expected_evidence")
+            if not isinstance(expected, list) or not any(str(value).strip() for value in expected):
+                errors.append(f"{title}: technology_constraints[{constraint_index}].expected_evidence must be a non-empty array")
+    if errors:
+        raise _shape_error(
+            "task-decompose",
+            input_path,
+            "task-decompose items must include explicit structured technology_constraints",
+            details={"errors": errors[:20]},
+        )
+
+
 def import_decompose(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
     project_root = Path(project_root).expanduser().resolve()
+    _validate_decompose_technology_constraints(payload, input_path)
     _persist_stage_input(project_root, "task-decompose", payload)
     include_shared = (project_root / "docs" / "shared-components.md").exists()
     items = parse_task_json(json.dumps(payload, ensure_ascii=False))

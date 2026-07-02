@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +20,111 @@ from .state import ensure_runtime_dirs, utc_now_iso
 PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SUPPORTED_STACKS = {"python-react"}
 REQUIREMENTS_ARCHIVE_FILENAME = "requirements-source"
+
+
+def _json_file_pid(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    try:
+        return int(payload.get("pid") or payload.get("runtime_pid") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_pid(pid: int) -> None:
+    if pid <= 0 or pid == os.getpid() or not _pid_is_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if not _pid_is_alive(pid):
+            return
+        time.sleep(0.1)
+    if pid == os.getpid():
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+
+
+def _project_runtime_pids(project_dir: Path) -> list[int]:
+    runtime_dir = project_dir / ".app-delivery-runtime"
+    candidates = [
+        runtime_dir / "watchdog-state.json",
+        runtime_dir / "locks" / "execution.lock",
+    ]
+    active_tasks_dir = runtime_dir / "active-tasks"
+    if active_tasks_dir.exists():
+        candidates.extend(sorted(active_tasks_dir.glob("*.json")))
+    pids: list[int] = []
+    seen: set[int] = set()
+    for path in candidates:
+        pid = _json_file_pid(path)
+        if pid > 0 and pid not in seen:
+            seen.add(pid)
+            pids.append(pid)
+    return pids
+
+
+def _stop_project_runtime_processes(project_dir: Path) -> None:
+    for pid in _project_runtime_pids(project_dir):
+        _terminate_pid(pid)
+
+
+def _rmtree_onerror(function: Any, path: str, _exc_info: Any) -> None:
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    function(path)
+
+
+def _force_remove_project_dir(project_dir: Path) -> None:
+    _stop_project_runtime_processes(project_dir)
+    last_error: OSError | None = None
+    for attempt in range(4):
+        try:
+            shutil.rmtree(project_dir, onerror=_rmtree_onerror)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_error = exc
+            _stop_project_runtime_processes(project_dir)
+            if attempt < 3:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+    raise DeliveryError(
+        code="project_force_remove_failed",
+        message=f"failed to replace existing project directory: {project_dir}",
+        exit_code=2,
+        details={"project_root": str(project_dir), "error": str(last_error) if last_error else "unknown"},
+        suggested_action="Stop active app-delivery/runtime/watchdog processes for this project, remove the directory manually if needed, then rerun with --force.",
+    )
 
 
 def normalize_dependency_hints(raw_hints: Any) -> list[dict[str, str]]:
@@ -187,7 +295,7 @@ def initialize_project(
             exit_code=2,
         )
     if force and project_dir.exists():
-        shutil.rmtree(project_dir)
+        _force_remove_project_dir(project_dir)
     elif project_dir.exists() and any(project_dir.iterdir()):
         raise DeliveryError(
             code="project_exists",

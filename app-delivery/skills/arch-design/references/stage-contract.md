@@ -16,7 +16,7 @@ Constraints:
 - `adrs` must contain decision records only: context, decision, consequences, and alternatives.
 - `architecture_md` must include `Module Architecture`: a fenced repository tree plus concise responsibilities for major code areas.
 - The fenced tree is the T000 scaffold contract. List directories, durable empty-directory placeholders, and minimal scaffold/config files only. Do not inventory implementation source files; keep concrete source files to rare entrypoints that T000 must create.
-- For the python-react stack, backend Python packages live under `backend/src/...`. Put project-specific modules such as API routes, agents, orchestration, MCP adapters, simulation, models, and core code under that source root. Do not place Python packages outside that backend source root or invent additional service roots unless the selected stack/template explicitly supports them. Implement production FastMCP code under `backend/src/...` or simulated tool services under project-root `mock-server/...`.
+- Follow the selected stack guidance below. When the stack does not prescribe a backend package layout, choose one in `Module Architecture` instead of inheriting a template directory by default.
 - Keep the skeleton project-specific and minimal. T000 owns this structural skeleton; T001 should only implement true shared foundation code that multiple feature slices need, not compensate for missing architecture structure.
 - If a UI is required, make that clear in the architecture and set ui_required=true.
 - Shared components should only include code that is reused across multiple modules.
@@ -26,6 +26,11 @@ Requirements JSON:
 
 Project technology constraints:
 {{dependency_hints_json}}
+
+Selected stack: {{stack_id}}
+
+Selected stack contract:
+{{stack_guidance_md}}
 
 Clarification answers:
 {{clarification_answers_md}}

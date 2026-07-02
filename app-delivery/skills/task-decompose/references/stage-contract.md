@@ -7,6 +7,7 @@ Each task item must include:
 - title
 - task_kind
 - intent
+- technology_constraints
 - requirements
 - acceptance_scenarios
 - dependencies
@@ -36,16 +37,43 @@ Intent rules:
 - If a task has more than 12 requirements, more than 5 acceptance scenarios, or more than 8 output tests, and two or more of those are true, reassess the boundary. Decide whether it is one coherent independently testable capability or should be split into vertical slices. Record the decision in `intent.split_justification`.
 - If the graph has more than 20 non-built-in delivery tasks, reassess whether the count is appropriate for the project size and module boundaries. Keep tasks separate when each is a coherent independently testable slice; merge only when the merged task remains focused. Record the decision in `intent.split_justification` for intentionally retained count-heavy boundaries.
 
+`technology_constraints` must use this shape on every task. Use an empty array only when no project technology choice is specifically owned or required by that task:
+
+```json
+[
+	{
+		"name": "selected-framework-or-library-name",
+		"ecosystem": "backend|frontend|infra|project",
+		"requirement": "must_use",
+		"reason": "brief source-grounded reason this task must use or verify the technology",
+		"source": "requirements, architecture, ADR, clarification, or other project artifact path/section",
+		"expected_evidence": [
+			"concrete dependency/config/import/API/use evidence expected from this task",
+			"concrete behavior or integration evidence expected from this task"
+		]
+	}
+]
+```
+
+Technology constraint rules:
+- Assign explicit project-wide technology choices from requirements, architecture, ADRs, shared components, and Project technology constraints to the smallest owning tasks that must implement or directly integrate them.
+- Do not copy all technologies into every task. A constraint belongs on a task only when that task must use, integrate, or verify that technology to satisfy its own intent and owned requirements.
+- Assign constraints by the task's required capability and source artifacts, not by whether the technology name appears in the task title.
+- Use `must_use` when architecture/ADR/requirements mandate the technology. Use `should_use` only for preferred libraries where an equivalent implementation could be accepted with explicit rationale. Use `avoid` only for rejected alternatives.
+- `expected_evidence` must be concrete and reviewable. Prefer dependency manifest entries, imports/API usage, configuration files, generated artifacts, or behavior-specific implementation evidence.
+- If a task explicitly supersedes a technology choice, require an ADR/clarification in `source` and explain it in `reason`; do not silently omit the original constraint.
+
 Constraints:
 - Do not emit T000, T001, or T-FINAL. The framework inserts built-in tasks itself.
 - Prefer complete user-visible slices over layer-by-layer tasks.
 - Decompose from overall product capability into executable vertical slices.
 - Choose the smallest coherent task that still delivers a meaningful product capability.
-- Assign each explicit project-wide technology choice from requirements, architecture, or project technology constraints to at least one owning task.
+- Assign each explicit project-wide technology choice from requirements, architecture, or project technology constraints to at least one owning task through `technology_constraints`.
 - A task may cross backend, frontend, mock-server, tests, and shared components when that is the smallest coherent slice.
 - Avoid horizontal or layer-only tasks such as "all DB models" or "all frontend pages".
 - Also avoid over-fragmenting one feature into separate model/API/UI/test fragments; too many handoff points can reduce delivery quality just as much as oversized tasks.
 - Keep dependency edges explicit and minimal so the resulting graph is a practical DAG, not a linear dump.
+- For medium-or-larger projects, a graph where every generated feature/validation task has `dependencies: []` is invalid. Add explicit prerequisite edges where workflow order, shared contracts, domain sequencing, or validation ownership exists.
 - Keep each task small enough for one AI session to complete.
 - A good task usually has 3-15 source paths, 1-5 output tests, and one coherent feature outcome.
 - If a feature would exceed that size, split it into smaller vertical slices by user workflow, sub-capability, or bounded context.
@@ -53,10 +81,7 @@ Constraints:
 - output_tests should be concrete paths that can be executed later.
 - output_paths should be the main source paths the task is expected to touch.
 - All file paths must be project-root-relative. Use `backend/...`, `frontend/...`, `mock-server/...`, or `docs/...` paths, not backend-root-relative shortcuts like `src/...` or `tests/...`.
-- The canonical mock server location is project-root `mock-server/`. Do not invent alternative mock-service roots unless the selected stack/template explicitly supports them.
-- For backend code paths in the python-react stack, use `backend/src/...`; for backend tests use `backend/src/tests/...` or `backend/tests/...`.
-- For MCP/FastMCP in python-react projects, put production code under `backend/src/...`; put simulated tool-service fixtures or mock-only helpers under project-root `mock-server/...`. Do not invent additional service roots unless the selected stack/template explicitly supports them.
-- For frontend code paths, use `frontend/src/...`; for browser/e2e tests use `frontend/e2e/...` when the test is file-based.
+- Follow the architecture-selected paths and the selected stack guidance below for backend, frontend, mock-server, MCP/FastMCP, and test path roots. Do not assume a backend package directory unless requirements or architecture explicitly selected one.
 - Add dependency edges only for real prerequisites: technical/shared foundation needs or product workflow/domain ordering. If feature B only makes sense after feature A, make B depend on A.
 - Ensure every requirement is covered by at least one feature task.
 - Do not use a foundation/support slice to claim full user-visible requirement coverage when it only creates scaffolding, stubs, wiring, or shared primitives; keep that full requirement on the owning feature slice and any validation task.
@@ -71,7 +96,7 @@ Constraints:
 - Do not create a generic end-to-end verification suite task. The framework already provides T-FINAL for cross-project verification.
 - Use `task_kind: "feature"` for normal implementation slices and `task_kind: "validation"` for validation-focused work items.
 - If the project is medium-or-larger (`M`, `L`, or `XL`), add validation-focused work items into `items` so module or milestone QA happens during implementation, not only at T-FINAL.
-- Validation tasks must depend on the feature tasks they validate. Keep those dependencies explicit, and do not schedule validation before the validated slices can possibly pass.
+- Validation tasks must depend on the feature tasks they validate by task ID or exact/shortened task title. Keep those dependencies explicit, and do not schedule validation before the validated slices can possibly pass.
 - Complexity classification does not need to be exact. A rough, defensible estimate is enough.
 - Avoid creating broad backend/frontend foundation buckets beyond the built-in scaffold/shared-infrastructure phases. If shared code is needed, keep it tightly scoped or attach it to the earliest owning vertical slice.
 - If `ui_required=true`, user-visible tasks should naturally include frontend output paths where the requirement implies UI behavior.
@@ -90,6 +115,11 @@ Use this `delivery_complexity` shape:
 	}
 }
 ```
+
+Selected stack: {{stack_id}}
+
+Selected stack contract:
+{{stack_guidance_md}}
 
 Use this `validation_gates` entry shape:
 

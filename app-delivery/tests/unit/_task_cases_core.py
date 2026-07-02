@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from delivery.builtin_tasks import FINAL_VERIFY_TASK_ID, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from delivery.state import save_gates, save_test_plan, save_test_results, save_work_items
 from delivery.task import Task, check_requirements_coverage, check_test_type_coverage, decompose_tasks, lint_task_contract, mark_task, pick_next_task, referenced_req_ids, reset_task
@@ -55,6 +57,44 @@ def test_mark_task_accumulates_session_history() -> None:
     assert updated[0].status_session_id == "session-2"
     assert updated[0].session_ids == ["session-1", "session-2"]
 
+def test_task_preserves_structured_technology_constraints() -> None:
+    task = Task.from_dict(
+        {
+            "id": "T009",
+            "title": "Orchestrator",
+            "status": "pending",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": [],
+            "output_paths": ["backend/otif/workflows/incident_workflow.py"],
+            "technology_constraints": [
+                {
+                    "name": "LangGraph",
+                    "ecosystem": "backend",
+                    "requirement": "must_use",
+                    "reason": "ADR selects LangGraph.",
+                    "source": "docs/adr/001-agent-framework.md",
+                    "expected_evidence": ["imports StateGraph", "uses checkpointing"],
+                },
+                {"name": "", "ecosystem": "backend"},
+                {"name": "LangGraph", "ecosystem": "backend"},
+            ],
+        }
+    )
+
+    assert task.technology_constraints == [
+        {
+            "name": "LangGraph",
+            "ecosystem": "backend",
+            "requirement": "must_use",
+            "reason": "ADR selects LangGraph.",
+            "source": "docs/adr/001-agent-framework.md",
+            "expected_evidence": ["imports StateGraph", "uses checkpointing"],
+        }
+    ]
+    assert Task.from_dict(task.to_dict()).technology_constraints == task.technology_constraints
+
 def test_reset_task_clears_review_and_block_state() -> None:
     tasks = [
         Task(
@@ -85,4 +125,24 @@ def test_reset_task_clears_review_and_block_state() -> None:
     assert updated[0].review_status is None
     assert updated[0].blocked_reason is None
     assert updated[0].attempts == 0
+
+
+def test_reset_task_refuses_verified_feature_task() -> None:
+    tasks = [
+        Task(
+            "T002",
+            "Feature",
+            "verified",
+            ["REQ-001"],
+            [],
+            [],
+            [],
+            ["backend/src/feature/"],
+            task_kind="feature",
+            verified_at="2026-06-24T00:12:00Z",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="do not reopen verified feature tasks"):
+        reset_task(tasks, "T002")
 

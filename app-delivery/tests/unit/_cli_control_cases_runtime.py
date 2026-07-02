@@ -25,7 +25,26 @@ from delivery.task import Task
 cli = import_module("delivery.__main__")
 
 
-def test_cmd_init_project_defaults_watchdog_enabled(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cmd_init_project_defaults_watchdog_disabled(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    project_root = tmp_path / "demo"
+
+    result = cli.cmd_init_project(
+        argparse.Namespace(
+            project=str(project_root),
+            description="demo",
+            runtime="opencode",
+            stack="python-react",
+            framework_root=str(Path(__file__).resolve().parents[2]),
+            force=False,
+        )
+    )
+
+    assert result == 0
+    metadata = json.loads((project_root / "docs" / "project-bootstrap.json").read_text(encoding="utf-8"))
+    assert metadata["watchdog_enabled"] is False
+
+
+def test_cmd_init_project_can_enable_watchdog_explicitly(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     project_root = tmp_path / "demo"
 
     result = cli.cmd_init_project(
@@ -100,7 +119,7 @@ def test_cmd_fix_clears_completed_task_runtime_state(tmp_path: Path) -> None:
             "generated_at": "2026-06-24T00:00:00Z",
             "last_updated_commit": "",
             "items": [
-                {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"]},
+                {"id": "T002", "title": "Feature", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"]},
             ],
         },
     )
@@ -128,6 +147,50 @@ def test_cmd_fix_clears_completed_task_runtime_state(tmp_path: Path) -> None:
     updated = recover(tmp_path)
     task = next(task for task in updated if task.id == "T002")
     assert task.status == "pending"
+
+def test_cmd_fix_refuses_to_reopen_verified_feature_task(tmp_path: Path) -> None:
+    review_path = tmp_path / "docs" / "reviews" / "code-review-T002.md"
+    review_path.parent.mkdir(parents=True, exist_ok=True)
+    review_path.write_text("status: pass\nsummary: ok\n", encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "verified",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/src/feature/"],
+                    "review_status": "pass",
+                    "review_artifact": "docs/reviews/code-review-T002.md",
+                    "verified_at": "2026-06-24T00:05:00Z",
+                },
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {"task_id": "T002", "status": "completed", "completed_at": "2026-06-24T00:05:00Z"},
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_fix(argparse.Namespace(project=str(tmp_path), task_id="T002", no_start=True, runtime="claude"))
+
+    assert exc_info.value.code == "verified_task_repair_forbidden"
+    task = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))["items"][0]
+    assert task["status"] == "verified"
+    assert task["verified_at"] == "2026-06-24T00:05:00Z"
+    assert load_task_runtime_state(tmp_path, "T002")["status"] == "completed"
+    assert review_path.exists()
 
 def test_cmd_fix_terminates_active_runtime_processes_for_same_task(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
@@ -166,6 +229,47 @@ def test_cmd_fix_terminates_active_runtime_processes_for_same_task(tmp_path: Pat
 
     assert result == 0
     assert terminated == [222, 111, 333]
+
+
+def test_cmd_fix_does_not_terminate_other_task_runtime_records(tmp_path: Path, monkeypatch) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "active", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"], "status_session_id": "session-1"},
+            ],
+        },
+    )
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli,
+        "load_active_task_records",
+        lambda project_root: [
+            {"task_id": "T999", "pid": 111, "runtime_pid": 222},
+            {"task_id": "T002", "pid": 333, "runtime_pid": 444},
+        ],
+    )
+    monkeypatch.setattr(cli, "read_lock_metadata", lambda path: {})
+    live_pids = {111, 222, 333, 444}
+
+    def fake_kill(pid: int, sig: int) -> None:
+        if sig == 0:
+            if pid in live_pids:
+                return
+            raise ProcessLookupError(pid)
+        terminated.append(pid)
+        live_pids.discard(pid)
+
+    monkeypatch.setattr(cli.os, "kill", fake_kill)
+
+    result = cli.cmd_fix(argparse.Namespace(project=str(tmp_path), task_id="T002", no_start=True, runtime="claude"))
+
+    assert result == 0
+    assert terminated == [444, 333]
 
 def test_run_stalled_recovery_once_preserves_session_and_stages_recovery_prompt(tmp_path: Path, monkeypatch) -> None:
     from delivery.session import RuntimeSession, save_current_session
@@ -238,7 +342,7 @@ def test_cmd_watchdog_run_triggers_stalled_recovery(tmp_path: Path, monkeypatch)
     assert result == 0
     assert calls == ["T003"]
 
-def test_cmd_watchdog_run_continues_autorunnable_host_step(tmp_path: Path, monkeypatch) -> None:
+def test_cmd_watchdog_run_waits_for_host_step_without_busy_loop(tmp_path: Path, monkeypatch) -> None:
     snapshots = [
         {
             "control_status": "in_progress",
@@ -267,7 +371,12 @@ def test_cmd_watchdog_run_continues_autorunnable_host_step(tmp_path: Path, monke
     result = cli.cmd_watchdog_run(argparse.Namespace(project=str(tmp_path), interval_seconds=5))
 
     assert result == 0
-    assert calls == ["auto"]
+    assert calls == []
+    state = json.loads((tmp_path / ".app-delivery-runtime" / "watchdog-state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "waiting_for_host"
+    assert state["last_action"] == "run_code_review"
+    assert state["skill"] == "code-review"
+    assert state["task_id"] == "T004"
 
 def test_cmd_fix_reapplies_exception_patch(tmp_path: Path) -> None:
     from delivery.loop_gitops import ensure_git_repo, git
@@ -358,6 +467,26 @@ index 1840f4f..0c54728 100644
     assert result == 0
     assert target.read_text(encoding="utf-8") == "print('patched')\n"
     assert not patch_path.exists()
+
+
+def test_cmd_fix_returns_nonzero_when_resume_finds_no_runnable_tasks(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_run_fix_once",
+        lambda project_root, task_id, runtime, no_start=False, spawn_watchdog_after=True: {
+            "status": "exception",
+            "reason": "no runnable tasks",
+            "exception_task_ids": [task_id],
+        },
+    )
+
+    result = cli.cmd_fix(argparse.Namespace(project=str(tmp_path), task_id="T007", no_start=False, runtime="opencode"))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["status"] == "exception"
+    assert payload["fix_status"] == "not_resumed"
+    assert "next_actions" in payload
 
 def test_project_execution_guard_prunes_dead_pid_lock(tmp_path: Path, monkeypatch) -> None:
     lock_dir = tmp_path / ".app-delivery-runtime" / "locks"

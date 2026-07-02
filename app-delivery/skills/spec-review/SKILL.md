@@ -16,8 +16,11 @@ Procedure:
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery-preflight.sh --project {project} --requirements {requirements_path}
 ```
 3. Normalize the raw source into canonical requirement slices:
-	- preserve stable IDs when the source already has defensible IDs
-	- otherwise generate stable IDs in document order
+	- preserve a source REQ/NFR ID as the canonical ID only when that source item is already actionable enough for architecture, implementation, and validation
+	- split source IDs that contain multiple independent behaviors, workflows, roles, integrations, state changes, or acceptance signals into multiple canonical requirements and keep the original IDs in `source_requirement_ids`
+	- merge candidate requirements that are only fields, UI fragments, endpoint fragments, tests, or implementation steps of one behavior
+	- otherwise generate stable canonical IDs in document order using only `REQ-###` for functional/business requirements and `NFR-###` for non-functional requirements
+	- do not invent domain-specific canonical ID prefixes; put domain labels in title, summary, or source traceability instead
 	- extract explicit functional requirements, constraints, roles, data/security/ops rules, external dependencies, and acceptance signals
 	- apply the coarse-vs-actionable requirement and C1/C2/C3 clarification rules from the stage contract before continuing
 	- preserve explicitly named technologies as requirements or constraints, and emit matching `technology_hints`
