@@ -1124,7 +1124,7 @@ def decompose_tasks(
     normalized_items.append(
         Task(
             id=FINAL_VERIFY_TASK_ID,
-            title="最终验证",
+            title="Final verification",
             status="pending",
             requirements=final_requirements,
             acceptance_scenarios=[],

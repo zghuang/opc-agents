@@ -2316,7 +2316,7 @@ def test_status_reports_verified_task_with_mock_only_browser_e2e_as_invalid(tmp_
     payload = loop_status(tmp_path)
 
     assert payload["invalid_verified_tasks"] == {
-        "T002": "frontend/e2e/case.spec.ts uses Playwright route fulfillment for project-owned API calls without route passthrough; mocked browser proof is not real backend E2E evidence"
+        "T002": "frontend/e2e/case.spec.ts:3 page.route for project-owned API calls uses route.fulfill without route.fetch/route.continue/route.fallback passthrough; mocked browser proof is not real backend E2E evidence"
     }
 
 def test_routed_status_reports_invalid_verified_task_without_blocking_next_task(tmp_path: Path, monkeypatch) -> None:

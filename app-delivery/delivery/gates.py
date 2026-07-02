@@ -330,6 +330,15 @@ def _write_gate_report(
             lines.append(f"- {task_id}: {status} ({test_types})")
     else:
         lines.append("- none")
+    lines.extend(["", "## Test Type Classification", ""])
+    if related_results:
+        for row in related_results:
+            task_id = str(row.get("task_id") or "-")
+            for test_file in row.get("test_files", []) if isinstance(row.get("test_files"), list) else []:
+                inferred = ", ".join(infer_test_types([str(test_file)])) or "none"
+                lines.append(f"- {task_id}: {test_file} -> {inferred}")
+    else:
+        lines.append("- none")
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(report_path.relative_to(Path(project_root).expanduser().resolve()))
 

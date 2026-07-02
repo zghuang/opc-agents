@@ -470,14 +470,14 @@ def test_cmd_code_review_rejects_pass_when_latest_task_tests_failed(tmp_path: Pa
     )
     monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
 
-    with pytest.raises(DeliveryError) as exc_info:
-        cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
 
-    assert exc_info.value.code == "review_pass_preconditions_failed"
-    assert "latest task validation failed" in exc_info.value.details["precondition_errors"][0]
+    assert result == 0
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
-    assert payload["items"][0]["status"] == "review_pending"
-    assert not (tmp_path / "docs" / "reviews" / "code-review-T002.md").exists()
+    assert payload["items"][0]["status"] == "pending"
+    assert payload["items"][0]["review_status"] == "changes_requested"
+    assert "latest task validation failed" in payload["items"][0]["blocked_reason"]
+    assert (tmp_path / "docs" / "reviews" / "code-review-T002.md").exists()
 
 def test_cmd_code_review_rejects_prefinal_audit_pass_when_report_missing(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
@@ -531,14 +531,14 @@ def test_cmd_code_review_rejects_prefinal_audit_pass_when_report_missing(tmp_pat
     input_path.write_text(json.dumps({"status": "pass", "summary": "Audit ready.", "findings": [], "requirement_assessment": [], "acceptance_assessment": []}), encoding="utf-8")
     monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
 
-    with pytest.raises(DeliveryError) as exc_info:
-        cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=PREFINAL_AUDIT_TASK_ID, input=str(input_path)))
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=PREFINAL_AUDIT_TASK_ID, input=str(input_path)))
 
-    assert exc_info.value.code == "review_pass_preconditions_failed"
-    assert "required audit report is missing" in exc_info.value.details["precondition_errors"][0]
+    assert result == 0
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
-    assert payload["items"][0]["status"] == "review_pending"
-    assert not (tmp_path / "docs" / "reviews" / "code-review-T-SYSTEM-AUDIT.md").exists()
+    assert payload["items"][0]["status"] == "pending"
+    assert payload["items"][0]["review_status"] == "changes_requested"
+    assert "required audit report is missing" in payload["items"][0]["blocked_reason"]
+    assert (tmp_path / "docs" / "reviews" / "code-review-T-SYSTEM-AUDIT.md").exists()
 
 def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
@@ -592,14 +592,14 @@ def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp
     input_path.write_text(json.dumps({"status": "pass", "summary": "Audit ready.", "findings": [], "requirement_assessment": [], "acceptance_assessment": []}), encoding="utf-8")
     monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
 
-    with pytest.raises(DeliveryError) as exc_info:
-        cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=FRONTEND_API_AUDIT_TASK_ID, input=str(input_path)))
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=FRONTEND_API_AUDIT_TASK_ID, input=str(input_path)))
 
-    assert exc_info.value.code == "review_pass_preconditions_failed"
-    assert "required frontend/API audit report is missing" in exc_info.value.details["precondition_errors"][0]
+    assert result == 0
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
-    assert payload["items"][0]["status"] == "review_pending"
-    assert not (tmp_path / "docs" / "reviews" / f"code-review-{FRONTEND_API_AUDIT_TASK_ID}.md").exists()
+    assert payload["items"][0]["status"] == "pending"
+    assert payload["items"][0]["review_status"] == "changes_requested"
+    assert "required frontend/API audit report is missing" in payload["items"][0]["blocked_reason"]
+    assert (tmp_path / "docs" / "reviews" / f"code-review-{FRONTEND_API_AUDIT_TASK_ID}.md").exists()
 
 def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path) -> None:
     save_work_items(

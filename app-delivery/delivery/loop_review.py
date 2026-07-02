@@ -151,6 +151,37 @@ def _enforce_review_pass_preconditions(project_root: Path | str, task: Task, inp
     )
 
 
+def _precondition_failure_review_payload(task: Task, parsed: dict[str, Any], errors: list[str]) -> dict[str, Any]:
+    summary = (
+        "Machine-verifiable review pass preconditions failed; route this task back to implementation repair. "
+        + "; ".join(errors[:3])
+    )
+    findings = [
+        *[finding for finding in parsed.get("findings", []) if isinstance(finding, dict)],
+        {
+            "severity": "blocking",
+            "requirement_ids": list(task.requirements),
+            "acceptance_ids": list(task.acceptance_scenarios),
+            "message": summary,
+        },
+    ]
+    return {
+        **parsed,
+        "status": "changes_requested",
+        "summary": summary,
+        "findings": findings,
+        "task_contract_assessment": {
+            "status": "changes_requested",
+            "issue_type": "implementation",
+            "recommended_action": "implementation_repair",
+            "operations": [],
+            "affected_requirement_ids": list(task.requirements),
+            "affected_acceptance_ids": list(task.acceptance_scenarios),
+            "notes": summary,
+        },
+    }
+
+
 def write_code_review_request(
     project_root: Path | str,
     task: Task,
@@ -327,7 +358,10 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         ) from exc
     review_status = str(parsed.get("status") or "changes_requested").strip()
     if review_status.casefold() == "pass":
-        _enforce_review_pass_preconditions(project_dir, task, input_path)
+        precondition_errors = _review_pass_precondition_errors(project_dir, task)
+        if precondition_errors:
+            parsed = _precondition_failure_review_payload(task, parsed, precondition_errors)
+            review_status = "changes_requested"
     reviewed_at = utc_now_iso()
     persisted_input = review_input_path(project_dir, task_id)
     persisted_input_content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"

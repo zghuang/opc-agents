@@ -717,22 +717,79 @@ def test_import_task_review_pass_rejects_mock_only_browser_e2e(tmp_path: Path) -
         },
     )
 
-    with pytest.raises(DeliveryError) as exc_info:
-        import_task_review(
-            tmp_path,
-            "T002",
-            {
-                "status": "pass",
-                "summary": "Looks good.",
-                "findings": [],
-                "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
-                "acceptance_assessment": [],
-            },
-            tmp_path / "review-input.json",
-        )
+    result = import_task_review(
+        tmp_path,
+        "T002",
+        {
+            "status": "pass",
+            "summary": "Looks good.",
+            "findings": [],
+            "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+            "acceptance_assessment": [],
+        },
+        tmp_path / "review-input.json",
+    )
 
-    assert exc_info.value.code == "review_pass_preconditions_failed"
-    assert "mocked browser proof is not real backend E2E evidence" in str(exc_info.value.details)
+    assert result == 2
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    item = payload["items"][0]
+    assert item["status"] == "pending"
+    assert item["review_status"] == "changes_requested"
+    assert "mocked browser proof is not real backend E2E evidence" in item["blocked_reason"]
+
+def test_import_task_review_pass_accepts_route_fetch_passthrough_e2e(tmp_path: Path, monkeypatch) -> None:
+    from delivery.loop_review import import_task_review
+
+    (tmp_path / "frontend" / "e2e").mkdir(parents=True)
+    (tmp_path / "frontend" / "e2e" / "case.spec.ts").write_text(
+        "import { test } from '@playwright/test'\n"
+        "test('case flow', async ({ page }) => {\n"
+        "  await page.route('**/api/incidents', async route => {\n"
+        "    try { const response = await route.fetch(); await route.fulfill({ response }) }\n"
+        "    catch { await route.fulfill({ status: 200, body: '{}' }) }\n"
+        "  })\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Cases",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["frontend/e2e/case.spec.ts"],
+                    "output_paths": ["frontend/src/routes/cases.tsx"],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
+
+    result = import_task_review(
+        tmp_path,
+        "T002",
+        {
+            "status": "pass",
+            "summary": "Looks good.",
+            "findings": [],
+            "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+            "acceptance_assessment": [],
+        },
+        tmp_path / "review-input.json",
+    )
+
+    assert result == 0
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "verified"
 
 def test_import_task_review_pass_rejects_non_passing_acceptance_assessment(tmp_path: Path) -> None:
     import pytest

@@ -18,6 +18,7 @@ SEMANTIC_REPORT_PATH = "docs/reviews/production-semantic-scan.md"
 PRODUCTION_DEMO_PATTERN = re.compile(r"\b(DEMO|MOCK_[A-Z0-9_]*|hardcoded|stub|placeholder|NotImplemented)\b", re.IGNORECASE)
 FASTAPI_ROUTE_PATTERN = re.compile(r"@router\.(get|post|put|patch|delete)\(")
 AUTH_DEPENDENCY_PATTERN = re.compile(r"Depends\((?:require_user|require_role|get_current_user)")
+PAGE_ROUTE_PATTERN = re.compile(r"\bpage\.route\s*\(")
 
 
 def _relative(project_dir: Path, path: Path) -> str:
@@ -31,6 +32,32 @@ def _read(path: Path) -> str:
         return ""
 
 
+def _line_number(text: str, offset: int) -> int:
+    return str(text or "")[:max(0, offset)].count("\n") + 1
+
+
+def _page_route_call_blocks(text: str) -> list[tuple[int, str]]:
+    blocks: list[tuple[int, str]] = []
+    for match in PAGE_ROUTE_PATTERN.finditer(str(text or "")):
+        start = match.start()
+        open_paren = text.find("(", match.start())
+        if open_paren < 0:
+            continue
+        depth = 0
+        end = len(text)
+        for index in range(open_paren, len(text)):
+            char = text[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        blocks.append((_line_number(text, start), text[start:end]))
+    return blocks
+
+
 def mock_only_browser_e2e_issues(project_root: Path | str, output_tests: list[str]) -> list[str]:
     project_dir = Path(project_root).expanduser().resolve()
     issues: list[str] = []
@@ -39,14 +66,15 @@ def mock_only_browser_e2e_issues(project_root: Path | str, output_tests: list[st
         if not normalized.startswith("frontend/e2e/"):
             continue
         text = _read(project_dir / normalized)
-        lowered = text.casefold()
-        if "page.route" not in lowered or "/api" not in lowered or "route.fulfill" not in lowered:
-            continue
-        if "route.continue" in lowered or "route.fallback" in lowered:
-            continue
-        issues.append(
-            f"{normalized} uses Playwright route fulfillment for project-owned API calls without route passthrough; mocked browser proof is not real backend E2E evidence"
-        )
+        for line_number, block in _page_route_call_blocks(text):
+            lowered = block.casefold()
+            if "/api" not in lowered or "route.fulfill" not in lowered:
+                continue
+            if any(marker in lowered for marker in ("route.fetch", "route.continue", "route.fallback")):
+                continue
+            issues.append(
+                f"{normalized}:{line_number} page.route for project-owned API calls uses route.fulfill without route.fetch/route.continue/route.fallback passthrough; mocked browser proof is not real backend E2E evidence"
+            )
     return issues
 
 

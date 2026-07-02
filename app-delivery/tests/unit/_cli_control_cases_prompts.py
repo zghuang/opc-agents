@@ -648,6 +648,8 @@ def test_cmd_context_sync_accepts_runtime_specific_context_only(tmp_path: Path) 
     assert "claude\n" in claude_text
     assert "## Runtime Baseline" in claude_text
     assert "docs/requirements-source.md is the raw requirements record" in claude_text
+    assert "read the matching section of `docs/requirements-source.md` before coding or reviewing" in claude_text
+    assert "follow `docs/requirements-source.md` for endpoints, methods, request/response fields, data models, protocols" in claude_text
     assert "framework artifacts for planning and traceability" in claude_text
     assert "do not guess APIs from memory" in claude_text
     assert "Backend Python commands must use the project environment" in claude_text
