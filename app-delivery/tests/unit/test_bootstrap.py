@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import shutil
 from pathlib import Path
 
-from delivery.bootstrap import archive_requirements_source, doctor_report, initialize_project, normalize_dependency_hints, save_project_dependency_hints, start_preflight
+import pytest
+
+from delivery.bootstrap import _command_check, archive_requirements_source, doctor_report, initialize_project, normalize_dependency_hints, save_project_dependency_hints, start_preflight
 
 
 def test_initialize_project_creates_scaffold_and_metadata(tmp_path: Path) -> None:
@@ -237,3 +240,17 @@ def test_doctor_report_detects_missing_framework_paths(tmp_path: Path) -> None:
     assert payload["status"] == "fail"
     missing = {row["name"] for row in payload["checks"] if row["status"] != "ok"}
     assert "framework:delivery" in missing
+
+
+def test_command_check_reports_pnpm_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*args, **kwargs):
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    row = _command_check("pnpm", ["pnpm", "--version"])
+
+    assert row["status"] == "missing"
+    assert row["message"] == "missing command: pnpm"
+    assert "corepack enable" in row["suggested_action"]
+    assert "npm install -g pnpm" in row["suggested_action"]

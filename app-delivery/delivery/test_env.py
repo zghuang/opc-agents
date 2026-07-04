@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -323,8 +324,9 @@ def _wait_for_services(project_root: Path, services: list[str], *, timeout_secon
 
 
 def _probe_backend_health(project_root: Path, command: str, *, timeout_seconds: int = 20) -> dict[str, Any]:
+    shell = os.environ.get("APP_DELIVERY_SHELL") or shutil.which("zsh") or shutil.which("bash") or shutil.which("sh") or "/bin/sh"
     process = subprocess.Popen(
-        ["/bin/zsh", "-lc", command],
+        [shell, "-lc", command],
         cwd=project_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

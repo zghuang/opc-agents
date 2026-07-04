@@ -326,16 +326,24 @@ def test_command_for_test_spec_uses_current_python_for_pytest(tmp_path: Path) ->
 
 def test_command_for_backend_test_spec_runs_in_backend_with_uv(tmp_path: Path) -> None:
     command = _command_for_test_spec(tmp_path, "backend/tests/core/test_database.py")
-    assert command[0:2] == ["/bin/zsh", "-lc"]
+    assert command[1] == "-lc"
     assert "cd " in command[2]
     assert "uv run pytest tests/core/test_database.py --tb=short -q" in command[2]
+
+
+def test_command_for_shell_specs_respects_app_delivery_shell(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APP_DELIVERY_SHELL", "/usr/bin/bash")
+
+    command = _command_for_test_spec(tmp_path, "backend/tests/core/test_database.py")
+
+    assert command[0:2] == ["/usr/bin/bash", "-lc"]
 
 
 def test_command_for_bare_pytest_spec_rewrites_to_backend_uv(tmp_path: Path) -> None:
     (tmp_path / "backend").mkdir()
     command = _command_for_test_spec(tmp_path, "python -m pytest src/tests/auth/test_login.py -q")
 
-    assert command[0:2] == ["/bin/zsh", "-lc"]
+    assert command[1] == "-lc"
     assert f"cd {tmp_path / 'backend'}" in command[2]
     assert "uv run python -m pytest src/tests/auth/test_login.py -q" in command[2]
 
@@ -345,14 +353,14 @@ def test_command_for_npm_script_runs_in_frontend(tmp_path: Path) -> None:
     (tmp_path / "frontend" / "package.json").write_text("{}\n", encoding="utf-8")
     command = _command_for_test_spec(tmp_path, "npm run test")
 
-    assert command[0:2] == ["/bin/zsh", "-lc"]
+    assert command[1] == "-lc"
     assert f"cd {tmp_path / 'frontend'}" in command[2]
     assert command[2].endswith("&& npm run test")
 
 
 def test_command_for_backend_test_directory_runs_in_backend_with_uv(tmp_path: Path) -> None:
     command = _command_for_test_spec(tmp_path, "backend/tests/core/")
-    assert command[0:2] == ["/bin/zsh", "-lc"]
+    assert command[1] == "-lc"
     assert "cd " in command[2]
     assert "uv run pytest tests/core --tb=short -q" in command[2]
 
@@ -360,7 +368,7 @@ def test_command_for_backend_test_directory_runs_in_backend_with_uv(tmp_path: Pa
 def test_command_for_mock_server_test_spec_runs_in_mock_server_with_uv(tmp_path: Path) -> None:
     command = _command_for_test_spec(tmp_path, "mock-server/tests/all_mock_contracts.py")
 
-    assert command[:2] == ["/bin/zsh", "-lc"]
+    assert command[1] == "-lc"
     assert f"cd {tmp_path / 'mock-server'}" in command[2]
     assert "uv run pytest tests/all_mock_contracts.py --tb=short -q" in command[2]
 
@@ -369,7 +377,7 @@ def test_command_for_frontend_e2e_spec_runs_in_frontend(tmp_path: Path) -> None:
     (tmp_path / "frontend").mkdir()
     (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")
     command = _command_for_test_spec(tmp_path, "frontend/e2e/app-shell.spec.ts")
-    assert command[0:2] == ["/bin/zsh", "-lc"]
+    assert command[1] == "-lc"
     assert "cd " in command[2]
     assert "playwright" in command[2]
     assert "e2e/app-shell.spec.ts" in command[2]
@@ -546,7 +554,7 @@ def test_command_for_npm_e2e_runs_in_frontend_with_backend_env_when_available(tm
 
     command = _command_for_test_spec(tmp_path, "npm run e2e")
 
-    assert command[0:2] == ["/bin/zsh", "-lc"]
+    assert command[1] == "-lc"
     assert f"cd {tmp_path / 'frontend'}" in command[2]
     assert "E2E_BACKEND_CMD=" in command[2]
     assert command[2].endswith("npm run e2e")

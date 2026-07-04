@@ -79,7 +79,7 @@ PROJECTS_DIR="$OPC_HOME/projects"
 SKILLS_DST="$HOME/.hermes/skills/opc-agents"
 WATCHDOG_FILE="$STATE_DIR/watchdog-deliver"
 
-export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/Users/hzg/.local/bin:/Users/hzg/.opencode/bin:/Users/hzg/.npm-global/bin:/Users/hzg/.lmstudio/bin:/Applications/Docker.app/Contents/Resources/bin:$PATH"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.npm-global/bin:$HOME/.lmstudio/bin:/Applications/Docker.app/Contents/Resources/bin:$PATH"
 
 resolve_python_path() {
   local candidate="${1:-}"
@@ -148,6 +148,7 @@ for row in checks:
     name = str(row.get("name") or "<unknown>")
     check_status = str(row.get("status") or "unknown")
     message = str(row.get("message") or "")
+    suggested_action = str(row.get("suggested_action") or "").strip()
     marker = {
         "ok": "✓",
         "fail": "✗",
@@ -155,6 +156,8 @@ for row in checks:
         "error": "✗",
     }.get(check_status, "•")
     print(f"  {marker} {name}: {message}")
+    if suggested_action and check_status != "ok":
+      print(f"      fix: {suggested_action}")
 PY
 }
 

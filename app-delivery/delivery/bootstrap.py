@@ -156,6 +156,26 @@ def normalize_dependency_hints(raw_hints: Any) -> list[dict[str, str]]:
 
 
 def _command_check(name: str, command: list[str]) -> dict[str, Any]:
+    def missing_payload() -> dict[str, Any]:
+        suggestions = {
+            "pnpm": "pnpm is required for frontend installs/tests. With Node 16+ run: corepack enable && corepack prepare pnpm@latest --activate. If corepack is unavailable, run: npm install -g pnpm.",
+            "node": "Install Node.js 24 or newer, then rerun setup-opc.sh.",
+            "npm": "Install npm with Node.js, or repair the Node.js installation, then rerun setup-opc.sh.",
+            "docker": "Install and start Docker, ensure the current user can run `docker --version`, then rerun setup-opc.sh.",
+            "git": "Install git and ensure it is on PATH, then rerun setup-opc.sh.",
+            "hermes": "Install Hermes and ensure `hermes --version` works in this shell, then rerun setup-opc.sh.",
+            "opencode": "Install OpenCode and ensure `opencode --version` works in this shell, then rerun setup-opc.sh.",
+            "claude": "Install Claude Code and ensure `claude --version` works in this shell, then rerun setup-opc.sh.",
+        }
+        executable = command[0]
+        return {
+            "name": name,
+            "status": "missing",
+            "message": f"missing command: {executable}",
+            "details": {"command": executable, "path": os.environ.get("PATH", "")},
+            "suggested_action": suggestions.get(name, f"Install `{executable}` and ensure it is on PATH, then rerun setup-opc.sh."),
+        }
+
     try:
         completed = subprocess.run(
             command,
@@ -167,10 +187,16 @@ def _command_check(name: str, command: list[str]) -> dict[str, Any]:
             check=False,
         )
     except FileNotFoundError:
-        return {"name": name, "status": "missing", "message": f"missing command: {command[0]}"}
+        return missing_payload()
     if completed.returncode != 0:
         output = completed.stdout.strip()
-        return {"name": name, "status": "error", "message": output or f"command failed: {' '.join(command)}"}
+        return {
+            "name": name,
+            "status": "error",
+            "message": output or f"command failed: {' '.join(command)}",
+            "details": {"command": " ".join(command), "exit_code": completed.returncode},
+            "suggested_action": f"Run `{' '.join(command)}` directly, fix the reported error, then rerun setup-opc.sh.",
+        }
     output = completed.stdout.strip().splitlines()
     return {"name": name, "status": "ok", "message": output[0] if output else "ok"}
 

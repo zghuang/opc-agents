@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -670,11 +671,16 @@ def _rewrite_command_test_spec(project_root: Path, spec: str) -> str:
     return normalized
 
 
+def _shell_command(command: str) -> list[str]:
+    shell = os.environ.get("APP_DELIVERY_SHELL") or shutil.which("zsh") or shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    return [shell, "-lc", command]
+
+
 def _command_for_test_spec(project_root: Path, spec: str) -> list[str]:
     normalized = str(spec or "").strip()
     path = Path(normalized)
     if is_command_test_spec(normalized):
-        return ["/bin/zsh", "-lc", _rewrite_command_test_spec(project_root, normalized)]
+        return _shell_command(_rewrite_command_test_spec(project_root, normalized))
     backend_root = project_root / "backend"
     frontend_root = project_root / "frontend"
     mock_root = project_root / "mock-server"
@@ -682,21 +688,21 @@ def _command_for_test_spec(project_root: Path, spec: str) -> list[str]:
     if normalized.startswith("backend/"):
         relative = Path(normalized).relative_to("backend")
         if relative.suffix.lower() in {".py"} or relative.suffix == "":
-            return ["/bin/zsh", "-lc", f"cd {shlex.quote(str(backend_root))} && uv run pytest {shlex.quote(str(relative))} --tb=short -q"]
+            return _shell_command(f"cd {shlex.quote(str(backend_root))} && uv run pytest {shlex.quote(str(relative))} --tb=short -q")
     if normalized.startswith("mock-server/"):
         relative = Path(normalized).relative_to("mock-server")
         if relative.suffix.lower() in {".py"} or relative.suffix == "":
-            return ["/bin/zsh", "-lc", f"cd {shlex.quote(str(mock_root))} && uv run pytest {shlex.quote(str(relative))} --tb=short -q"]
+            return _shell_command(f"cd {shlex.quote(str(mock_root))} && uv run pytest {shlex.quote(str(relative))} --tb=short -q")
     if normalized.startswith("frontend/"):
         relative = Path(normalized).relative_to("frontend")
         if ".spec." in relative.name or "e2e" in relative.parts or "playwright" in normalized.lower():
-            return ["/bin/zsh", "-lc", f"cd {shlex.quote(str(frontend_root))} && {e2e_env}{ _js_runner_prefix(project_root, normalized, 'playwright') } test {shlex.quote(str(relative))}"]
+            return _shell_command(f"cd {shlex.quote(str(frontend_root))} && {e2e_env}{ _js_runner_prefix(project_root, normalized, 'playwright') } test {shlex.quote(str(relative))}")
         if relative.suffix.lower() in {".ts", ".tsx", ".js", ".jsx"}:
-            return ["/bin/zsh", "-lc", f"cd {shlex.quote(str(frontend_root))} && { _js_runner_prefix(project_root, normalized, 'vitest') } run {shlex.quote(str(relative))}"]
+            return _shell_command(f"cd {shlex.quote(str(frontend_root))} && { _js_runner_prefix(project_root, normalized, 'vitest') } run {shlex.quote(str(relative))}")
     if path.suffix.lower() in {".ts", ".tsx", ".js", ".jsx"}:
         if ".spec." in path.name or "e2e" in path.parts or "playwright" in normalized.lower():
-            return ["/bin/zsh", "-lc", f"{e2e_env}{_js_runner_prefix(project_root, normalized, 'playwright')} test {shlex.quote(normalized)}"]
-        return ["/bin/zsh", "-lc", f"{_js_runner_prefix(project_root, normalized, 'vitest')} run {shlex.quote(normalized)}"]
+            return _shell_command(f"{e2e_env}{_js_runner_prefix(project_root, normalized, 'playwright')} test {shlex.quote(normalized)}")
+        return _shell_command(f"{_js_runner_prefix(project_root, normalized, 'vitest')} run {shlex.quote(normalized)}")
     pytest_runner = os.environ.get("APP_DELIVERY_PYTHON") or sys.executable or "python3"
     return [pytest_runner, "-m", "pytest", normalized, "--tb=short", "-q"]
 
