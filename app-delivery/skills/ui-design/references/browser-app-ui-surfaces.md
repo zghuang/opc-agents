@@ -4,12 +4,12 @@ For browser-app projects, `docs/ui/page-archetypes.md` must include a Route Mapp
 
 Each route/workflow should list:
 
-- route path
-- requirement IDs
+- page / route / workflow name
+- source requirement IDs
 - allowed roles/personas
-- backend/API dependencies
+- required regions/components and backend/API dependencies
 - loading/empty/error/disabled/success states
-- target frontend paths
-- browser/a11y QA expectations
+- target frontend output paths
+- browser/a11y QA expectations and suggested test paths
 
 `opc-ledger.py check-ui-coverage` uses route mappings to verify frontend work items exist.

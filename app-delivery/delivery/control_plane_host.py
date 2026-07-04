@@ -8,11 +8,13 @@ from .loop_review import final_review_input_path, review_input_path
 from .stage_harness import stage_import_command, stage_input_path
 
 
+APP_DELIVERY_BIN = "${OPC_HOME:-$HOME/opc}/bin/app-delivery"
+
+
 def _generate_only_prompt(prefix: str, expected_input_path: str) -> str:
     return (
         f"{prefix} "
         f"Write the canonical JSON artifact to {expected_input_path}. "
-        "Do not run the app-delivery import command yourself; the framework will import it automatically. "
         "Return only a concise final summary."
     )
 
@@ -30,13 +32,20 @@ def _host_skill_step(
     blocking: bool = False,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    prompt_text = prompt
+    if import_command:
+        prompt_text = (
+            f"{prompt_text.rstrip()} "
+            f"After writing the artifact, run this import command to hand it back to the framework: {import_command}. "
+            "If the import command fails, leave the artifact at the expected path and report the import failure in the final summary."
+        )
     payload: dict[str, Any] = {
         "kind": "host_skill",
         "owner": "host",
         "skill": skill,
         "action": action,
         "message": message,
-        "prompt": prompt,
+        "prompt": prompt_text,
         "project": str(project_root),
         "blocking": blocking,
     }
@@ -250,7 +259,7 @@ def build_planning_host_step(
 def build_review_host_step(*, project_root: Path, task_id: str, title: str) -> dict[str, Any]:
     if task_id == "T-FINAL":
         input_path = final_review_input_path(project_root)
-        import_command = f'app-delivery final-review --project "{project_root}" --input "{input_path}"'
+        import_command = f'{APP_DELIVERY_BIN} final-review --project "{project_root}" --input "{input_path}"'
         return _host_skill_step(
             project_root=project_root,
             skill="final-review",
@@ -266,7 +275,7 @@ def build_review_host_step(*, project_root: Path, task_id: str, title: str) -> d
         )
 
     input_path = review_input_path(project_root, task_id)
-    import_command = f'app-delivery code-review --project "{project_root}" --task-id "{task_id}" --input "{input_path}"'
+    import_command = f'{APP_DELIVERY_BIN} code-review --project "{project_root}" --task-id "{task_id}" --input "{input_path}"'
     return _host_skill_step(
         project_root=project_root,
         skill="code-review",

@@ -85,6 +85,7 @@ Constraints:
 - Add dependency edges only for real prerequisites: technical/shared foundation needs or product workflow/domain ordering. If feature B only makes sense after feature A, make B depend on A.
 - Ensure every requirement is covered by at least one feature task.
 - Do not use a foundation/support slice to claim full user-visible requirement coverage when it only creates scaffolding, stubs, wiring, or shared primitives; keep that full requirement on the owning feature slice and any validation task.
+- If a task owns API endpoints, route handlers, UI data flows, workflow actions, or external-system contracts, its intent and output paths/tests must include the real backing behavior for that slice: service/domain logic, persistence or query/update path, external adapter/mock-server contract when explicitly dev-only, and assertions on returned data semantics. Do not treat "route exists", "response shape matches", hardcoded/default responses, or static fake data as a completed feature.
 - Mock servers, seed data, fixtures, common components, base contracts, app shells, and runtime wiring may be necessary tasks only when they unlock later feature work; they should not become catch-all requirement owners.
 - Prefer whole-feature sequencing: from infrastructure/shared foundations into functional slices, then final verification.
 - Before finalizing `items`, self-check every `feature` task with this question: after this task alone and its dependencies complete, what user, operator, or external system capability works end-to-end enough to be tested?
@@ -100,6 +101,8 @@ Constraints:
 - Complexity classification does not need to be exact. A rough, defensible estimate is enough.
 - Avoid creating broad backend/frontend foundation buckets beyond the built-in scaffold/shared-infrastructure phases. If shared code is needed, keep it tightly scoped or attach it to the earliest owning vertical slice.
 - If `ui_required=true`, user-visible tasks should naturally include frontend output paths where the requirement implies UI behavior.
+- If `docs/ui/page-archetypes.md` exists and contains a `## Route Mapping` table, every mapped page/route/workflow row must be covered by at least one `feature` or `validation` task through overlapping source requirement IDs. The covering task must include relevant `frontend/...` output paths; when the route row suggests browser tests, the task must include at least one `frontend/e2e/...`, Playwright, browser, or e2e output test.
+- Do not leave page shell, primary navigation, page archetypes, mobile drawer behavior, or required UI states only in `docs/ui/*`; attach them to the owning user-visible feature tasks through `intent.done_when`, `output_paths`, and `output_tests`.
 - Use the provided test-plan coverage hints to keep output_tests aligned with expected test types.
 
 Use this `delivery_complexity` shape:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from delivery.state import (
     acquire_lock,
+    active_task_record_path,
     clear_task_runtime_failure,
     latest_task_log_event,
     load_active_task_records,
@@ -28,6 +29,7 @@ from delivery.state import (
     save_test_plan,
     save_test_results,
     save_work_items,
+    write_active_task_record,
 )
 
 
@@ -90,6 +92,39 @@ def test_work_items_markdown_compacts_session_history(tmp_path: Path) -> None:
     save_work_items(tmp_path, payload)
     work_items_md = (tmp_path / "docs" / "work-items.md").read_text(encoding="utf-8")
     assert "session-1, ... session-4 (4 total; see docs/work-items.json)" in work_items_md
+
+
+def test_work_items_markdown_overlays_active_validation_subtask(tmp_path: Path) -> None:
+    record_path = active_task_record_path(tmp_path, runtime="validation", task_id="T-FINAL:frontend-browser-qa", session_id="test")
+    write_active_task_record(
+        record_path,
+        {
+            "pid": os.getpid(),
+            "runtime": "validation",
+            "task_id": "T-FINAL:frontend-browser-qa",
+            "task_title": "T-FINAL:frontend-browser-qa",
+            "phase": "verification",
+        },
+    )
+    payload = {
+        "schema_version": "2",
+        "project": "demo",
+        "generated_at": "2026-06-24T00:00:00Z",
+        "items": [
+            {
+                "id": "T-FINAL",
+                "title": "Final verification",
+                "status": "blocked",
+                "requirements": [],
+                "dependencies": [],
+            }
+        ],
+    }
+
+    save_work_items(tmp_path, payload)
+
+    work_items_md = (tmp_path / "docs" / "work-items.md").read_text(encoding="utf-8")
+    assert "| T-FINAL | Final verification | active (verification: frontend-browser-qa) |" in work_items_md
 
 
 def test_test_results_round_trip(tmp_path: Path) -> None:

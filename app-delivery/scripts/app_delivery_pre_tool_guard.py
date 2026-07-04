@@ -39,6 +39,7 @@ SETUP_SEGMENT_PREFIXES = (
     "source ",
     ". ",
     "export ",
+    "set ",
 )
 
 READONLY_COMMAND_PREFIXES = (
@@ -131,6 +132,29 @@ READONLY_PIPE_FILTER_PREFIXES = (
     "wc",
     "sed -n",
 )
+
+TEST_COMMAND_MARKERS = (
+    "playwright test",
+    "npx playwright test",
+    "npx -y playwright test",
+    "pnpm exec playwright test",
+    "npm run e2e",
+    "pnpm e2e",
+    "npm test",
+    "npm run test",
+    "pnpm test",
+    "vitest",
+    "npx vitest",
+    "pnpm exec vitest",
+    "pytest",
+    "python -m pytest",
+    "python3 -m pytest",
+    "uv run pytest",
+    "uv run python -m pytest",
+    "uv run python3 -m pytest",
+)
+
+TEST_PIPE_FILTER_RE = re.compile(r"\|\s*(?:tail|head|grep|rg|sed|awk)\b", re.IGNORECASE)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -401,6 +425,17 @@ def _is_allowed_terminal_command(command: str, *, cwd: Path, project_root: Path)
     return actionable_seen
 
 
+def _masks_test_exit_code_with_pipe(command: str) -> bool:
+    normalized = " ".join(str(command or "").strip().split()).lower()
+    if "|" not in normalized:
+        return False
+    if "pipefail" in normalized or "pipestatus" in normalized:
+        return False
+    if not any(marker in normalized for marker in TEST_COMMAND_MARKERS):
+        return False
+    return bool(TEST_PIPE_FILTER_RE.search(normalized))
+
+
 def _is_readonly_shell_segment(segment: str) -> bool:
     normalized = ENV_ASSIGNMENT_PREFIX.sub("", segment).strip().lower()
     if not normalized:
@@ -450,6 +485,10 @@ def main() -> int:
 
     if tool_name == "bash":
         command = str(tool_input.get("command") or "")
+        if _masks_test_exit_code_with_pipe(command):
+            return _emit_block(
+                "app-delivery pre-tool guard blocked a test command piped through an output filter without pipefail; this masks Playwright/pytest/vitest failures as exit 0. Run the test unpiped, or prefix the command with `set -o pipefail;` before piping to tail/head/grep."
+            )
         if not _is_allowed_terminal_command(command, cwd=cwd, project_root=project_root):
             return _emit_block(
                 "app-delivery pre-tool guard blocked a mutating shell command in the canonical project worktree. Use the framework-owned task loop instead of direct terminal mutations."

@@ -16,6 +16,7 @@ from .state import (
     load_test_results,
     load_work_items,
     remove_active_task_record,
+    render_work_items_markdown,
     save_test_results,
     utc_now_iso,
     write_active_task_record,
@@ -563,6 +564,7 @@ def _run(
                 "spec": normalized_spec or None,
             },
         )
+        render_work_items_markdown(project_root)
         append_task_log_event(
             project_root,
             runtime="validation",
@@ -586,6 +588,8 @@ def _run(
         )
     finally:
         remove_active_task_record(record_path)
+        if project_root is not None and normalized_task_id:
+            render_work_items_markdown(project_root)
     if project_root is not None and normalized_task_id:
         append_task_log_event(
             project_root,

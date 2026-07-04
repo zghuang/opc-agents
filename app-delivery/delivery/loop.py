@@ -47,7 +47,7 @@ from .task import (
 )
 from .test_env import project_has_browser_e2e, warm_browser_e2e_environment, warm_shared_test_environment
 from .loop_task_prompt import build_fix_prompt, build_scope_fix_prompt, build_stalled_recovery_prompt, build_task_prompt
-from .verify import infer_final_repair_candidates, is_path_test_spec, run_full_suite, run_task_tests, test_results_to_summary, write_final_repair_report
+from .verify import infer_final_repair_candidates, is_command_test_spec, is_path_test_spec, run_full_suite, run_task_tests, test_results_to_summary, write_final_repair_report
 
 
 MAX_TEST_FIX_ATTEMPTS = 3
@@ -204,14 +204,30 @@ def _collapse_repair_scope_paths(paths: list[str], *, limit: int = 20) -> list[s
     return collapsed[:limit]
 
 
-def _failed_test_specs_for_repair(results: list[Any]) -> list[str]:
+def _normalize_final_repair_test_spec(project_root: Path | str, spec: str) -> str:
+    project_dir = Path(project_root).expanduser().resolve()
+    normalized = str(spec or "").strip().lstrip("./")
+    if not normalized:
+        return ""
+    if normalized.startswith(("backend/", "frontend/", "mock-server/")) or is_command_test_spec(normalized):
+        return normalized
+    frontend_root = project_dir / "frontend"
+    if frontend_root.joinpath("package.json").exists() and normalized.startswith(("src/", "e2e/")):
+        return f"frontend/{normalized}"
+    backend_tests_root = project_dir / "backend" / "tests"
+    if backend_tests_root.exists() and normalized.startswith("tests/") and not project_dir.joinpath("tests").exists():
+        return f"backend/{normalized}"
+    return normalized
+
+
+def _failed_test_specs_for_repair(project_root: Path | str, results: list[Any]) -> list[str]:
     specs: list[str] = []
     seen: set[str] = set()
     for result in results:
         if getattr(result, "passed", False):
             continue
         for test_file in getattr(result, "test_files", []) or []:
-            normalized = str(test_file or "").strip()
+            normalized = _normalize_final_repair_test_spec(project_root, str(test_file or ""))
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
@@ -298,7 +314,7 @@ def _ensure_final_repair_task(
         [requirement_id for task in source_tasks for requirement_id in task.requirements]
         + [requirement_id for requirement_id, _ in missing_test_types]
     )
-    output_tests = _failed_test_specs_for_repair(results)
+    output_tests = _failed_test_specs_for_repair(project_root, results)
     if not output_tests:
         output_tests = _dedupe_task_ids([spec for task in source_tasks for spec in task.output_tests])[:10]
     supplemental_missing_types = [test_type for _, test_type in missing_test_types]
@@ -325,7 +341,7 @@ def _ensure_final_repair_task(
     title = FINAL_REPAIR_TASK_PREFIX
     if repair_candidates:
         title = f"{FINAL_REPAIR_TASK_PREFIX} ({', '.join(repair_candidates[:3])}{'...' if len(repair_candidates) > 3 else ''})"
-    failed_specs = _failed_test_specs_for_repair(results)
+    failed_specs = _failed_test_specs_for_repair(project_root, results)
     gate_summaries: list[str] = []
     for gate in non_verified_gates:
         gate_id = str(gate.get("id") or "").strip()
@@ -374,6 +390,14 @@ def _ensure_final_repair_task(
                 insert_at = index
                 break
         updated.insert(insert_at, replacement)
+    save_task_runtime_state(
+        project_root,
+        repair_task_id,
+        {
+            "force_task_prompt": True,
+            "force_task_prompt_reason": "final_verification_repair",
+        },
+    )
     return updated, repair_task_id, False
 
 
@@ -754,6 +778,7 @@ class DeliveryLoop:
             runtime_completed = str(runtime_state.get("status") or "").strip() == "completed"
             review_requested_repair = str(task.review_status or "").strip().casefold() == "changes_requested"
             recovery_prompt = str(runtime_state.get("recovery_prompt") or "").strip()
+            force_task_prompt = bool(runtime_state.get("force_task_prompt"))
             if recovery_prompt:
                 try:
                     self._execute_session_prompt(task.id, session, recovery_prompt)
@@ -771,7 +796,7 @@ class DeliveryLoop:
                         "recovery_resumed_at": utc_now_iso(),
                     },
                 )
-            elif review_requested_repair or (not runtime_completed and not task_scoped_changed_paths(self.project_root, task)):
+            elif force_task_prompt or review_requested_repair or (not runtime_completed and not task_scoped_changed_paths(self.project_root, task)):
                 prompt = build_task_prompt(self.project_root, task)
                 try:
                     self._execute_session_prompt(task.id, session, prompt)
@@ -779,6 +804,15 @@ class DeliveryLoop:
                     if exc.kind == "stalled_runtime":
                         return self._prepare_stalled_runtime_recovery(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
+                if force_task_prompt:
+                    save_task_runtime_state(
+                        self.project_root,
+                        task.id,
+                        {
+                            "force_task_prompt": False,
+                            "force_task_prompt_consumed_at": utc_now_iso(),
+                        },
+                    )
             elif runtime_completed:
                 clear_task_runtime_failure(self.project_root, task.id)
             last_block_reason = "failed after retry budget was exhausted"
@@ -861,6 +895,19 @@ class DeliveryLoop:
                 attempts=cycle_count,
             )
             save_tasks(self.project_root, tasks)
+            save_task_runtime_state(
+                self.project_root,
+                task.id,
+                {
+                    "escalation": {
+                        "status": "required",
+                        "kind": "test_fix_limit",
+                        "reason": last_block_reason,
+                        "escalated_at": utc_now_iso(),
+                        "exception_report": exception_report,
+                    }
+                },
+            )
             _release_session_after_exception(self.project_root, session)
             return False, "exception"
         except Exception as exc:
@@ -914,6 +961,21 @@ class DeliveryLoop:
             attempts=3,
         )
         save_tasks(self.project_root, tasks)
+        save_task_runtime_state(
+            self.project_root,
+            task_id,
+            {
+                "escalation": {
+                    "status": "required",
+                    "kind": "runtime_failure",
+                    "reason": blocked_reason,
+                    "escalated_at": utc_now_iso(),
+                    "session_id": resolved_session_id,
+                    "failure_kind": exc.kind,
+                    "exception_report": exception_report,
+                }
+            },
+        )
         _release_session_after_exception(self.project_root, session)
         return False, "exception"
 
@@ -1034,6 +1096,20 @@ class DeliveryLoop:
                 "semantic_report_artifact": semantic_report_artifact,
                 "final_repair_limit_reached": final_repair_limit_reached,
                 "final_verify_status": "pass" if final_pass else ("review_pending" if ready_for_final_review else ("environment_blocked" if environment_blocked and repair_required else ("repair_required" if repair_required else "blocked"))),
+                **(
+                    {
+                        "escalation": {
+                            "status": "required",
+                            "kind": "final_repair_limit",
+                            "reason": f"final verification reached maximum repair iterations ({MAX_FINAL_REPAIR_ITERATIONS})",
+                            "escalated_at": utc_now_iso(),
+                            "repair_task_id": repair_task_id,
+                            "repair_candidates": repair_candidates,
+                        }
+                    }
+                    if final_repair_limit_reached
+                    else {}
+                ),
             },
         )
         if any(task.id == FINAL_VERIFY_TASK_ID for task in tasks):

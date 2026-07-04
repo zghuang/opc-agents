@@ -111,6 +111,22 @@ def _normalize_review_matrix(
     return normalized
 
 
+def _expand_pass_all_except_matrix(
+    parsed: dict[str, Any],
+    *,
+    field_name: str,
+    allowed_ids: list[str],
+) -> Any:
+    mode = str(parsed.get(f"{field_name}_mode") or "").strip().casefold()
+    if mode != "pass_all_except":
+        return parsed.get(field_name)
+    defaults = parsed.get(f"{field_name}_defaults") if isinstance(parsed.get(f"{field_name}_defaults"), dict) else {}
+    default_notes = str(defaults.get("notes") or "Passed by reviewer default under pass_all_except mode.").strip()
+    exception_rows = _normalize_review_matrix(parsed.get(field_name, []), field_name=field_name, allowed_ids=allowed_ids)
+    by_id = {row["id"]: row for row in exception_rows}
+    return [by_id[item_id] if item_id in by_id else {"id": item_id, "status": "pass", "notes": default_notes} for item_id in allowed_ids]
+
+
 def _normalize_findings(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
@@ -263,15 +279,17 @@ def validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str,
     except ValueError as exc:
         findings = []
         errors.append(str(exc))
-    if not isinstance(parsed.get("requirement_assessment"), list):
+    requirement_assessment_source = _expand_pass_all_except_matrix(parsed, field_name="requirement_assessment", allowed_ids=task.requirements)
+    acceptance_assessment_source = _expand_pass_all_except_matrix(parsed, field_name="acceptance_assessment", allowed_ids=task.acceptance_scenarios)
+    if not isinstance(requirement_assessment_source, list):
         errors.append("requirement_assessment must be provided as an array")
-    if not isinstance(parsed.get("acceptance_assessment"), list):
+    if not isinstance(acceptance_assessment_source, list):
         errors.append("acceptance_assessment must be provided as an array")
     if task.intent and not isinstance(parsed.get("intent_assessment"), dict):
         errors.append("intent_assessment must be provided when task intent is present")
     try:
         requirement_assessment = _normalize_review_matrix(
-            parsed.get("requirement_assessment"),
+            requirement_assessment_source,
             field_name="requirement_assessment",
             allowed_ids=task.requirements,
         )
@@ -280,7 +298,7 @@ def validate_pass_review_matrix(task: Task, parsed: dict[str, Any]) -> dict[str,
         errors.append(str(exc))
     try:
         acceptance_assessment = _normalize_review_matrix(
-            parsed.get("acceptance_assessment"),
+            acceptance_assessment_source,
             field_name="acceptance_assessment",
             allowed_ids=task.acceptance_scenarios,
         )

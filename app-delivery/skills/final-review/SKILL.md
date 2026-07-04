@@ -10,19 +10,20 @@ Inputs:
 
 Procedure:
 1. Read `{project}/.app-delivery-runtime/review-requests/final-review.md`.
-2. Inspect the repository state, release evidence, and current final verification outputs.
-3. Produce raw JSON with fields:
+2. If `{project}/.app-delivery-runtime/host-handoff.json` exists for this review, a host executor can update it to `status="running"` with `started_at` before doing review work; the core will mark it `imported` after import.
+3. Inspect the repository state, release evidence, and current final verification outputs.
+4. Produce raw JSON with fields:
    - `status`: `pass` or `changes_requested`
    - `summary`: short release verdict
    - `findings`: array of finding objects
-4. Write that JSON to `{project}/.app-delivery-runtime/review-inputs/final-review.json`.
-5. Import it through the core:
+5. Write that JSON to `{project}/.app-delivery-runtime/review-inputs/final-review.json`.
+6. Import it through the core:
 
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery final-review --project {project} --input {project}/.app-delivery-runtime/review-inputs/final-review.json
 ```
 
-6. Re-run verification/status if needed:
+7. Re-run verification/status if needed:
 
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery verify --project {project}

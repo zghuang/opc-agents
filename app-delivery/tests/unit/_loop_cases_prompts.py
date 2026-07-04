@@ -306,6 +306,8 @@ def test_build_task_prompt_includes_requirement_and_acceptance_details(tmp_path:
     assert "Successful login." in prompt
     assert "Use declared output paths/tests as the main contract" in prompt
     assert "Green tests are not enough" in prompt
+    assert "Production fidelity: do not satisfy requirements" in prompt
+    assert "document a blocking gap instead of faking completion" in prompt
     assert "cd backend && uv run pytest" in prompt
     assert "frontend/package.json" not in prompt
 
@@ -659,8 +661,36 @@ def test_build_fix_prompt_reanchors_repairs_to_project_contract(tmp_path: Path) 
     assert "Declared output paths: backend/src/auth/, frontend/src/routes/login.tsx" in prompt
     assert "Declared output tests: backend/src/tests/test_auth/test_login.py, frontend/e2e/auth.spec.ts" in prompt
     assert "Do not search sibling projects or the framework repo" in prompt
+    assert "Production fidelity: do not satisfy requirements" in prompt
     assert "cd backend && uv run pytest" in prompt
     assert "frontend/package.json" in prompt
+
+def test_build_fix_prompt_tightens_real_backend_validation_gate_guidance(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    prompt = build_fix_prompt(
+        tmp_path,
+        Task(
+            "T900",
+            "Production Gate: Real backend E2E validation",
+            "active",
+            [],
+            [],
+            [],
+            ["frontend/e2e/real-backend.spec.ts"],
+            ["frontend/e2e/real-backend.spec.ts", "scripts/e2e-backend.sh", "scripts/seed-backend.sh", "docs/reviews/production-gate-real-backend-e2e.md"],
+            task_kind="validation",
+        ),
+        "- T900: FAIL (1 passed, 1 failed)\n  - frontend/e2e/real-backend.spec.ts: latest assertion failed",
+    )
+
+    assert "Real-backend E2E focus:" in prompt
+    assert "frontend/e2e/real-backend.spec.ts" in prompt
+    assert "scripts/e2e-backend.sh" in prompt
+    assert "scripts/seed-backend.sh" in prompt
+    assert "Run Playwright from the `frontend/` directory" in prompt
+    assert "Do not create alternate or throwaway specs" in prompt
+    assert "do not spend the turn on unrelated placeholder tests" in prompt
 
 def test_build_task_prompt_includes_browser_e2e_backend_env_prefix(tmp_path: Path) -> None:
     from delivery.task import Task
@@ -740,6 +770,133 @@ def test_build_stalled_recovery_prompt_includes_browser_e2e_backend_env_prefix(t
     assert "Browser/e2e validation" in prompt
     assert "E2E_BACKEND_CMD=" in prompt
     assert "uv run uvicorn otif.main:app --host 127.0.0.1 --port 8000" in prompt
+
+def test_build_stalled_recovery_prompt_tightens_real_backend_validation_gate_guidance(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    prompt = build_stalled_recovery_prompt(
+        tmp_path,
+        Task(
+            "T900",
+            "Production Gate: Real backend E2E validation",
+            "active",
+            [],
+            [],
+            [],
+            ["frontend/e2e/real-backend.spec.ts"],
+            ["frontend/e2e/real-backend.spec.ts", "scripts/e2e-backend.sh", "scripts/seed-backend.sh", "docs/reviews/production-gate-real-backend-e2e.md"],
+            task_kind="validation",
+        ),
+        runtime_state={"session_id": "ses-stall", "started_at": "2026-06-24T00:00:00Z", "last_tool_at": "2026-06-24T00:19:00Z", "last_mutation_at": None},
+        runtime_attention={"kind": "silent_stall", "message": "Runtime is still alive but has not produced any recent actionable tool progress.", "last_tool_name": "grep"},
+    )
+
+    assert "Real-backend E2E focus:" in prompt
+    assert "Reproduce the latest failing real-backend spec first" in prompt
+    assert "repair environment, migration, or seed steps first" in prompt
+
+def test_build_validation_prompt_compacts_production_gate_requirements_and_scans_current_code(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [
+                    {"id": f"REQ-{index:03d}", "title": f"Requirement {index}", "summary": "Detailed requirement summary that should not be expanded in production gate prompts."}
+                    for index in range(1, 13)
+                ],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    task = Task(
+        "T900",
+        "Production Gate: Real backend E2E validation",
+        "pending",
+        [f"REQ-{index:03d}" for index in range(1, 13)],
+        [],
+        [],
+        ["frontend/e2e/real-backend.spec.ts"],
+        ["frontend/e2e/real-backend.spec.ts", "scripts/e2e-backend.sh", "scripts/seed-backend.sh", "docs/reviews/production-gate-real-backend-e2e.md"],
+        task_kind="validation",
+    )
+
+    prompt = build_task_prompt(tmp_path, task)
+
+    assert "Requirement IDs in gate scope:" in prompt
+    assert "Requirement details:" not in prompt
+    assert "Detailed requirement summary" not in prompt
+    assert "Production gate source check:" in prompt
+    assert "docs/requirements-source.md" in prompt
+    assert "docs/architecture.md" in prompt
+    assert "Scan `frontend/src/` and `frontend/e2e/` for mocked, hardcoded, or fallback API data" in prompt
+    assert "Compare frontend API usage with backend routes and schemas" in prompt
+
+def test_build_validation_prompt_specializes_other_production_gates(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps({"requirements": [], "acceptance_scenarios": []}),
+        encoding="utf-8",
+    )
+    cases = [
+        (
+            Task(
+                "T901",
+                "Production Gate: Security and access control enforcement",
+                "pending",
+                ["REQ-072"],
+                [],
+                [],
+                ["backend/tests/security/"],
+                ["backend/", "backend/tests/security/", "docs/reviews/production-gate-security-access-control.md"],
+                task_kind="validation",
+            ),
+            ["Security/access-control gate focus:", "RBAC, ABAC, policy rules", "bypass declared security rules"],
+        ),
+        (
+            Task(
+                "T902",
+                "Production Gate: Real agent integration",
+                "pending",
+                ["REQ-067"],
+                [],
+                [],
+                ["backend/tests/integration/agents/test_real_agent_inputs.py"],
+                ["backend/", "mock-server/mcp_servers/", "backend/tests/integration/agents/test_real_agent_inputs.py", "docs/reviews/production-gate-agent-reality.md"],
+                task_kind="validation",
+            ),
+            ["Declared AI/automation integration gate focus:", "which AI, automation, model, tool, or external-service integration boundaries", "Flag static canned outputs"],
+        ),
+        (
+            Task(
+                "T903",
+                "Production Gate: Approval and execution loop",
+                "pending",
+                ["REQ-033"],
+                [],
+                [],
+                ["backend/tests/scenarios/test_execution_dispatch_to_external_system.py"],
+                ["backend/", "backend/tests/scenarios/test_execution_dispatch_to_external_system.py", "docs/reviews/production-gate-execution-loop.md"],
+                task_kind="validation",
+            ),
+            ["Declared process/execution gate focus:", "which approval, workflow, execution, dispatch, rollback, or manual-control behavior", "missing side-effect verification"],
+        ),
+    ]
+
+    for task, expected_phrases in cases:
+        prompt = build_task_prompt(tmp_path, task)
+
+        assert "Production gate source check:" in prompt
+        assert "If `docs/reviews/production-gate-*.md` is declared" in prompt
+        assert "Requirement details:" not in prompt
+        for phrase in expected_phrases:
+            assert phrase in prompt
 
 def test_build_task_prompt_filters_recent_failures_to_task_scope(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"

@@ -218,6 +218,53 @@ def test_execute_task_uses_persisted_recovery_prompt_before_validation(tmp_path:
     assert state == "review_pending"
     assert prompts == ["Recover this task from the stalled run."]
 
+def test_execute_task_uses_forced_task_prompt_even_with_scoped_changes(tmp_path: Path, monkeypatch) -> None:
+    from delivery.state import load_task_runtime_state
+    from delivery.task import Task
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T003", "title": "Validation", "status": "pending", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_validation.py"], "output_paths": ["backend/src/feature.py"]},
+            ],
+        },
+    )
+    save_task_runtime_state(tmp_path, "T003", {"force_task_prompt": True, "force_task_prompt_reason": "manual_fix"})
+    loop = DeliveryLoop(tmp_path)
+    prompts: list[str] = []
+
+    class DummySession:
+        id = "session-1"
+        runtime = "claude"
+        task_count = 0
+        created_at = "2026-06-24T00:00:00Z"
+        status = "active"
+        title = "Validation"
+        last_heartbeat = "2026-06-24T00:00:00Z"
+        current_task_id = "T003"
+
+    monkeypatch.setattr(loop, "_session_for_task", lambda task: DummySession())
+    monkeypatch.setattr("delivery.loop.execute_in_session", lambda project_root, session, prompt: prompts.append(prompt) or {"text": "ok"})
+    monkeypatch.setattr("delivery.loop.run_task_tests", lambda project_root, task, attempt=1: type("R", (), {"passed": True, "passed_count": 1, "failed_count": 0, "failures": [], "test_files": task.get("output_tests", []), "test_types": ["unit"], "requirement_ids": task.get("requirements", []), "task_id": task.get("id", "")})())
+    monkeypatch.setattr("delivery.loop.task_scoped_changed_paths", lambda project_root, task: ["backend/src/feature.py"])
+    monkeypatch.setattr("delivery.loop.git_stage_task_snapshot", lambda project_root, task, extra_paths=None, preserved_paths=None: [])
+    monkeypatch.setattr("delivery.loop.git_head_sha", lambda project_root: "base123")
+
+    success, state = loop._execute_task(Task("T003", "Validation", "pending", ["REQ-002"], [], [], ["backend/tests/test_validation.py"], ["backend/src/feature.py"]))
+
+    assert success is False
+    assert state == "review_pending"
+    assert len(prompts) == 1
+    assert "## Task T003: Validation" in prompts[0]
+    runtime_state = load_task_runtime_state(tmp_path, "T003")
+    assert runtime_state["force_task_prompt"] is False
+    assert runtime_state["force_task_prompt_consumed_at"]
+
 def test_execute_task_relaunches_after_review_changes_requested_even_with_scoped_changes(tmp_path: Path, monkeypatch) -> None:
     from delivery.task import Task
 
@@ -736,6 +783,529 @@ def test_import_task_review_pass_rejects_mock_only_browser_e2e(tmp_path: Path) -
     assert item["status"] == "pending"
     assert item["review_status"] == "changes_requested"
     assert "mocked browser proof is not real backend E2E evidence" in item["blocked_reason"]
+
+def test_production_semantic_scan_detects_static_backend_package_routes(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/reports')\n\n"
+        "@router.get('/weekly-summary')\n"
+        "async def weekly_summary():\n"
+        "    return {'overallOtif': 94.2, 'totalOrders': 12500}\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert any(
+        finding.category == "production-stub"
+        and finding.path == "backend/otif/api/routes/reporting.py"
+        and "static literal" in finding.message
+        for finding in findings
+    )
+
+def test_production_semantic_scan_detects_static_routes_outside_api_root(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    route_path = tmp_path / "backend" / "app" / "agents" / "routes.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/agents')\n\n"
+        "@router.get('/invocations')\n"
+        "async def list_invocations():\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert any(
+        finding.category == "production-stub"
+        and finding.path == "backend/app/agents/routes.py"
+        and "static literal" in finding.message
+        for finding in findings
+    )
+
+def test_production_semantic_scan_reports_all_static_routes_in_file(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    route_path = tmp_path / "backend" / "app" / "agents" / "routes.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/agents')\n\n"
+        "@router.get('/invocations')\n"
+        "async def list_invocations():\n"
+        "    return []\n\n"
+        "@router.get('/invocations/{run_id}/outputs')\n"
+        "async def get_invocation_outputs(run_id: str):\n"
+        "    return {'run_id': run_id, 'outputs': []}\n",
+        encoding="utf-8",
+    )
+
+    findings = [finding for finding in scan_production_semantics(tmp_path) if finding.path == "backend/app/agents/routes.py"]
+    messages = "\n".join(finding.message for finding in findings)
+
+    assert "Production route `list_invocations`" in messages
+    assert "Production route `get_invocation_outputs`" in messages
+
+def test_production_semantic_scan_accepts_store_backed_route_ack(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    route_path = tmp_path / "backend" / "app" / "agents" / "routes.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/agents')\n\n"
+        "@router.post('/invocations/{run_id}/feedback')\n"
+        "async def record_invocation_feedback(run_id: str):\n"
+        "    result = store.add_feedback(run_id=run_id, action='adopted')\n"
+        "    if result is None:\n"
+        "        raise RuntimeError('not found')\n"
+        "    return {'feedback_id': result.feedback_id, 'status': 'recorded'}\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert not any(
+        finding.category == "production-stub"
+        and finding.path == "backend/app/agents/routes.py"
+        and "record_invocation_feedback" in finding.message
+        for finding in findings
+    )
+
+def test_production_semantic_scan_detects_synthetic_data_helpers(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    provider_path = tmp_path / "backend" / "app" / "integrations" / "mes.py"
+    provider_path.parent.mkdir(parents=True, exist_ok=True)
+    provider_path.write_text(
+        "def _create_default_data():\n"
+        "    return {'line_id': 'L001', 'work_order_id': 'WO-2024-001'}\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert any(
+        finding.category == "production-fake-data"
+        and finding.path == "backend/app/integrations/mes.py"
+        and "_create_default_data" in finding.message
+        for finding in findings
+    )
+
+def test_production_semantic_scan_ignores_backend_test_api_mocks(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter, Depends\n\n"
+        "router = APIRouter(prefix='/reports')\n\n"
+        "def require_user():\n"
+        "    return {'id': 'u1'}\n\n"
+        "@router.get('/kpi')\n"
+        "async def get_kpi(user = Depends(require_user)):\n"
+        "    return await report_service.fetch_kpi(user)\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_path / "backend" / "tests" / "api" / "test_admin_api.py"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text(
+        "from unittest.mock import AsyncMock, MagicMock, patch\n\n"
+        "class FakeProducer:\n"
+        "    async def publish(self, *args, **kwargs):\n"
+        "        return None\n\n"
+        "def test_api_uses_mock_service():\n"
+        "    service = MagicMock()\n"
+        "    service.create = AsyncMock(return_value={'ok': True})\n"
+        "    assert service.create is not None\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert not any(finding.path.startswith("backend/tests/") for finding in findings)
+
+
+def test_production_semantic_scan_accepts_app_level_router_auth_dependency(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "orders.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/orders')\n\n"
+        "@router.get('/{order_id}')\n"
+        "async def get_order(order_id: str):\n"
+        "    return await order_service.fetch_order(order_id)\n",
+        encoding="utf-8",
+    )
+    main_path = tmp_path / "backend" / "otif" / "main.py"
+    main_path.parent.mkdir(parents=True, exist_ok=True)
+    main_path.write_text(
+        "from fastapi import Depends, FastAPI\n"
+        "from otif.api.routes import orders\n\n"
+        "def get_current_user():\n"
+        "    return {'id': 'u1'}\n\n"
+        "app = FastAPI()\n"
+        "app.include_router(orders.router, dependencies=[Depends(get_current_user)])\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert not any(finding.category == "security-access-control" and finding.path == "backend/otif/api/routes/orders.py" for finding in findings)
+
+
+def test_production_semantic_scan_accepts_fastapi_global_auth_dependency(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "orders.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/orders')\n\n"
+        "@router.get('/{order_id}')\n"
+        "async def get_order(order_id: str):\n"
+        "    return await order_service.fetch_order(order_id)\n",
+        encoding="utf-8",
+    )
+    main_path = tmp_path / "backend" / "otif" / "main.py"
+    main_path.parent.mkdir(parents=True, exist_ok=True)
+    main_path.write_text(
+        "from fastapi import Depends, FastAPI\n\n"
+        "def get_current_user():\n"
+        "    return {'id': 'u1'}\n\n"
+        "app = FastAPI(dependencies=[Depends(get_current_user)])\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert not any(finding.category == "security-access-control" for finding in findings)
+
+
+def test_production_semantic_scan_applies_exact_path_waiver(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics, write_semantic_scan_report
+
+    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/reports')\n\n"
+        "@router.get('/trend')\n"
+        "async def get_trend():\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    waiver_path = tmp_path / "docs" / "reviews" / "semantic-waivers.json"
+    waiver_path.parent.mkdir(parents=True, exist_ok=True)
+    waiver_path.write_text(
+        json.dumps(
+            {
+                "waivers": [
+                    {
+                        "category": "production-stub",
+                        "path": "backend/otif/api/routes/reporting.py",
+                        "reason": "Known false positive accepted by human escalation.",
+                        "expires_at": "2999-01-01",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+    report = write_semantic_scan_report(tmp_path, findings)
+
+    assert not any(finding.category == "production-stub" and finding.path == "backend/otif/api/routes/reporting.py" for finding in findings)
+    assert any(finding.category == "security-access-control" and finding.path == "backend/otif/api/routes/reporting.py" for finding in findings)
+    assert "## Active Waivers" in (tmp_path / report).read_text(encoding="utf-8")
+
+
+def test_import_task_review_pass_rejects_changed_production_stub_route(tmp_path: Path) -> None:
+    from delivery.loop_review import import_task_review
+
+    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/reports')\n\n"
+        "@router.get('/weekly-summary')\n"
+        "async def weekly_summary():\n"
+        "    return {'overallOtif': 94.2, 'totalOrders': 12500}\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Reporting API",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_reporting.py"],
+                    "output_paths": ["backend/otif/api/routes/reporting.py"],
+                }
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "pending_scope_report": {
+                "changed_paths": ["backend/otif/api/routes/reporting.py"],
+                "staged_paths": ["backend/otif/api/routes/reporting.py"],
+                "out_of_scope": [],
+            }
+        },
+    )
+
+    result = import_task_review(
+        tmp_path,
+        "T002",
+        {
+            "status": "pass",
+            "summary": "Looks good.",
+            "findings": [],
+            "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+            "acceptance_assessment": [],
+        },
+        tmp_path / "review-input.json",
+    )
+
+    assert result == 2
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    item = payload["items"][0]
+    assert item["status"] == "pending"
+    assert item["review_status"] == "changes_requested"
+    assert "production semantic finding" in item["blocked_reason"]
+    assert "production-stub" in item["blocked_reason"]
+
+def test_import_task_review_pass_lists_all_changed_static_routes(tmp_path: Path) -> None:
+    from delivery.loop_review import import_task_review
+
+    route_path = tmp_path / "backend" / "app" / "agents" / "routes.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/agents')\n\n"
+        "@router.get('/invocations')\n"
+        "async def list_invocations():\n"
+        "    return []\n\n"
+        "@router.get('/invocations/{run_id}/outputs')\n"
+        "async def get_invocation_outputs(run_id: str):\n"
+        "    return {'run_id': run_id, 'outputs': []}\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Agent routes",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_agents/test_routes.py"],
+                    "output_paths": ["backend/app/agents/routes.py"],
+                }
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "pending_scope_report": {
+                "changed_paths": ["backend/app/agents/routes.py"],
+                "staged_paths": ["backend/app/agents/routes.py"],
+                "out_of_scope": [],
+            }
+        },
+    )
+
+    result = import_task_review(
+        tmp_path,
+        "T002",
+        {
+            "status": "pass",
+            "summary": "Looks good.",
+            "findings": [],
+            "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+            "acceptance_assessment": [],
+        },
+        tmp_path / "review-input.json",
+    )
+
+    assert result == 2
+    artifact_text = (tmp_path / "docs" / "reviews" / "code-review-T002.md").read_text(encoding="utf-8")
+    assert "machine_precondition_error_count: 2" in artifact_text
+    assert "Production route `list_invocations`" in artifact_text
+    assert "Production route `get_invocation_outputs`" in artifact_text
+
+def test_import_production_gate_review_pass_rejects_project_production_stubs(tmp_path: Path) -> None:
+    from delivery.loop_review import import_task_review
+
+    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/reports')\n\n"
+        "@router.get('/weekly-summary')\n"
+        "async def weekly_summary():\n"
+        "    return {'overallOtif': 94.2, 'totalOrders': 12500}\n",
+        encoding="utf-8",
+    )
+    gate_report = tmp_path / "docs" / "reviews" / "production-gate-real-backend-e2e.md"
+    gate_report.parent.mkdir(parents=True, exist_ok=True)
+    gate_report.write_text("status: pass\n\n# Production Gate\n", encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T900",
+                    "title": "Production Gate: Real backend E2E validation",
+                    "status": "review_pending",
+                    "task_kind": "validation",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["frontend/e2e/real-backend.spec.ts"],
+                    "output_paths": ["frontend/e2e/real-backend.spec.ts", "docs/reviews/production-gate-real-backend-e2e.md"],
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "generated_at": "2026-06-24T01:01:00Z",
+            "results": [
+                {
+                    "task_id": "T900",
+                    "timestamp": "2026-06-24T01:01:00Z",
+                    "test_files": ["frontend/e2e/real-backend.spec.ts"],
+                    "test_types": ["browser", "e2e"],
+                    "requirement_ids": ["REQ-001"],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {},
+        },
+    )
+
+    result = import_task_review(
+        tmp_path,
+        "T900",
+        {
+            "status": "pass",
+            "summary": "Looks good.",
+            "findings": [],
+            "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+            "acceptance_assessment": [],
+        },
+        tmp_path / "review-input.json",
+    )
+
+    assert result == 2
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    item = payload["items"][0]
+    assert item["status"] == "pending"
+    assert item["review_status"] == "changes_requested"
+    assert "production gate semantic finding" in item["blocked_reason"]
+    assert "production-stub" in item["blocked_reason"]
+
+def test_import_task_review_pass_rejects_root_frontend_shims(tmp_path: Path) -> None:
+    from delivery.loop_review import import_task_review
+
+    (tmp_path / "frontend").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "frontend" / "package.json").write_text('{"scripts":{"test":"vitest run"}}', encoding="utf-8")
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "App.test.tsx").write_text("test('shim', () => {})\n", encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Repair frontend tests",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["src/App.test.tsx"],
+                    "output_paths": ["frontend/src/App.tsx"],
+                }
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "pending_scope_report": {
+                "changed_paths": ["src/App.test.tsx", "package.json", "vitest.config.ts"],
+                "staged_paths": ["src/App.test.tsx", "package.json", "vitest.config.ts"],
+                "out_of_scope": [],
+            }
+        },
+    )
+
+    result = import_task_review(
+        tmp_path,
+        "T002",
+        {
+            "status": "pass",
+            "summary": "Looks good.",
+            "findings": [],
+            "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+            "acceptance_assessment": [],
+        },
+        tmp_path / "review-input.json",
+    )
+
+    assert result == 2
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    item = payload["items"][0]
+    assert item["status"] == "pending"
+    assert item["review_status"] == "changes_requested"
+    assert "unsupported top-level frontend paths" in item["blocked_reason"]
 
 def test_import_task_review_pass_accepts_route_fetch_passthrough_e2e(tmp_path: Path, monkeypatch) -> None:
     from delivery.loop_review import import_task_review

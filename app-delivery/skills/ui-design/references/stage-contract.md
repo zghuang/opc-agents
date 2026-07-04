@@ -14,6 +14,8 @@ Constraints:
 - `design_system_md` must stay consistent with the chosen pack's style contract and notes.
 - Choose a coherent UI direction that fits the product domain.
 - Page archetypes should map to major user workflows.
+- `page_archetypes_md` must include a `## Route Mapping` table with one row per user-facing page, route, or major workflow from the requirements. Required columns: `Page / Route`, `Source Requirements`, `Primary Roles`, `Required Regions / Components`, `States`, `Suggested Output Paths`, and `Suggested Browser Tests`.
+- Route Mapping rows must preserve source requirement IDs and expected frontend implementation/test paths so `task-decompose` can convert them into work items.
 - States should cover loading, empty, error, permission, and destructive confirmation states.
 
 Requirements JSON:

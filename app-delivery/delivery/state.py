@@ -727,10 +727,29 @@ def load_all_task_runtime_states(project_root: Path | str) -> dict[str, dict[str
     return payloads
 
 
+def _active_work_item_statuses(project_root: Path | str) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    active_records = sorted(load_active_task_records(project_root), key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+    for record in active_records:
+        raw_task_id = str(record.get("task_id") or "").strip()
+        if not raw_task_id:
+            continue
+        task_id, _, subtask = raw_task_id.partition(":")
+        if not task_id or task_id in statuses:
+            continue
+        phase = str(record.get("phase") or "active").strip() or "active"
+        if subtask:
+            statuses[task_id] = f"active ({phase}: {subtask})"
+        else:
+            statuses[task_id] = f"active ({phase})"
+    return statuses
+
+
 def render_work_items_markdown(project_root: Path | str, payload: dict[str, Any] | None = None) -> None:
     paths = ensure_runtime_dirs(project_root)
     data = payload if payload is not None else load_work_items(project_root)
     items = data.get("items") if isinstance(data.get("items"), list) else []
+    active_statuses = _active_work_item_statuses(paths.project_root)
     lines = [
         f"# Work Items - {data.get('project', paths.project_root.name)}",
         "",
@@ -748,7 +767,11 @@ def render_work_items_markdown(project_root: Path | str, payload: dict[str, Any]
         dependencies = ", ".join(str(value) for value in item.get("dependencies", [])) or "-"
         commit = str(item.get("git_commit") or "-")
         session_id = _compact_session_ids(item.get("session_ids", []), str(item.get("status_session_id") or "").strip() or None)
+        item_status = str(item.get("status") or "-")
+        active_status = active_statuses.get(str(item.get("id") or "").strip())
+        status = active_status if item_status == "active" or (active_status and ":" in active_status) else None
+        status = status or item_status
         lines.append(
-            f"| {item.get('id', '-') } | {str(item.get('title', '-')).replace('|', '/')} | {item.get('status', '-')} | {dependencies} | {session_id} | {requirements} | {commit} |"
+            f"| {item.get('id', '-') } | {str(item.get('title', '-')).replace('|', '/')} | {status.replace('|', '/')} | {dependencies} | {session_id} | {requirements} | {commit} |"
         )
     paths.work_items_view.write_text("\n".join(lines) + "\n", encoding="utf-8")

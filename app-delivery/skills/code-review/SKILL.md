@@ -11,16 +11,17 @@ Inputs:
 
 Procedure:
 1. Read `{project}/.app-delivery-runtime/review-requests/code-review-{task_id}.md`.
-2. Inspect the current repository state and the task-scoped diff.
-3. Produce raw JSON that follows the review request and [references/review-contract.md](./references/review-contract.md).
-4. Write that JSON to `{project}/.app-delivery-runtime/review-inputs/code-review-{task_id}.json`.
-5. Import it through the core:
+2. If `{project}/.app-delivery-runtime/host-handoff.json` exists for this task, a host executor can update it to `status="running"` with `started_at` before doing review work; the core will mark it `imported` after import.
+3. Inspect the current repository state and the task-scoped diff.
+4. Produce raw JSON that follows the review request and [references/review-contract.md](./references/review-contract.md).
+5. Write that JSON to `{project}/.app-delivery-runtime/review-inputs/code-review-{task_id}.json`.
+6. Import it through the core:
 
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery code-review --project {project} --task-id {task_id} --input {project}/.app-delivery-runtime/review-inputs/code-review-{task_id}.json
 ```
 
-6. Re-run status:
+7. Re-run status:
 
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery status --project {project}

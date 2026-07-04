@@ -51,6 +51,7 @@ CODE_LINE_EXTENSIONS = {
     ".vue",
 }
 CODE_LINE_FILENAMES = {"Dockerfile", "Makefile"}
+CODE_LINE_TEST_PARTS = {"__tests__", "e2e", "spec", "specs", "test", "tests"}
 CODE_LINE_EXCLUDED_PARTS = {
     ".app-delivery-runtime",
     ".cache",
@@ -597,17 +598,35 @@ def _count_nonblank_lines(path: Path) -> int:
         return 0
 
 
+def _is_test_code_path(relative_path: Path) -> bool:
+    parts = {part.casefold() for part in relative_path.parts[:-1]}
+    if parts.intersection(CODE_LINE_TEST_PARTS):
+        return True
+    stem = relative_path.stem.casefold()
+    name = relative_path.name.casefold()
+    return (
+        stem.startswith("test_")
+        or stem.endswith("_test")
+        or ".test." in name
+        or ".spec." in name
+    )
+
+
 def _project_code_line_summary(project_root: Path) -> dict[str, Any]:
     totals = {
         "total": 0,
+        "application": 0,
+        "test": 0,
         "backend": 0,
         "frontend": 0,
         "other": 0,
         "files": 0,
+        "application_files": 0,
+        "test_files": 0,
         "backend_files": 0,
         "frontend_files": 0,
         "other_files": 0,
-        "basis": "nonblank lines in code files, excluding dependencies, build outputs, runtime state, and docs",
+        "basis": "nonblank lines in code files, excluding dependencies, build outputs, runtime state, and docs; total includes application and test code",
     }
     for current_root, dirnames, filenames in os.walk(project_root):
         dirnames[:] = [name for name in dirnames if name not in CODE_LINE_EXCLUDED_PARTS]
@@ -634,6 +653,12 @@ def _project_code_line_summary(project_root: Path) -> dict[str, Any]:
             totals[bucket] += line_count
             totals["files"] += 1
             totals[f"{bucket}_files"] += 1
+            if _is_test_code_path(relative):
+                totals["test"] += line_count
+                totals["test_files"] += 1
+            else:
+                totals["application"] += line_count
+                totals["application_files"] += 1
     return totals
 
 
@@ -646,6 +671,11 @@ def _backfill_missing_status_session_ids(project_root: Path, tasks: list[Any]) -
             continue
         runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
         session_id = str(runtime_state.get("session_id") or "").strip()
+        if not session_id:
+            for record in reversed(execution_token_records_for_task(project_root, task.id)):
+                session_id = str(record.get("session_id") or "").strip()
+                if session_id:
+                    break
         if not session_id:
             updated.append(task)
             continue
@@ -799,6 +829,8 @@ def _display_tasks(project_root: Path, tasks: list[Any]) -> list[Any]:
 
 def _active_task_payload(project_root: Path, tasks: list[Any]) -> dict[str, Any] | None:
     active_records = sorted(load_active_task_records(project_root), key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+    active_task_ids = {task.id for task in tasks if task.status == "active"}
+    active_records = [record for record in active_records if str(record.get("task_id") or "").strip() in active_task_ids]
     if active_records:
         record = active_records[0]
         task_id = str(record.get("task_id") or "").strip()
@@ -856,6 +888,16 @@ def _active_task_payload(project_root: Path, tasks: list[Any]) -> dict[str, Any]
     return payload
 
 
+def _orphan_active_task_records(project_root: Path, tasks: list[Any]) -> list[dict[str, Any]]:
+    active_task_ids = {task.id for task in tasks if task.status == "active"}
+    orphans: list[dict[str, Any]] = []
+    for record in sorted(load_active_task_records(project_root), key=lambda row: str(row.get("updated_at") or ""), reverse=True):
+        task_id = str(record.get("task_id") or "").strip()
+        if task_id and task_id not in active_task_ids:
+            orphans.append(record)
+    return orphans
+
+
 def render_project_summary(project_root: Path | str, payload: dict[str, Any]) -> Path:
     project_dir = resolve_project_root(project_root)
     summary_json_path = project_dir / "docs" / "project-summary.json"
@@ -875,11 +917,14 @@ def render_project_summary(project_root: Path | str, payload: dict[str, Any]) ->
         "",
         f"- Generated at: {payload.get('generated_at', 'unknown')}",
         f"- Effective Code Lines: {code_lines.get('total', 0)}",
+        f"- Application Code Lines: {code_lines.get('application', 0)}",
+        f"- Test Code Lines: {code_lines.get('test', 0)}",
+        "- Code Line Formula: Effective Code Lines = Application Code Lines + Test Code Lines",
         f"- Backend Code Lines: {code_lines.get('backend', 0)}",
         f"- Frontend Code Lines: {code_lines.get('frontend', 0)}",
         f"- Other Code Lines: {code_lines.get('other', 0)}",
         f"- Code Files Counted: {code_lines.get('files', 0)}",
-        f"- Duration: {duration.get('duration_formatted', 'unavailable')}",
+        f"- Elapsed Duration: {duration.get('duration_formatted', 'unavailable')}",
         f"- Planning lead time: {planning.get('planning_lead_formatted', 'unavailable')}",
         f"- Billable tokens: {tokens.get('execution_total_tokens', 'unavailable')}",
         f"- Observed tokens incl. cache reads: {((tokens.get('execution_total_tokens') or 0) + (tokens.get('execution_cache_read_tokens') or 0)) if tokens.get('status') == 'available' else 'unavailable'}",
@@ -913,11 +958,19 @@ def render_project_summary(project_root: Path | str, payload: dict[str, Any]) ->
         "",
         f"- Verified tasks: {verified_metrics.get('verified_tasks', 0)}",
         f"- Tasks with recorded token metrics: {verified_metrics.get('tasks_with_total_tokens', 0)}",
-        f"- Summed verified task durations: {verified_metrics.get('task_duration_minutes_sum', 'unavailable')}",
+        f"- Summed verified task elapsed durations: {verified_metrics.get('task_duration_minutes_sum', 'unavailable')}",
         f"- Verified task execution tokens: {verified_metrics.get('task_total_tokens_sum', 'unavailable')}",
         "",
     ])
-    lines.extend(["", "## Task Metrics", "", "| Task | Duration | Tokens | Session |", "| --- | --- | --- | --- |"])
+    lines.extend([
+        "",
+        "## Task Metrics",
+        "",
+        "Task elapsed duration is measured from the first recorded implementation start to the final verified/completed timestamp. It intentionally includes repair turns, review loops, stalls, and reruns; it is not a single runtime session duration.",
+        "",
+        "| Task | Elapsed Duration | Tokens | Session |",
+        "| --- | --- | --- | --- |",
+    ])
     for row in payload.get("task_metrics", []) if isinstance(payload.get("task_metrics"), list) else []:
         if not isinstance(row, dict):
             continue
@@ -1064,6 +1117,7 @@ def status(project_root: Path | str) -> dict[str, Any]:
         "review_pending_task": review_payload,
         "active_task": active_payload,
         "runtime_attention": runtime_attention,
+        "orphan_active_tasks": _orphan_active_task_records(project_dir, display_tasks),
         "stale_active_tasks": load_stale_active_task_records(project_dir),
         "paused": (project_dir / PAUSE_FILE).exists(),
         "final_verify_ready": all_actionable_verified and final_task is not None and final_task.status == "pending",

@@ -24,6 +24,7 @@ def normalize_complexity_override(payload: Any) -> dict[str, Any]:
     if tier not in {"S", "M", "L", "XL"}:
         raise ValueError("delivery_complexity.tier must be one of S/M/L/XL")
     signals = payload.get("signals") if isinstance(payload.get("signals"), dict) else {}
+    _validate_complexity_signal_consistency(tier, signals)
     normalized = {
         "tier": tier,
         "score": int(payload.get("score") or 0),
@@ -34,6 +35,43 @@ def normalize_complexity_override(payload: Any) -> dict[str, Any]:
         normalized["rationale"] = rationale
     normalized["source"] = "task-decompose"
     return normalized
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _validate_complexity_signal_consistency(tier: str, signals: dict[str, Any]) -> None:
+    estimated_loc = _safe_int(signals.get("estimated_loc"))
+    estimated_modules = _safe_int(signals.get("estimated_modules"))
+    estimated_tasks = _safe_int(signals.get("estimated_tasks"))
+    minimum_tier = "S"
+    reasons: list[str] = []
+    if estimated_loc >= 80000 or estimated_modules >= 10 or estimated_tasks >= 15:
+        minimum_tier = "L"
+        if estimated_loc >= 80000:
+            reasons.append(f"estimated_loc={estimated_loc} >= 80000")
+        if estimated_modules >= 10:
+            reasons.append(f"estimated_modules={estimated_modules} >= 10")
+        if estimated_tasks >= 15:
+            reasons.append(f"estimated_tasks={estimated_tasks} >= 15")
+    elif estimated_loc >= 20000 or estimated_modules >= 5 or estimated_tasks >= 9:
+        minimum_tier = "M"
+        if estimated_loc >= 20000:
+            reasons.append(f"estimated_loc={estimated_loc} >= 20000")
+        if estimated_modules >= 5:
+            reasons.append(f"estimated_modules={estimated_modules} >= 5")
+        if estimated_tasks >= 9:
+            reasons.append(f"estimated_tasks={estimated_tasks} >= 9")
+    rank = {"S": 0, "M": 1, "L": 2, "XL": 3}
+    if rank[tier] < rank[minimum_tier]:
+        raise ValueError(
+            f"delivery_complexity.tier={tier} is inconsistent with signals; minimum expected tier is {minimum_tier} "
+            f"because {', '.join(reasons)}"
+        )
 
 
 def normalize_stage_gates(payload: Any) -> list[dict[str, Any]]:

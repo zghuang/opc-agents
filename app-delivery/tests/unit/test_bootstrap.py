@@ -43,7 +43,10 @@ def test_initialize_project_creates_scaffold_and_metadata(tmp_path: Path) -> Non
     bootstrap_meta = json.loads((project_root / "docs" / "project-bootstrap.json").read_text(encoding="utf-8"))
     assert bootstrap_meta["runtime"] == "claude"
     assert bootstrap_meta["mock_server"] == "embedded"
-    assert bootstrap_meta["watchdog_enabled"] is False
+    assert bootstrap_meta["watchdog_enabled"] is True
+    assert bootstrap_meta["host_fallback_enabled"] is True
+    assert bootstrap_meta["host_fallback_after_seconds"] == 600
+    assert bootstrap_meta["host_fallback_max_attempts"] == 1
 
 
 def test_python_react_template_does_not_precreate_backend_package_layout() -> None:
@@ -83,7 +86,8 @@ def test_initialize_project_uses_opencode_scaffold_when_requested(tmp_path: Path
     assert (project_root / ".opencode" / "opencode.json").exists()
     assert not (project_root / ".claude").exists()
     bootstrap_meta = json.loads((project_root / "docs" / "project-bootstrap.json").read_text(encoding="utf-8"))
-    assert bootstrap_meta["watchdog_enabled"] is False
+    assert bootstrap_meta["watchdog_enabled"] is True
+    assert bootstrap_meta["host_fallback_enabled"] is True
 
 
 def test_initialize_project_can_enable_watchdog_explicitly(tmp_path: Path) -> None:

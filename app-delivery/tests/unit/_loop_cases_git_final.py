@@ -887,6 +887,9 @@ def test_final_verify_creates_dedicated_repair_task_without_reopening_verified_t
     assert "backend/tests/" in by_id[repair_task_id].output_tests
     runtime_state = load_task_runtime_state(tmp_path, "T-FINAL")
     assert runtime_state["repair_task_id"] == repair_task_id
+    repair_runtime_state = load_task_runtime_state(tmp_path, repair_task_id)
+    assert repair_runtime_state["force_task_prompt"] is True
+    assert repair_runtime_state["force_task_prompt_reason"] == "final_verification_repair"
 
 def test_final_verify_includes_blocked_gate_missing_type_specs_in_repair_task(tmp_path: Path, monkeypatch) -> None:
     from delivery.state import save_gates
@@ -1068,6 +1071,62 @@ def test_final_verify_prioritizes_missing_type_specs_when_failed_test_list_is_al
     assert "npm run typecheck" in by_id[repair_task_id].output_tests
     assert "npm run build" in by_id[repair_task_id].output_tests
     assert "backend/tests/" in by_id[repair_task_id].output_tests
+
+def test_final_verify_normalizes_package_relative_failed_specs_for_repair_task(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import all_tasks
+    from delivery.verify import TestResult
+
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "requirements.json").write_text(
+        json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}),
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/src/App.test.tsx"], "output_paths": ["frontend/src/App.tsx"], "review_status": "pass", "git_commit": "abc123"},
+                {"id": "T-FINAL", "title": "最终验证", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": [], "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"]},
+            ],
+        },
+    )
+    (tmp_path / "frontend").mkdir(exist_ok=True)
+    (tmp_path / "frontend" / "package.json").write_text(json.dumps({"scripts": {"test": "vitest run", "e2e": "playwright test"}}), encoding="utf-8")
+    (tmp_path / "backend" / "tests").mkdir(parents=True, exist_ok=True)
+    loop = DeliveryLoop(tmp_path)
+    monkeypatch.setattr(
+        "delivery.loop.run_full_suite",
+        lambda project_root, mode="all": [
+            TestResult(
+                task_id="T002",
+                timestamp="2026-06-24T00:00:00Z",
+                test_files=["src/App.test.tsx", "e2e/smoke.spec.ts", "tests/test_health.py"],
+                test_types=["unit", "browser", "e2e"],
+                requirement_ids=["REQ-001"],
+                passed=False,
+                passed_count=0,
+                failed_count=3,
+                failures=[],
+                attempt=1,
+            )
+        ],
+    )
+    monkeypatch.setattr("delivery.loop.check_test_type_coverage", lambda project_root: [])
+
+    result = loop.final_verify()
+
+    tasks = all_tasks(tmp_path)
+    repair_task = next(task for task in tasks if task.id == result["repair_task_id"])
+    assert "frontend/src/App.test.tsx" in repair_task.output_tests
+    assert "frontend/e2e/smoke.spec.ts" in repair_task.output_tests
+    assert "backend/tests/test_health.py" in repair_task.output_tests
+    assert "src/App.test.tsx" not in repair_task.output_tests
+    assert "e2e/smoke.spec.ts" not in repair_task.output_tests
+    assert "tests/test_health.py" not in repair_task.output_tests
 
 def test_final_verify_reuses_exception_repair_task_without_creating_another(tmp_path: Path, monkeypatch) -> None:
     from delivery.task import all_tasks

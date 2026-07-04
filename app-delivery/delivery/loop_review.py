@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ from .review_payload import (
     _validate_pass_review_matrix,
 )
 from .review_prompts import build_code_review_request, build_final_review_request, build_validation_code_review_request
-from .production_semantics import mock_only_browser_e2e_issues
+from .production_semantics import mock_only_browser_e2e_issues, scan_production_semantics
 from .session import current_session, retire_session, save_current_session
 from .state import ensure_runtime_dirs, load_task_runtime_state, load_test_results, normalize_task_runtime_state, project_paths, save_task_runtime_state, utc_now_iso
 from .task import Task, all_tasks, mark_task, next_generated_task_id, save_tasks
@@ -95,6 +96,17 @@ def _prefinal_audit_artifact_issues(project_root: Path | str) -> list[str]:
     missing_sections = [section for section in PREFINAL_AUDIT_REQUIRED_SECTIONS if section not in report_text]
     if missing_sections:
         return ["required audit report is missing sections: " + ", ".join(missing_sections)]
+    lowered = report_text.casefold()
+    release_blocking_markers = (
+        "overall: defer",
+        "t-final should not proceed",
+        "fails pre-final validation",
+        "release-blocking",
+    )
+    if any(marker in lowered for marker in release_blocking_markers):
+        return [
+            "system audit report declares release-blocking gaps or says T-FINAL should not proceed; review pass is not allowed until blockers are fixed or the report is updated with source-backed evidence"
+        ]
     return []
 
 
@@ -112,7 +124,103 @@ def _frontend_api_audit_artifact_issues(project_root: Path | str) -> list[str]:
     missing_sections = [section for section in FRONTEND_API_AUDIT_REQUIRED_SECTIONS if section not in report_text]
     if missing_sections:
         return ["required frontend/API audit report is missing sections: " + ", ".join(missing_sections)]
+    lowered = report_text.casefold()
+    mentions_production_stubs = any(
+        marker in lowered
+        for marker in (
+            "implemented as stubs",
+            "backend stub routes added",
+            "stub endpoint",
+            "returns stub",
+            "return stub",
+        )
+    )
+    minimizes_blockers = bool(re.search(r"###\s*critical[^\n]*\n\s*\*\*none\b", lowered)) or "critical (functional blockers)\n**none" in lowered
+    if mentions_production_stubs and minimizes_blockers:
+        return [
+            "frontend/API audit report identifies production-path stubs but presents them as non-blocking; production stubs must be fixed, moved to explicit mock/dev fixtures, or documented as blocking gaps"
+        ]
     return []
+
+
+def _path_overlaps(scope: str, candidate: str) -> bool:
+    normalized_scope = str(scope or "").strip().lstrip("./").rstrip("/")
+    normalized_candidate = str(candidate or "").strip().lstrip("./").rstrip("/")
+    if not normalized_scope or not normalized_candidate:
+        return False
+    return (
+        normalized_candidate == normalized_scope
+        or normalized_candidate.startswith(normalized_scope + "/")
+        or normalized_scope.startswith(normalized_candidate + "/")
+    )
+
+
+def _production_semantic_precondition_errors(project_root: Path | str, task: Task) -> list[str]:
+    runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
+    scope_report = runtime_state.get("pending_scope_report") if isinstance(runtime_state.get("pending_scope_report"), dict) else {}
+    changed_paths = [
+        str(path).strip()
+        for key in ("changed_paths", "staged_paths", "out_of_scope")
+        for path in scope_report.get(key, [])
+        if str(path).strip()
+    ]
+    if not changed_paths:
+        return []
+    errors: list[str] = []
+    for finding in scan_production_semantics(project_root):
+        if not any(_path_overlaps(path, finding.path) for path in changed_paths):
+            continue
+        errors.append(
+            f"production semantic finding in task-changed path: {finding.category} {finding.path}: {finding.message}"
+        )
+        if len(errors) >= 20:
+            break
+    return errors
+
+
+def _is_production_gate_task(task: Task) -> bool:
+    return str(task.task_kind or "").strip() == "validation" and str(task.title or "").startswith("Production Gate:")
+
+
+def _production_gate_precondition_errors(project_root: Path | str, task: Task) -> list[str]:
+    if not _is_production_gate_task(task):
+        return []
+    errors: list[str] = []
+    for finding in scan_production_semantics(project_root):
+        errors.append(
+            f"production gate semantic finding: {finding.category} {finding.path}: {finding.message}"
+        )
+        if len(errors) >= 10:
+            break
+    return errors
+
+
+def _unsupported_frontend_root_precondition_errors(project_root: Path | str, task: Task) -> list[str]:
+    project_dir = resolve_project_root(project_root)
+    if not (project_dir / "frontend" / "package.json").exists():
+        return []
+    runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
+    scope_report = runtime_state.get("pending_scope_report") if isinstance(runtime_state.get("pending_scope_report"), dict) else {}
+    changed_paths = [
+        str(path).strip().lstrip("./")
+        for key in ("changed_paths", "staged_paths", "out_of_scope")
+        for path in scope_report.get(key, [])
+        if str(path).strip()
+    ]
+    invalid = sorted(
+        {
+            path
+            for path in changed_paths
+            if path.startswith(("src/", "e2e/")) or path in {"package.json", "vitest.config.ts", "vite.config.ts"}
+        }
+    )
+    if not invalid:
+        return []
+    return [
+        "task changed unsupported top-level frontend paths while this project uses `frontend/` as the frontend root: "
+        + ", ".join(invalid[:8])
+        + "; move fixes under `frontend/` or repair the task/test contract instead of creating root-level frontend shims"
+    ]
 
 
 def _review_pass_precondition_errors(project_root: Path | str, task: Task) -> list[str]:
@@ -130,6 +238,9 @@ def _review_pass_precondition_errors(project_root: Path | str, task: Task) -> li
     if task.id == FRONTEND_API_AUDIT_TASK_ID:
         errors.extend(_frontend_api_audit_artifact_issues(project_root))
     errors.extend(mock_only_browser_e2e_issues(project_root, task.output_tests))
+    errors.extend(_production_semantic_precondition_errors(project_root, task))
+    errors.extend(_production_gate_precondition_errors(project_root, task))
+    errors.extend(_unsupported_frontend_root_precondition_errors(project_root, task))
     return errors
 
 
@@ -154,20 +265,28 @@ def _enforce_review_pass_preconditions(project_root: Path | str, task: Task, inp
 def _precondition_failure_review_payload(task: Task, parsed: dict[str, Any], errors: list[str]) -> dict[str, Any]:
     summary = (
         "Machine-verifiable review pass preconditions failed; route this task back to implementation repair. "
+        + f"{len(errors)} blocking precondition error(s): "
         + "; ".join(errors[:3])
     )
     findings = [
         *[finding for finding in parsed.get("findings", []) if isinstance(finding, dict)],
-        {
-            "severity": "blocking",
-            "requirement_ids": list(task.requirements),
-            "acceptance_ids": list(task.acceptance_scenarios),
-            "message": summary,
-        },
+        *[
+            {
+                "severity": "blocking",
+                "requirement_ids": list(task.requirements),
+                "acceptance_ids": list(task.acceptance_scenarios),
+                "message": error,
+            }
+            for error in errors
+        ],
     ]
     return {
         **parsed,
         "status": "changes_requested",
+        "review_type": "machine-precondition",
+        "external_review_status": str(parsed.get("status") or "").strip() or "unknown",
+        "machine_precondition_status": "failed",
+        "machine_precondition_errors": list(errors),
         "summary": summary,
         "findings": findings,
         "task_contract_assessment": {
@@ -482,6 +601,14 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
                 "review_repair_limit_report": exception_report,
                 "review_requested_scope_paths": accepted_scope_paths,
                 "pending_scope_report": None,
+                "escalation": {
+                    "status": "required",
+                    "kind": "review_repair_limit",
+                    "reason": f"code review requested changes {review_changes_requested_count} time(s)",
+                    "escalated_at": reviewed_at,
+                    "review_artifact": review_artifact,
+                    "exception_report": exception_report,
+                },
             },
         )
         refresh_gates(project_dir)

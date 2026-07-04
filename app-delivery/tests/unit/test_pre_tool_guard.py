@@ -108,6 +108,23 @@ def test_guard_allows_frontend_npm_run_list_probe(tmp_path: Path) -> None:
     assert result == {}
 
 
+def test_guard_blocks_filtered_playwright_without_pipefail(tmp_path: Path) -> None:
+    _seed_project(tmp_path, task_id="T001", output_paths=["frontend/package.json", "frontend/package-lock.json"])
+
+    result = _run_guard(tmp_path, "npx playwright test e2e/incidents/ --reporter=list 2>&1 | tail -50", workdir=str(tmp_path / "frontend"))
+
+    assert result["decision"] == "block"
+    assert "pipefail" in str(result["reason"])
+
+
+def test_guard_allows_filtered_playwright_with_pipefail(tmp_path: Path) -> None:
+    _seed_project(tmp_path, task_id="T001", output_paths=["frontend/package.json", "frontend/package-lock.json"])
+
+    result = _run_guard(tmp_path, "set -o pipefail; npx playwright test e2e/incidents/ --reporter=list 2>&1 | tail -50", workdir=str(tmp_path / "frontend"))
+
+    assert result == {}
+
+
 def test_guard_allows_node_and_npm_version_checks(tmp_path: Path) -> None:
     _seed_project(tmp_path, task_id="T001", output_paths=["frontend/package.json", "frontend/package-lock.json"])
 

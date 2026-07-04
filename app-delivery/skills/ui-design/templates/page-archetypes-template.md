@@ -68,7 +68,7 @@ Required elements:
 
 ## Route Mapping
 
-Every user-facing route from the requirements must appear here before `arch-design` creates frontend work items. The Source Requirement column must contain REQ IDs. Use Notes to name the owning frontend feature spec, for example `docs/modules/contracts-ui.md`.
+Every user-facing page, route, or major workflow from the requirements must appear here before `task-decompose` creates frontend work items. Source Requirements must contain REQ IDs. Suggested Output Paths and Suggested Browser Tests must be project-root-relative paths.
 
-| Route | Archetype | Source Requirement | Notes |
-|-------|-----------|--------------------|-------|
+| Page / Route | Source Requirements | Primary Roles | Required Regions / Components | States | Suggested Output Paths | Suggested Browser Tests |
+|--------------|---------------------|---------------|--------------------------------|--------|------------------------|-------------------------|

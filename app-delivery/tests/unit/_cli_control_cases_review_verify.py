@@ -25,6 +25,42 @@ from delivery.task import Task
 cli = import_module("delivery.__main__")
 
 
+def test_review_payload_supports_pass_all_except_requirement_assessment() -> None:
+    from delivery.review_payload import validate_pass_review_matrix
+
+    task = Task.from_dict(
+        {
+            "id": "T010",
+            "title": "Large repair",
+            "status": "review_pending",
+            "task_kind": "repair",
+            "requirements": ["REQ-001", "REQ-002", "REQ-003"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": [],
+            "output_paths": [],
+        }
+    )
+
+    parsed = validate_pass_review_matrix(
+        task,
+        {
+            "status": "changes_requested",
+            "summary": "REQ-002 still needs work.",
+            "findings": [],
+            "requirement_assessment_mode": "pass_all_except",
+            "requirement_assessment_defaults": {"notes": "Covered by prior verified evidence."},
+            "requirement_assessment": [{"id": "REQ-002", "status": "changes_requested", "notes": "Missing proof."}],
+            "acceptance_assessment": [],
+        },
+    )
+
+    by_id = {row["id"]: row for row in parsed["requirement_assessment"]}
+    assert by_id["REQ-001"] == {"id": "REQ-001", "status": "pass", "notes": "Covered by prior verified evidence."}
+    assert by_id["REQ-002"]["status"] == "changes_requested"
+    assert by_id["REQ-003"]["status"] == "pass"
+
+
 def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
         tmp_path,
@@ -68,6 +104,9 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
     )
 
     monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
+    spawned: list[str] = []
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: True)
+    monkeypatch.setattr(cli, "spawn_watchdog", lambda project_root: spawned.append(str(project_root)) or 123)
 
     result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
 
@@ -81,6 +120,7 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
     metrics = {row["task_id"]: row for row in summary["task_metrics"]}
     assert metrics["T002"]["status"] == "verified"
     assert metrics["T002"]["completed_at"] is not None
+    assert spawned == [str(tmp_path)]
 
 def test_cmd_code_review_task_contract_repair_moves_acceptance_to_later_task(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
@@ -540,6 +580,80 @@ def test_cmd_code_review_rejects_prefinal_audit_pass_when_report_missing(tmp_pat
     assert "required audit report is missing" in payload["items"][0]["blocked_reason"]
     assert (tmp_path / "docs" / "reviews" / "code-review-T-SYSTEM-AUDIT.md").exists()
 
+def test_cmd_code_review_rejects_prefinal_audit_pass_when_report_declares_blockers(tmp_path: Path, monkeypatch) -> None:
+    report_path = tmp_path / PREFINAL_AUDIT_REPORT_PATH
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        "# System Audit\n\n"
+        "## Audit Scope\n\n"
+        "## Executive Verdict\n\n**Overall: DEFER** — T-FINAL should not proceed until critical blockers are fixed.\n\n"
+        "## Fixed Issues\n\n"
+        "## Remaining Gaps / Blockers\n\nCritical release-blocking issue remains.\n\n"
+        "## Requirement Gap Matrix\n\n"
+        "## Validation Summary\n\n"
+        "## Changed Files\n\n"
+        "## Final Recommendation\n\nThe system fails pre-final validation.\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": PREFINAL_AUDIT_TASK_ID,
+                    "title": "Pre-final full-system repair pass",
+                    "status": "review_pending",
+                    "task_kind": "audit",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T002"],
+                    "output_tests": list(PREFINAL_AUDIT_OUTPUT_TESTS),
+                    "output_paths": list(PREFINAL_AUDIT_OUTPUT_PATHS),
+                    "status_session_id": "ses-system-audit",
+                    "completed_at": "2026-06-24T01:00:00Z",
+                    "attempts": 1,
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "generated_at": "2026-06-24T01:01:00Z",
+            "results": [
+                {
+                    "task_id": PREFINAL_AUDIT_TASK_ID,
+                    "timestamp": "2026-06-24T01:01:00Z",
+                    "test_files": list(PREFINAL_AUDIT_OUTPUT_TESTS),
+                    "test_types": ["unit"],
+                    "requirement_ids": [],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {},
+        },
+    )
+    input_path = tmp_path / "audit-review.json"
+    input_path.write_text(json.dumps({"status": "pass", "summary": "Audit ready.", "findings": [], "requirement_assessment": [], "acceptance_assessment": []}), encoding="utf-8")
+    monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
+
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=PREFINAL_AUDIT_TASK_ID, input=str(input_path)))
+
+    assert result == 0
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "pending"
+    assert payload["items"][0]["review_status"] == "changes_requested"
+    assert "T-FINAL should not proceed" in payload["items"][0]["blocked_reason"]
+
 def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
         tmp_path,
@@ -600,8 +714,88 @@ def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp
     assert payload["items"][0]["review_status"] == "changes_requested"
     assert "required frontend/API audit report is missing" in payload["items"][0]["blocked_reason"]
     assert (tmp_path / "docs" / "reviews" / f"code-review-{FRONTEND_API_AUDIT_TASK_ID}.md").exists()
+    handoff = json.loads((tmp_path / ".app-delivery-runtime" / "host-handoff.json").read_text(encoding="utf-8"))
+    assert handoff["status"] == "imported"
+    assert handoff["skill"] == "code-review"
+    assert handoff["task_id"] == FRONTEND_API_AUDIT_TASK_ID
+    assert handoff["import_exit_code"] == 2
 
-def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path) -> None:
+def test_cmd_code_review_rejects_frontend_api_audit_pass_when_stubs_are_nonblocking(tmp_path: Path, monkeypatch) -> None:
+    report_path = tmp_path / FRONTEND_API_AUDIT_REPORT_PATH
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        "# Frontend API Integration Audit\n\n"
+        "## Audit Scope\n\n"
+        "## API Surface Mapping\n\nBackend stub routes added and implemented as stubs.\n\n"
+        "## Mocked Browser Test Assessment\n\n"
+        "## Real Backend E2E Readiness\n\n"
+        "## Test Data / Environment Readiness\n\n"
+        "## Fixed Issues\n\nStub endpoint added in production route.\n\n"
+        "## Remaining Gaps / Blockers\n\n### Critical (functional blockers)\n**None.**\n\n"
+        "## Validation Summary\n\n"
+        "## Final Recommendation\n",
+        encoding="utf-8",
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": FRONTEND_API_AUDIT_TASK_ID,
+                    "title": "Frontend API integration audit",
+                    "status": "review_pending",
+                    "task_kind": "audit",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T002"],
+                    "output_tests": list(FRONTEND_API_AUDIT_OUTPUT_TESTS),
+                    "output_paths": list(FRONTEND_API_AUDIT_OUTPUT_PATHS),
+                    "status_session_id": "ses-frontend-audit",
+                    "completed_at": "2026-06-24T01:00:00Z",
+                    "attempts": 1,
+                }
+            ],
+        },
+    )
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "generated_at": "2026-06-24T01:01:00Z",
+            "results": [
+                {
+                    "task_id": FRONTEND_API_AUDIT_TASK_ID,
+                    "timestamp": "2026-06-24T01:01:00Z",
+                    "test_files": list(FRONTEND_API_AUDIT_OUTPUT_TESTS),
+                    "test_types": ["unit"],
+                    "requirement_ids": [],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {},
+        },
+    )
+    input_path = tmp_path / "frontend-audit-review.json"
+    input_path.write_text(json.dumps({"status": "pass", "summary": "Audit ready.", "findings": [], "requirement_assessment": [], "acceptance_assessment": []}), encoding="utf-8")
+    monkeypatch.setattr("delivery.loop_review.git_commit_task", lambda project_root, task, message, extra_paths=None: "abc123")
+
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=FRONTEND_API_AUDIT_TASK_ID, input=str(input_path)))
+
+    assert result == 0
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "pending"
+    assert payload["items"][0]["review_status"] == "changes_requested"
+    assert "production-path stubs" in payload["items"][0]["blocked_reason"]
+
+def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
         tmp_path,
         {
@@ -625,6 +819,9 @@ def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path) -> None:
     )
     input_path = tmp_path / "final-review.json"
     input_path.write_text(json.dumps({"status": "pass", "summary": "Release ready.", "findings": []}), encoding="utf-8")
+    spawned: list[str] = []
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: True)
+    monkeypatch.setattr(cli, "spawn_watchdog", lambda project_root: spawned.append(str(project_root)) or 123)
 
     result = cli.cmd_final_review(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -633,6 +830,7 @@ def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path) -> None:
     assert payload["items"][0]["status"] == "verified"
     assert payload["items"][0]["review_status"] == "pass"
     assert payload["items"][0]["review_artifact"] == "docs/reviews/final-review.md"
+    assert spawned == [str(tmp_path)]
 
 def test_cmd_final_review_import_changes_requested_creates_repair_bundle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     save_work_items(
@@ -846,6 +1044,35 @@ def test_cmd_task_reset_repair_refuses_verified_feature_task(tmp_path: Path) -> 
     item = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))["items"][0]
     assert item["status"] == "verified"
     assert item["verified_at"] == "2026-06-24T00:10:00Z"
+
+
+
+def test_cmd_task_reset_repair_refuses_final_repair_after_iteration_limit(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T003", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": "pass", "verified_at": "2026-06-24T00:10:00Z"},
+                {"id": "T004", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T002", "T003"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": "pass"},
+                {"id": "T005", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T002", "T003", "T004"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": "pass"},
+                {"id": "T-FINAL", "title": "Final verification", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T003", "T004", "T005"], "output_tests": [], "output_paths": [], "blocked_reason": "final verification reached maximum repair iterations (3); remaining failures require manual escalation"},
+            ],
+        },
+    )
+    save_task_runtime_state(tmp_path, "T-FINAL", {"final_repair_limit_reached": True, "repair_task_id": "T005"})
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_task(argparse.Namespace(project=str(tmp_path), task_id="T003", action="reset-repair", reason="Try again."))
+
+    assert exc_info.value.code == "final_repair_limit_reached"
+    item = next(item for item in json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))["items"] if item["id"] == "T003")
+    assert item["status"] == "verified"
+    assert item["verified_at"] == "2026-06-24T00:10:00Z"
+
 
 def test_final_repair_preserves_verified_prefinal_audit_and_updates_final_dependency() -> None:
     loop_module = import_module("delivery.loop")

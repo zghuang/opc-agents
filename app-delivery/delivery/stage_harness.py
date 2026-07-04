@@ -110,6 +110,8 @@ IMPLEMENTATION_TREE_FILE_RE = re.compile(
 MAX_MODULE_TREE_IMPLEMENTATION_FILE_ENTRIES = 20
 CANONICAL_REQUIREMENT_ID_RE = re.compile(r"^(?:REQ|NFR)-\d{3,}$")
 ACCEPTANCE_ID_RE = re.compile(r"^AS-\d{3,}$")
+ROUTE_MAPPING_HEADING_RE = re.compile(r"^##+\s+Route Mapping\s*$", re.IGNORECASE)
+REQ_ID_RE = re.compile(r"\bREQ-\d{3,}\b")
 
 
 def _validate_spec_review_ids(input_path: Path, requirements: list[Any], acceptance_scenarios: list[Any]) -> None:
@@ -611,6 +613,109 @@ def _validate_decompose_technology_constraints(payload: dict[str, Any], input_pa
         )
 
 
+def _markdown_tables_after_heading(text: str, heading_re: re.Pattern[str]) -> list[list[str]]:
+    lines = str(text or "").splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if heading_re.match(line.strip()):
+            start = index + 1
+            break
+    if start is None:
+        return []
+    rows: list[list[str]] = []
+    for line in lines[start:]:
+        stripped = line.strip()
+        if stripped.startswith("##") and rows:
+            break
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if cells and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells):
+            continue
+        rows.append(cells)
+    if len(rows) <= 1:
+        return []
+    return rows
+
+
+def _ui_route_mapping_rows(project_root: Path) -> list[dict[str, Any]]:
+    path = project_root / "docs" / "ui" / "page-archetypes.md"
+    if not path.exists():
+        return []
+    rows = _markdown_tables_after_heading(path.read_text(encoding="utf-8", errors="replace"), ROUTE_MAPPING_HEADING_RE)
+    if not rows:
+        return []
+    header = [cell.casefold() for cell in rows[0]]
+    def column(*names: str) -> int | None:
+        for name in names:
+            normalized = name.casefold()
+            for index, value in enumerate(header):
+                if normalized in value:
+                    return index
+        return None
+    page_idx = column("page", "route")
+    req_idx = column("source requirement", "requirement")
+    output_idx = column("suggested output", "output path")
+    test_idx = column("suggested browser", "browser test", "test")
+    result: list[dict[str, Any]] = []
+    for cells in rows[1:]:
+        text = " | ".join(cells)
+        req_text = cells[req_idx] if req_idx is not None and req_idx < len(cells) else text
+        requirements = sorted(set(REQ_ID_RE.findall(req_text)))
+        if not requirements:
+            continue
+        result.append(
+            {
+                "page": cells[page_idx] if page_idx is not None and page_idx < len(cells) else cells[0],
+                "requirements": requirements,
+                "suggested_outputs": cells[output_idx] if output_idx is not None and output_idx < len(cells) else "",
+                "suggested_tests": cells[test_idx] if test_idx is not None and test_idx < len(cells) else "",
+            }
+        )
+    return result
+
+
+def _has_frontend_path(task: Task) -> bool:
+    return any(str(path).strip().startswith("frontend/") for path in [*task.output_paths, *task.output_tests])
+
+
+def _has_browser_test(task: Task) -> bool:
+    return any(
+        "frontend/e2e/" in str(path).strip()
+        or "playwright" in str(path).casefold()
+        or "browser" in str(path).casefold()
+        or "e2e" in str(path).casefold()
+        for path in task.output_tests
+    )
+
+
+def _validate_ui_route_task_coverage(project_root: Path, tasks: list[Task], input_path: Path) -> None:
+    route_rows = _ui_route_mapping_rows(project_root)
+    if not route_rows:
+        return
+    errors: list[str] = []
+    candidates = [task for task in tasks if task.task_kind in {"feature", "validation"}]
+    for row in route_rows:
+        reqs = set(row["requirements"])
+        covering = [task for task in candidates if reqs.intersection(task.requirements)]
+        if not covering:
+            errors.append(f"{row['page']}: no feature/validation task covers source requirements {', '.join(sorted(reqs))}")
+            continue
+        frontend_covering = [task for task in covering if _has_frontend_path(task)]
+        if not frontend_covering:
+            errors.append(f"{row['page']}: covering tasks lack frontend output paths ({', '.join(task.id for task in covering)})")
+        if str(row.get("suggested_tests") or "").strip() and not any(_has_browser_test(task) for task in covering):
+            errors.append(f"{row['page']}: route mapping suggests browser tests but covering tasks lack browser/e2e output_tests ({', '.join(task.id for task in covering)})")
+    if errors:
+        raise DeliveryError(
+            code="stage_output_invalid",
+            message="task-decompose did not cover UI route mappings from docs/ui/page-archetypes.md",
+            exit_code=2,
+            details={"stage": "task-decompose", "input_path": str(input_path), "ui_route_coverage_errors": errors[:20]},
+            suggested_action="Regenerate task-decompose so each UI Route Mapping row is covered by a frontend-capable task with appropriate browser/e2e evidence.",
+        )
+
+
 def import_decompose(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
     project_root = Path(project_root).expanduser().resolve()
     _validate_decompose_technology_constraints(payload, input_path)
@@ -647,6 +752,7 @@ def import_decompose(project_root: Path | str, payload: dict[str, Any], input_pa
             },
             suggested_action="Ask the stage skill to repair the task graph using the reported contract errors and rerun the same import command",
         )
+    _validate_ui_route_task_coverage(project_root, [Task.from_dict(item) for item in work_items_payload.get("items", []) if isinstance(item, dict)], input_path)
     save_work_items(project_root, work_items_payload)
     sync_gates(project_root, stage_payload=payload)
     return 0

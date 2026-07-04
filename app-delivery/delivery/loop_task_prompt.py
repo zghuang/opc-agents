@@ -128,6 +128,10 @@ def _append_validation_command_guidance(lines: list[str], project_root: Path | s
             lines.append(f"- Browser/e2e validation: if you manually run Playwright or `npm run e2e`, prefix it with `{e2e_prefix}` so the local backend is started for Vite API proxy requests.")
 
 
+def _append_production_fidelity_rule(lines: list[str]) -> None:
+    lines.append("- Production fidelity: do not satisfy requirements, API contracts, or tests by adding production-path hardcoded/default responses, static fixtures, fake data, or stub routes. Use real service/database/tool/external-system behavior; if that is too broad for this task, document a blocking gap instead of faking completion. Keep fake behavior only in explicit mock/dev fixtures.")
+
+
 def _append_technology_constraints_section(lines: list[str], constraints: list[dict[str, Any]] | None) -> None:
     if not constraints:
         return
@@ -243,6 +247,81 @@ def _append_invalid_verified_context(lines: list[str], project_root: Path | str)
     lines.append("")
 
 
+def _is_real_backend_validation_gate(task: Task) -> bool:
+    if str(task.task_kind or "").strip() != "validation":
+        return False
+    tests = {str(value).strip() for value in task.output_tests}
+    paths = {str(value).strip() for value in task.output_paths}
+    return (
+        "frontend/e2e/real-backend.spec.ts" in tests
+        and "scripts/e2e-backend.sh" in paths
+        and "scripts/seed-backend.sh" in paths
+    )
+
+
+def _is_production_gate_task(task: Task) -> bool:
+    return str(task.task_kind or "").strip() == "validation" and str(task.title or "").startswith("Production Gate:")
+
+
+def _append_production_gate_source_guidance(lines: list[str], task: Task) -> None:
+    lines.append("Production gate source check:")
+    lines.append("- Read the relevant sections of `docs/requirements-source.md` and `docs/architecture.md` before changing code; generated summaries may omit contract details.")
+    lines.append("- Inspect the current implementation and tests for this gate's scope before deciding whether the issue is code, test, data, or environment setup.")
+    lines.append("- If `docs/reviews/production-gate-*.md` is declared in this task's output paths, create or update it with the source sections consulted, production-path scan findings, executable test evidence, and any blocking gaps.")
+    lines.append("- Keep repairs limited to evidence needed by this production gate; do not restart broad feature implementation.")
+    lines.append("")
+
+
+def _append_security_access_gate_guidance(lines: list[str]) -> None:
+    lines.append("Security/access-control gate focus:")
+    lines.append("- Scan the authentication, authorization, access-control, data-protection, and sensitive-operation paths the current project claims to implement before adding tests.")
+    lines.append("- Validate both allow and deny paths for the project's declared model, such as RBAC, ABAC, policy rules, tenant/resource scopes, ownership checks, or unauthenticated public endpoints.")
+    lines.append("- Treat production paths that bypass declared security rules, rely on dev-only shortcuts, or are protected only by test fixtures as blocking findings unless the source docs explicitly allow them.")
+    lines.append("")
+
+
+def _append_agent_reality_gate_guidance(lines: list[str]) -> None:
+    lines.append("Declared AI/automation integration gate focus:")
+    lines.append("- First confirm from source docs and architecture which AI, automation, model, tool, or external-service integration boundaries this project actually declares.")
+    lines.append("- Scan only those declared boundaries, including adapters, orchestration, tool calls, schemas, persistence, retry/timeout handling, and observability when they exist.")
+    lines.append("- Flag static canned outputs or bypassed integration paths when the project claims a real integration boundary; local simulators are acceptable only when they exercise that boundary's contract rather than replace its result.")
+    lines.append("- Validate request/response contracts, evidence or trace references when declared, failure handling, and state persistence across the owned boundary.")
+    lines.append("")
+
+
+def _append_execution_loop_gate_guidance(lines: list[str]) -> None:
+    lines.append("Declared process/execution gate focus:")
+    lines.append("- First confirm from source docs and architecture which approval, workflow, execution, dispatch, rollback, or manual-control behavior this project actually declares.")
+    lines.append("- Scan only those declared process boundaries, including state transitions, side effects, auditability, authorization, idempotency, and external-system handoff when they exist.")
+    lines.append("- Validate the declared unhappy paths as well as the happy path, such as rejection, retry, timeout, cancellation, rollback, or manual override where applicable.")
+    lines.append("- Treat in-memory happy-path-only evidence, missing side-effect verification, or reports that do not trace to executable boundary tests as blocking findings.")
+    lines.append("")
+
+
+def _append_production_gate_specific_guidance(lines: list[str], task: Task) -> None:
+    title = str(task.title or "").casefold()
+    paths_and_tests = " ".join([*(task.output_paths or []), *(task.output_tests or [])]).casefold()
+    if "security" in title or "rbac" in title or "access control" in title or "/security" in paths_and_tests:
+        _append_security_access_gate_guidance(lines)
+    if "agent" in title or "mcp" in paths_and_tests or "/agents/" in paths_and_tests:
+        _append_agent_reality_gate_guidance(lines)
+    if "approval" in title or "execution loop" in title or "execution_dispatch" in paths_and_tests or "dispatch_to_external_system" in paths_and_tests:
+        _append_execution_loop_gate_guidance(lines)
+
+
+def _append_real_backend_gate_guidance(lines: list[str]) -> None:
+    lines.append("Real-backend E2E focus:")
+    lines.append("- Start from `frontend/e2e/real-backend.spec.ts`, `scripts/e2e-backend.sh`, and `scripts/seed-backend.sh`; do not begin with broad repository exploration.")
+    lines.append("- Reproduce the latest failing real-backend spec first, then inspect backend startup, migration, and seed behavior before changing unrelated feature code.")
+    lines.append("- Run Playwright from the `frontend/` directory against the declared spec path `e2e/real-backend.spec.ts`; do not run project-root paths like `frontend/e2e/real-backend.spec.ts` through a separate Playwright context.")
+    lines.append("- Do not create alternate or throwaway specs as completion evidence; repair the declared real-backend spec and report instead.")
+    lines.append("- Scan `frontend/src/` and `frontend/e2e/` for mocked, hardcoded, or fallback API data on flows where real backend routes already exist.")
+    lines.append("- Compare frontend API usage with backend routes and schemas; core real-backend validation should use live backend behavior rather than page.route, fixtures, or static demo responses.")
+    lines.append("- Check backend health/login endpoints and the exact failing API assertion path before widening scope.")
+    lines.append("- If backend startup is broken, repair environment, migration, or seed steps first; do not spend the turn on unrelated placeholder tests.")
+    lines.append("")
+
+
 def _append_review_repair_context(
     lines: list[str],
     project_root: Path | str,
@@ -340,6 +419,7 @@ def build_review_repair_prompt(project_root: Path | str, task: Task) -> str:
     lines.append("- Continue from current code; the review artifact is the repair brief.")
     lines.append("- Green tests are not enough; prove the review findings are fixed.")
     lines.append("- Add or strengthen task-local tests when proof is missing.")
+    _append_production_fidelity_rule(lines)
     if has_frontend_paths and task.acceptance_scenarios:
         lines.append("- If review affects frontend acceptance behavior, keep browser/e2e coverage here unless a declared downstream validation task owns the exact journey.")
         if not has_browser_specs:
@@ -460,6 +540,7 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
     lines.append("- Use declared output paths/tests as the main contract; make necessary adjacent support edits and validate them here.")
     lines.append("- Green tests are not enough; prove the declared requirement and acceptance behavior.")
     lines.append("- Add or strengthen task-local tests when behavior is not demonstrated.")
+    _append_production_fidelity_rule(lines)
     if has_frontend_paths and task.acceptance_scenarios:
         lines.append("- Frontend acceptance behavior needs browser/e2e coverage here unless a declared downstream validation task owns the exact journey.")
         if not has_browser_specs:
@@ -494,20 +575,29 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
     ]
     _append_task_intent_section(lines, task)
     if task.requirements:
-        lines.append(f"Requirements: {', '.join(task.requirements)}")
-        lines.append("")
-        lines.append("Requirement details:")
-        requirement_context = format_requirement_context(project_root, task.requirements) or []
-        lines.extend(requirement_context or ["- none"])
+        if _is_production_gate_task(task):
+            lines.append(f"Requirement IDs in gate scope: {_format_id_summary(task.requirements)}")
+            lines.append("- Requirement details are intentionally not expanded for production gates; use `docs/requirements-source.md` and gate reports for precise source context.")
+            requirement_context = []
+        else:
+            lines.append(f"Requirements: {', '.join(task.requirements)}")
+            lines.append("")
+            lines.append("Requirement details:")
+            requirement_context = format_requirement_context(project_root, task.requirements) or []
+            lines.extend(requirement_context or ["- none"])
         lines.append("")
     else:
         requirement_context = []
     if task.acceptance_scenarios:
-        lines.append(f"Acceptance scenarios: {', '.join(task.acceptance_scenarios)}")
-        lines.append("")
-        lines.append("Acceptance scenario details:")
-        acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
-        lines.extend(acceptance_context or ["- none"])
+        if _is_production_gate_task(task):
+            lines.append(f"Acceptance scenario IDs in gate scope: {_format_id_summary(task.acceptance_scenarios)}")
+            acceptance_context = []
+        else:
+            lines.append(f"Acceptance scenarios: {', '.join(task.acceptance_scenarios)}")
+            lines.append("")
+            lines.append("Acceptance scenario details:")
+            acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
+            lines.extend(acceptance_context or ["- none"])
         lines.append("")
     else:
         acceptance_context = []
@@ -566,10 +656,16 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
     lines.append("- If a declared scenario cannot be validated truthfully without a small supporting implementation fix, apply the minimal code change required to enable the validation and keep it tightly scoped.")
     lines.append("- Do not turn this task into broad new product implementation that belongs to upstream feature tasks.")
     lines.append("")
+    if _is_production_gate_task(task):
+        _append_production_gate_source_guidance(lines, task)
+        _append_production_gate_specific_guidance(lines, task)
+    if _is_real_backend_validation_gate(task):
+        _append_real_backend_gate_guidance(lines)
     lines.append("Execution guidance:")
     lines.append("- Use the declared Paths and Tests as the main scope and delivery contract for this task.")
     lines.append("- Treat passing tests as necessary but not sufficient. Do not stop if the declared acceptance scenarios are still not directly represented by executable validation.")
     lines.append("- If existing tests are weak, incomplete, missing fixtures, or not executable, fix them in this task.")
+    _append_production_fidelity_rule(lines)
     lines.append("- If a scenario remains unprovable without broad new product work, stop and surface the blocker instead of faking coverage.")
     if task.acceptance_scenarios:
         lines.append("- Each declared acceptance scenario should map to at least one concrete validation path, assertion set, or explicitly documented coverage route in this task.")
@@ -611,6 +707,9 @@ def build_fix_prompt(project_root: Path | str, task: Task, test_summary: str) ->
             "- Start from the failing declared tests and the declared output paths above. Prefer fixing project-local implementation and test wiring before broad exploration.",
         ]
     )
+    if _is_real_backend_validation_gate(task):
+        _append_real_backend_gate_guidance(lines)
+    _append_production_fidelity_rule(lines)
     _append_validation_command_guidance(
         lines,
         project_root,
@@ -664,6 +763,8 @@ def build_stalled_recovery_prompt(
     _append_python_package_placement_rule(lines, task)
     if _has_python_package_output_dir(task):
         lines.append("")
+    if _is_real_backend_validation_gate(task):
+        _append_real_backend_gate_guidance(lines)
     lines.extend(
         [
             "Recovery instructions:",

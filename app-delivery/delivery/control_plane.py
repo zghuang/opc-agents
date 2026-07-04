@@ -21,12 +21,15 @@ from .project_readiness import (
     work_item_contract_errors,
     work_items_ready,
 )
+from .review_artifacts import code_review_request_path, final_review_request_path
 from .runtime_config import resolve_project_root
 from .state import load_json, load_task_runtime_state, normalize_task_runtime_state, project_paths, write_json
 from .task import FINAL_VERIFY_TASK_ID, all_tasks
 
 
 CONTROL_GOALS = {"auto", "status", "pause", "repair", "step"}
+FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
+FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,55 @@ class ControlStep:
 
 def _step(kind: str, action: str, owner: str, **payload: Any) -> ControlStep:
     return ControlStep(kind=kind, action=action, owner=owner, payload=payload)
+
+
+def _host_input_matches_latest_runtime_attempt(project_root: Path, task_id: str, input_path: Path) -> bool:
+    runtime_state = load_task_runtime_state(project_root, task_id)
+    completed_at = _parse_iso_datetime(runtime_state.get("completed_at"))
+    if completed_at is None:
+        return False
+    try:
+        input_mtime = dt.datetime.fromtimestamp(input_path.stat().st_mtime, tz=dt.timezone.utc)
+    except OSError:
+        return False
+    return input_mtime > completed_at
+
+
+def _host_input_import_ready(project_root: Path, next_step: dict[str, Any]) -> bool:
+    expected_input = str(next_step.get("expected_input_path") or "").strip()
+    if not expected_input:
+        return False
+    input_path = Path(expected_input).expanduser()
+    if not input_path.exists():
+        return False
+
+    skill = str(next_step.get("skill") or "").strip()
+    task_id = str(next_step.get("task_id") or "").strip()
+    if skill == "code-review" and task_id:
+        request_path = code_review_request_path(project_root, task_id)
+        if request_path.exists() and input_path.stat().st_mtime_ns <= request_path.stat().st_mtime_ns:
+            return _host_input_matches_latest_runtime_attempt(project_root, task_id, input_path)
+    if skill == "final-review":
+        request_path = final_review_request_path(project_root)
+        if request_path.exists() and input_path.stat().st_mtime_ns <= request_path.stat().st_mtime_ns:
+            return False
+    return True
+
+
+def _annotate_host_response_readiness(project_root: Path, next_step: dict[str, Any] | None) -> None:
+    if not isinstance(next_step, dict):
+        return
+    if str(next_step.get("owner") or "").strip() != "host":
+        return
+    expected_input = str(next_step.get("expected_input_path") or "").strip()
+    if not expected_input:
+        return
+    if _host_input_import_ready(project_root, next_step):
+        next_step["host_response_ready"] = True
+        next_step["host_response_status"] = "ready_unimported"
+        next_step["message"] = (
+            f"Host artifact already exists at {expected_input}; run control --goal auto to import it before requesting host work again."
+        )
 
 
 def _parse_iso_datetime(value: Any) -> dt.datetime | None:
@@ -130,13 +182,39 @@ def _auto_exception_repair_candidate(project_root: Path, tasks: list[Any]) -> tu
     pending = [task for task in tasks if task.status == "pending" and task.id != FINAL_VERIFY_TASK_ID]
     if not exceptions or not pending:
         return None
+    fallback_candidate: tuple[Any, list[str]] | None = None
     for task in exceptions:
         if _auto_exception_repair_already_attempted(project_root, task.id):
             continue
         blocked = _exception_blocking_pending_ids(tasks, task.id)
         if blocked and len(blocked) == len(pending):
             return task, blocked
+        if blocked and fallback_candidate is None:
+            fallback_candidate = (task, blocked)
+    return fallback_candidate
+
+
+def _gate_exception_repair_candidate(project_root: Path, tasks_by_id: dict[str, Any], repair_candidates: list[str]) -> Any | None:
+    for task_id in repair_candidates:
+        task = tasks_by_id.get(task_id)
+        if task is None or task.status != "exception":
+            continue
+        if _auto_exception_repair_already_attempted(project_root, task.id):
+            continue
+        return task
     return None
+
+
+def _is_final_repair_task_payload(task: dict[str, Any]) -> bool:
+    title = str(task.get("title") or "").strip()
+    return (
+        title.startswith(FINAL_REPAIR_TASK_PREFIX)
+        or title.startswith(FINAL_REVIEW_REPAIR_TASK_PREFIX)
+    )
+
+
+def _final_repair_limit_blocks_continuation(task: dict[str, Any], final_runtime_state: dict[str, Any]) -> bool:
+    return _is_final_repair_task_payload(task) and bool(final_runtime_state.get("final_repair_limit_reached"))
 
 
 def routed_status(project_root: Path | str, *, requirements_path: str | None = None) -> dict[str, Any]:
@@ -193,7 +271,11 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
         runtime_state_status = str(runtime_state.get("status") or "").strip()
         runtime_completed_at = str(runtime_state.get("completed_at") or "").strip()
         runtime_attention = base.get("runtime_attention") if isinstance(base.get("runtime_attention"), dict) else None
-        if runtime_attention and runtime_attention.get("suspected"):
+        if _final_repair_limit_blocks_continuation(task, final_runtime_state):
+            next_step = None
+            must_continue = False
+            control_status = "blocked"
+        elif runtime_attention and runtime_attention.get("suspected"):
             next_step = _step(
                 "framework",
                 "recover_stalled",
@@ -309,7 +391,11 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
         runtime_state = task.get("runtime_state") if isinstance(task.get("runtime_state"), dict) else {}
         runtime_state_status = str(runtime_state.get("status") or "").strip()
         runtime_completed_at = str(runtime_state.get("completed_at") or "").strip()
-        if runtime_state_status == "completed":
+        if _final_repair_limit_blocks_continuation(task, final_runtime_state):
+            next_step = None
+            must_continue = False
+            control_status = "blocked"
+        elif runtime_state_status == "completed":
             message = (
                 f"Continue framework validation and repair flow for {task.get('id')}; "
                 f"the last runtime attempt already completed{(' at ' + runtime_completed_at) if runtime_completed_at else ''}."
@@ -342,24 +428,82 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
         ]
         repair_report = str(gate.get("report_artifact") or "").strip() or None
         if repair_candidates:
-            next_step = _step(
-                "host_notice",
-                "review_gate_blocker",
-                "host",
-                message=f"Validation gate {gate.get('id')} found unresolved evidence. Review the gate report and decide whether to trigger a repair task.",
-                project=str(project_dir),
-                task_id=repair_candidates[0],
-                repair_candidates=repair_candidates,
-                repair_report=repair_report,
-                gate_id=str(gate.get("id") or "").strip() or None,
-                blocked_reason=str(gate.get("blocked_reason") or "").strip() or None,
-            ).to_dict()
+            gate_id = str(gate.get("id") or "").strip() or None
+            blocked_reason = str(gate.get("blocked_reason") or "").strip() or None
+            exception_repair_task = _gate_exception_repair_candidate(project_dir, task_by_id, repair_candidates)
+            if exception_repair_task is not None:
+                next_step = _step(
+                    "framework",
+                    "auto_repair_exception",
+                    "framework",
+                    message=f"Validation gate {gate_id} is blocked by exception task {exception_repair_task.id}; reapply its exception patch and retry once.",
+                    project=str(project_dir),
+                    task_id=exception_repair_task.id,
+                    task_title=exception_repair_task.title,
+                    repair_candidates=repair_candidates,
+                    repair_report=repair_report,
+                    gate_id=gate_id,
+                    blocked_reason=blocked_reason,
+                ).to_dict()
+            else:
+                auto_repair = _auto_exception_repair_candidate(project_dir, tasks)
+                if auto_repair is not None:
+                    exception_task, blocked_pending_ids = auto_repair
+                    next_step = _step(
+                        "framework",
+                        "auto_repair_exception",
+                        "framework",
+                        message=f"Validation gate {gate_id} is blocked while exception task {exception_task.id} blocks pending continuation; reapply its exception patch and retry once.",
+                        project=str(project_dir),
+                        task_id=exception_task.id,
+                        task_title=exception_task.title,
+                        blocked_pending_task_ids=blocked_pending_ids,
+                        repair_candidates=repair_candidates,
+                        repair_report=repair_report,
+                        gate_id=gate_id,
+                        blocked_reason=blocked_reason,
+                    ).to_dict()
+                else:
+                    next_step = _step(
+                        "host_notice",
+                        "review_gate_blocker",
+                        "host",
+                        message=f"Validation gate {gate.get('id')} found unresolved evidence. Review the gate report and decide whether to trigger a repair task.",
+                        project=str(project_dir),
+                        task_id=repair_candidates[0],
+                        repair_candidates=repair_candidates,
+                        repair_report=repair_report,
+                        gate_id=gate_id,
+                        blocked_reason=blocked_reason,
+                    ).to_dict()
             must_continue = True
             control_status = "in_progress"
         else:
-            next_step = None
-            must_continue = False
-            control_status = "blocked"
+            gate_id = str(gate.get("id") or "").strip() or None
+            blocked_reason = str(gate.get("blocked_reason") or "").strip() or None
+            auto_repair = _auto_exception_repair_candidate(project_dir, tasks)
+            if auto_repair is not None:
+                exception_task, blocked_pending_ids = auto_repair
+                next_step = _step(
+                    "framework",
+                    "auto_repair_exception",
+                    "framework",
+                    message=f"Validation gate {gate_id} is blocked while exception task {exception_task.id} blocks pending continuation; reapply its exception patch and retry once.",
+                    project=str(project_dir),
+                    task_id=exception_task.id,
+                    task_title=exception_task.title,
+                    blocked_pending_task_ids=blocked_pending_ids,
+                    repair_candidates=repair_candidates,
+                    repair_report=repair_report,
+                    gate_id=gate_id,
+                    blocked_reason=blocked_reason,
+                ).to_dict()
+                must_continue = True
+                control_status = "in_progress"
+            else:
+                next_step = None
+                must_continue = False
+                control_status = "blocked"
     elif isinstance(base.get("next_task"), dict):
         task = base["next_task"]
         runtime_state = task.get("runtime_state") if isinstance(task.get("runtime_state"), dict) else {}
@@ -413,6 +557,8 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
             )
             delivery_claim_allowed = final_task_status == "verified" and not any_actionable
             control_status = "complete" if delivery_claim_allowed else "blocked"
+
+    _annotate_host_response_readiness(project_dir, next_step)
 
     continue_instruction = ""
     if must_continue and isinstance(next_step, dict):

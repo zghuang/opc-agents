@@ -140,6 +140,7 @@ def write_review_artifact(project_root: Path | str, task: Task, review_payload: 
     paths.reviews_dir.mkdir(parents=True, exist_ok=True)
     review_path = paths.reviews_dir / f"code-review-{task.id}.md"
     status = str(review_payload.get("status") or "changes_requested").strip()
+    review_type = str(review_payload.get("review_type") or "code").strip() or "code"
     summary = str(review_payload.get("summary") or "").strip()
     findings = review_payload.get("findings") if isinstance(review_payload.get("findings"), list) else []
     requirement_assessment = review_payload.get("requirement_assessment") if isinstance(review_payload.get("requirement_assessment"), list) else []
@@ -147,8 +148,20 @@ def write_review_artifact(project_root: Path | str, task: Task, review_payload: 
     task_contract_assessment = review_payload.get("task_contract_assessment") if isinstance(review_payload.get("task_contract_assessment"), dict) else None
     lines = [
         f"status: {status}",
-        "review_type: code",
+        f"review_type: {review_type}",
         f"work_item: {task.id}",
+    ]
+    if review_type == "machine-precondition":
+        lines.extend(
+            [
+                f"external_review_status: {str(review_payload.get('external_review_status') or '-').strip() or '-'}",
+                f"machine_precondition_status: {str(review_payload.get('machine_precondition_status') or '-').strip() or '-'}",
+            ]
+        )
+        errors = review_payload.get("machine_precondition_errors") if isinstance(review_payload.get("machine_precondition_errors"), list) else []
+        if errors:
+            lines.append(f"machine_precondition_error_count: {len(errors)}")
+    lines.extend([
         "",
         "# Code Review",
         "",
@@ -158,7 +171,7 @@ def write_review_artifact(project_root: Path | str, task: Task, review_payload: 
         "",
         "## Findings",
         "",
-    ]
+    ])
     if findings:
         for finding in findings:
             if isinstance(finding, dict):
@@ -186,6 +199,12 @@ def write_review_artifact(project_root: Path | str, task: Task, review_payload: 
         notes = str(task_contract_assessment.get("notes") or "").strip()
         if notes:
             lines.append(f"- notes: {notes}")
+    if review_type == "machine-precondition":
+        errors = review_payload.get("machine_precondition_errors") if isinstance(review_payload.get("machine_precondition_errors"), list) else []
+        if errors:
+            lines.extend(["", "## Machine Precondition Errors", ""])
+            for error in errors:
+                lines.append(f"- {error}")
     if requirement_assessment:
         lines.extend(["", "## Requirement Assessment", ""])
         for row in requirement_assessment:

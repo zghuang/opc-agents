@@ -14,12 +14,13 @@ from delivery.errors import DeliveryError
 from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
 from delivery.loop_review import code_review_request_path
 from delivery.loop import status as loop_status
-from delivery.control_plane_host import build_planning_host_step
+from delivery.control_plane_host import build_planning_host_step, build_review_host_step
 from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt
 from delivery.stage_harness import stage_import_command, stage_input_path
 from delivery.state import load_gates, load_session_state, load_task_runtime_state, save_architecture_meta, save_session_state, save_task_runtime_state, save_test_plan, save_test_results, save_work_items
 from delivery.task import Task
+from delivery.token_usage import append_token_usage_record
 
 
 cli = import_module("delivery.__main__")
@@ -147,6 +148,9 @@ def test_cmd_status_writes_project_summary_and_backfills_missing_task_session_id
     backend_dir = tmp_path / "backend" / "src" / "feature"
     backend_dir.mkdir(parents=True, exist_ok=True)
     backend_dir.joinpath("service.py").write_text("def feature():\n    return True\n\n", encoding="utf-8")
+    backend_test_dir = tmp_path / "backend" / "tests"
+    backend_test_dir.mkdir(parents=True, exist_ok=True)
+    backend_test_dir.joinpath("test_feature.py").write_text("def test_feature():\n    value = 1\n    assert value == 1\n\n", encoding="utf-8")
     frontend_dir = tmp_path / "frontend" / "src"
     frontend_dir.mkdir(parents=True, exist_ok=True)
     frontend_dir.joinpath("App.tsx").write_text("export function App() {\n  return null\n}\n", encoding="utf-8")
@@ -181,12 +185,17 @@ def test_cmd_status_writes_project_summary_and_backfills_missing_task_session_id
     work_items = json.loads((docs_dir / "work-items.json").read_text(encoding="utf-8"))
     assert work_items["items"][0]["status_session_id"] == "ses-runtime-1"
     summary_json = json.loads((docs_dir / "project-summary.json").read_text(encoding="utf-8"))
-    assert summary_json["code_lines"]["total"] == 5
-    assert summary_json["code_lines"]["backend"] == 2
+    assert summary_json["code_lines"]["total"] == 8
+    assert summary_json["code_lines"]["application"] == 5
+    assert summary_json["code_lines"]["test"] == 3
+    assert summary_json["code_lines"]["backend"] == 5
     assert summary_json["code_lines"]["frontend"] == 3
     summary_md = (docs_dir / "project-summary.md").read_text(encoding="utf-8")
-    assert "- Effective Code Lines: 5" in summary_md
-    assert "- Backend Code Lines: 2" in summary_md
+    assert "- Effective Code Lines: 8" in summary_md
+    assert "- Application Code Lines: 5" in summary_md
+    assert "- Test Code Lines: 3" in summary_md
+    assert "- Code Line Formula: Effective Code Lines = Application Code Lines + Test Code Lines" in summary_md
+    assert "- Backend Code Lines: 5" in summary_md
     assert "- Frontend Code Lines: 3" in summary_md
     assert "## Planning Lead" not in summary_md
     assert "## Delivery Status" not in summary_md
@@ -198,6 +207,41 @@ def test_cmd_status_writes_project_summary_and_backfills_missing_task_session_id
     assert "## Stale Runtime Records" not in summary_md
     assert "## Invalid Verified Tasks" not in summary_md
     assert "## Recent Activity" not in summary_md
+
+def test_cmd_status_backfills_missing_task_session_id_from_token_usage(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": tmp_path.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"], "status_session_id": None},
+            ],
+        },
+    )
+    append_token_usage_record(
+        tmp_path,
+        runtime="opencode",
+        task_id="T002",
+        task_title="Feature",
+        session_id="ses-token-2",
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        log_file=".app-delivery-runtime/logs/opencode-ses-token-2-turn-1.log",
+    )
+
+    result = cli.cmd_status(argparse.Namespace(project=str(tmp_path)))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["project"] == str(tmp_path)
+    work_items = json.loads((docs_dir / "work-items.json").read_text(encoding="utf-8"))
+    assert work_items["items"][0]["status_session_id"] == "ses-token-2"
+    summary_json = json.loads((docs_dir / "project-summary.json").read_text(encoding="utf-8"))
+    assert summary_json["task_metrics"][0]["session_id"] == "ses-token-2"
 
 def test_cmd_status_tolerates_project_summary_refresh_failure(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     save_work_items(
@@ -234,7 +278,7 @@ def test_cmd_control_tolerates_project_summary_refresh_failure(tmp_path: Path, m
     result = cli.cmd_control(
         argparse.Namespace(
             project=str(tmp_path),
-            goal="step",
+            goal="auto",
             requirements=None,
             task_id=None,
             runtime=None,
@@ -862,6 +906,121 @@ def test_cmd_control_status_prefers_review_pending_task_over_blocked_final_repai
     assert payload["next_step"]["action"] == "run_code_review"
     assert payload["next_step"]["task_id"] == "T002"
 
+
+def test_review_host_step_prompt_tells_host_to_import_artifact(tmp_path: Path) -> None:
+    step = build_review_host_step(project_root=tmp_path, task_id="T002", title="Feature")
+
+    assert "Do not run the app-delivery import command yourself" not in step["prompt"]
+    assert "After writing the artifact, run this import command" in step["prompt"]
+    assert '${OPC_HOME:-$HOME/opc}/bin/app-delivery code-review --project' in step["prompt"]
+    assert step["import_command"] in step["prompt"]
+
+
+def test_cmd_control_status_marks_ready_host_response_as_unimported(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    project_root = tmp_path
+    docs_dir = project_root / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    (docs_dir / "architecture.md").write_text("architecture\n", encoding="utf-8")
+    (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
+    save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
+    project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
+    save_test_plan(project_root, {"schema_version": "1", "coverage": []})
+    save_work_items(
+        project_root,
+        {
+            "schema_version": "2",
+            "project": project_root.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "Feature", "status": "review_pending", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": None},
+                {"id": "T-FINAL", "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+    input_path = project_root / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(json.dumps({"status": "pass", "summary": "ready", "findings": []}), encoding="utf-8")
+    monkeypatch.setattr("delivery.control_plane.needs_scaffold", lambda project_root: False)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(project_root),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["next_step"]["task_id"] == "T002"
+    assert payload["next_step"]["host_response_ready"] is True
+    assert payload["next_step"]["host_response_status"] == "ready_unimported"
+    assert "run control --goal auto to import" in payload["next_step"]["message"]
+
+
+def test_cmd_control_status_does_not_mark_stale_host_response_ready(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    project_root = tmp_path
+    docs_dir = project_root / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}), encoding="utf-8")
+    (docs_dir / "architecture.md").write_text("architecture\n", encoding="utf-8")
+    (docs_dir / "shared-components.md").write_text("shared\n", encoding="utf-8")
+    save_architecture_meta(project_root, {"schema_version": "1", "ui_required": False})
+    project_root.joinpath("CLAUDE.md").write_text("claude\n", encoding="utf-8")
+    save_test_plan(project_root, {"schema_version": "1", "coverage": []})
+    save_work_items(
+        project_root,
+        {
+            "schema_version": "2",
+            "project": project_root.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "Feature", "status": "review_pending", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": None},
+                {"id": "T-FINAL", "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+    input_path = project_root / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(json.dumps({"status": "pass", "summary": "old", "findings": []}), encoding="utf-8")
+    request_path = code_review_request_path(project_root, "T002")
+    request_path.write_text("new request\n", encoding="utf-8")
+    old_time = dt.datetime(2026, 6, 27, 7, 0, tzinfo=dt.timezone.utc).timestamp()
+    request_time = dt.datetime(2026, 6, 27, 7, 5, tzinfo=dt.timezone.utc).timestamp()
+    os.utime(input_path, (old_time, old_time))
+    os.utime(request_path, (request_time, request_time))
+    save_task_runtime_state(project_root, "T002", {"task_id": "T002", "completed_at": "2026-06-27T07:04:00Z"})
+    monkeypatch.setattr("delivery.control_plane.needs_scaffold", lambda project_root: False)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(project_root),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["next_step"]["task_id"] == "T002"
+    assert "host_response_ready" not in payload["next_step"]
+    assert "ready_unimported" not in json.dumps(payload["next_step"])
+
 def test_cmd_control_status_blocks_when_final_repair_task_is_missing(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     project_root = tmp_path
     docs_dir = project_root / "docs"
@@ -911,7 +1070,47 @@ def test_cmd_control_status_blocks_when_final_repair_task_is_missing(tmp_path: P
     assert result == 1
     assert payload["control_status"] == "blocked"
     assert payload["must_continue"] is False
-    assert payload["next_step"] is None
+
+
+def test_cmd_control_status_spawns_watchdog_for_importable_host_step(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T007.json"
+    snapshot = {
+        "control_status": "in_progress",
+        "must_continue": True,
+        "counts": {"verified": 6, "review_pending": 1, "pending": 18},
+        "next_step": {
+            "kind": "host_skill",
+            "owner": "host",
+            "action": "run_code_review",
+            "skill": "code-review",
+            "task_id": "T007",
+            "expected_input_path": str(input_path),
+        },
+    }
+    spawned: list[str] = []
+
+    monkeypatch.setattr(cli, "run_control", lambda project_root, *, goal, requirements_path=None, repair_task_id=None: dict(snapshot))
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: True)
+    monkeypatch.setattr(cli, "spawn_watchdog", lambda project_root: spawned.append(str(project_root)) or 123)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert spawned == [str(tmp_path)]
+    assert payload["watchdog_pid"] == 123
+    assert payload["next_step"]["task_id"] == "T007"
 
 def test_cmd_control_auto_stops_when_final_repair_task_is_missing(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     project_root = tmp_path
@@ -1037,6 +1236,56 @@ def test_cmd_control_auto_executes_repair_task_for_blocked_final_verify(tmp_path
     assert payload["next_step"] is None
     assert payload["must_continue"] is False
 
+
+
+def test_cmd_control_auto_executes_recover_stalled_step(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    snapshots = [
+        {
+            "control_status": "in_progress",
+            "must_continue": True,
+            "next_step": {
+                "kind": "framework",
+                "owner": "framework",
+                "action": "recover_stalled",
+                "task_id": "T002",
+                "attention_kind": "silent_stall",
+            },
+        },
+        {"control_status": "running", "must_continue": False, "next_step": None},
+    ]
+    recovered: list[str] = []
+
+    def fake_run_control(project_root, *, goal, requirements_path=None, repair_task_id=None):
+        return dict(snapshots.pop(0))
+
+    def fake_recover(project_root, *, task_id, runtime, runtime_attention, spawn_watchdog_after=True):
+        recovered.append(task_id)
+        return {"status": "recovered", "task_id": task_id, "attention_kind": runtime_attention.get("attention_kind")}
+
+    monkeypatch.setattr(cli, "run_control", fake_run_control)
+    monkeypatch.setattr(cli, "_run_stalled_recovery_once", fake_recover)
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="auto",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert recovered == ["T002"]
+    assert payload["executed_steps"][0]["action"] == "recover_stalled"
+    assert payload["executed_steps"][0]["result"]["status"] == "recovered"
+
+
 def test_cmd_control_auto_defers_host_review_step_to_outer_host(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     snapshots = [
         {
@@ -1080,7 +1329,7 @@ def test_cmd_control_auto_defers_host_review_step_to_outer_host(tmp_path: Path, 
     assert payload["next_step"]["owner"] == "host"
 
 
-def test_cmd_control_auto_records_waiting_for_host_without_spawning_watchdog(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cmd_control_auto_spawns_watchdog_for_waiting_host_step_and_exits_successfully(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
     snapshots = [
         {
@@ -1108,6 +1357,106 @@ def test_cmd_control_auto_records_waiting_for_host_without_spawning_watchdog(tmp
     result = cli.cmd_control(
         argparse.Namespace(
             project=str(tmp_path),
+            goal="auto",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    handoff = json.loads((tmp_path / ".app-delivery-runtime" / "host-handoff.json").read_text(encoding="utf-8"))
+    assert result == 0
+    assert payload["executed_steps"][0]["deferred_to_host"] is True
+    assert spawned == [str(tmp_path)]
+    assert payload["host_handoff"]["status"] == "waiting_for_host"
+    assert payload["host_handoff"]["retry_attempts"] == 0
+    assert handoff["status"] == "waiting_for_host"
+    assert handoff["kind"] == ""
+    assert handoff["skill"] == "code-review"
+    assert handoff["task_id"] == "T002"
+    assert handoff["expected_input_path"] == str(input_path)
+    assert handoff["prompt"] == "review prompt"
+    assert handoff["retry_attempts"] == 0
+    assert handoff["next_step"]["action"] == "run_code_review"
+
+
+def test_save_host_handoff_requests_one_retry_for_stale_waiting_handoff(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "HOST_HANDOFF_RETRY_AFTER_SECONDS", 0)
+    input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
+    next_step = {
+        "owner": "host",
+        "action": "run_code_review",
+        "skill": "code-review",
+        "task_id": "T002",
+        "expected_input_path": str(input_path),
+    }
+
+    first = cli._save_host_handoff(tmp_path, next_step)
+    second = cli._save_host_handoff(tmp_path, next_step)
+    third = cli._save_host_handoff(tmp_path, next_step)
+
+    assert first["retry_attempts"] == 0
+    assert second["requested_at"] == first["requested_at"]
+    assert second["retry_attempts"] == 1
+    assert second["retry_requested_at"]
+    assert third["retry_attempts"] == 1
+    assert third["retry_requested_at"] == second["retry_requested_at"]
+
+
+def test_save_host_handoff_uses_new_id_for_new_review_request_round(tmp_path: Path) -> None:
+    input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
+    request_path = code_review_request_path(tmp_path, "T002")
+    request_path.write_text("first request\n", encoding="utf-8")
+    next_step = {
+        "owner": "host",
+        "action": "run_code_review",
+        "skill": "code-review",
+        "task_id": "T002",
+        "expected_input_path": str(input_path),
+    }
+
+    first = cli._save_host_handoff(tmp_path, next_step)
+    old_time = dt.datetime(2026, 6, 24, 0, 0, tzinfo=dt.timezone.utc).timestamp()
+    new_time = dt.datetime(2026, 6, 24, 0, 5, tzinfo=dt.timezone.utc).timestamp()
+    os.utime(request_path, (old_time, old_time))
+    first = cli._save_host_handoff(tmp_path, next_step)
+    os.utime(request_path, (new_time, new_time))
+    second = cli._save_host_handoff(tmp_path, next_step)
+
+    assert first["handoff_id"] != second["handoff_id"]
+    assert second["retry_attempts"] == 0
+
+
+def test_cmd_control_auto_persists_host_handoff_even_without_watchdog(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
+    snapshots = [
+        {
+            "control_status": "in_progress",
+            "must_continue": True,
+            "next_step": {
+                "owner": "host",
+                "action": "run_code_review",
+                "skill": "code-review",
+                "task_id": "T002",
+                "prompt": "review prompt",
+                "expected_input_path": str(input_path),
+            },
+        },
+    ]
+
+    def fake_run_control(project_root, *, goal, requirements_path=None, repair_task_id=None):
+        return dict(snapshots.pop(0))
+
+    monkeypatch.setattr(cli, "run_control", fake_run_control)
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
             goal="step",
             requirements=None,
             task_id=None,
@@ -1119,15 +1468,67 @@ def test_cmd_control_auto_records_waiting_for_host_without_spawning_watchdog(tmp
     )
 
     payload = json.loads(capsys.readouterr().out)
-    state = json.loads((tmp_path / ".app-delivery-runtime" / "watchdog-state.json").read_text(encoding="utf-8"))
+    handoff = json.loads((tmp_path / ".app-delivery-runtime" / "host-handoff.json").read_text(encoding="utf-8"))
     assert result == 1
     assert payload["executed_steps"][0]["deferred_to_host"] is True
+    assert handoff["status"] == "waiting_for_host"
+    assert handoff["skill"] == "code-review"
+    assert handoff["task_id"] == "T002"
+    assert handoff["expected_input_path"] == str(input_path)
+    assert handoff["prompt"] == "review prompt"
+
+
+def test_cmd_control_auto_does_not_persist_host_notice_as_handoff(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    snapshots = [
+        {
+            "control_status": "in_progress",
+            "must_continue": True,
+            "next_step": {
+                "kind": "host_notice",
+                "owner": "host",
+                "action": "review_gate_blocker",
+                "task_id": "T004",
+                "message": "Review gate report and decide whether to repair.",
+            },
+        },
+    ]
+
+    def fake_run_control(project_root, *, goal, requirements_path=None, repair_task_id=None):
+        return dict(snapshots.pop(0))
+
+    monkeypatch.setattr(cli, "run_control", fake_run_control)
+    spawned: list[str] = []
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: True)
+    monkeypatch.setattr(cli, "spawn_watchdog", lambda project_root: spawned.append(str(project_root)) or 123)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="auto",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    handoff = json.loads((tmp_path / ".app-delivery-runtime" / "host-handoff.json").read_text(encoding="utf-8"))
+    watchdog_state = json.loads((tmp_path / ".app-delivery-runtime" / "watchdog-state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert payload["executed_steps"][0]["deferred_to_host"] is True
+    assert payload["host_handoff"]["status"] == "notice"
+    assert handoff["status"] == "notice"
+    assert handoff["action"] == "review_gate_blocker"
+    assert handoff["skill"] == ""
+    assert handoff["expected_input_path"] == ""
+    assert handoff["message"] == "Review gate report and decide whether to repair."
+    assert watchdog_state["pid"] == 0
+    assert watchdog_state["status"] == "host_notice"
+    assert watchdog_state["last_action"] == "review_gate_blocker"
     assert spawned == []
-    assert state["status"] == "waiting_for_host"
-    assert state["last_action"] == "run_code_review"
-    assert state["skill"] == "code-review"
-    assert state["task_id"] == "T002"
-    assert state["expected_input_path"] == str(input_path)
 
 
 def test_cmd_control_step_executes_one_framework_step(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1366,6 +1767,11 @@ def test_cmd_control_auto_executes_host_skill_and_imports_generated_artifact(tmp
     assert payload["executed_steps"][0]["action"] == "run_code_review"
     assert payload["executed_steps"][0]["result"]["status"] == "imported"
     assert payload["executed_steps"][0]["result"]["host_execution"]["status"] == "executed"
+    handoff = json.loads((tmp_path / ".app-delivery-runtime" / "host-handoff.json").read_text(encoding="utf-8"))
+    assert handoff["status"] == "imported"
+    assert handoff["skill"] == "code-review"
+    assert handoff["task_id"] == "T002"
+    assert handoff["input_path"] == str(input_path.resolve())
 
 def test_cmd_control_auto_falls_back_to_existing_review_input_when_host_skill_fails(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
@@ -1663,6 +2069,324 @@ def test_cmd_control_status_routes_blocked_validation_gate_to_repair_before_fina
     assert payload["next_step"]["action"] == "review_gate_blocker"
     assert payload["next_step"]["owner"] == "host"
     assert payload["next_step"]["repair_candidates"] == ["T002"]
+
+def test_cmd_control_status_auto_repairs_blocked_gate_exception_candidate_once(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    project_root = tmp_path
+    save_work_items(
+        project_root,
+        {
+            "schema_version": "2",
+            "project": project_root.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T018", "title": "Gate scope task", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["frontend/src/feature.tsx"], "attempts": 3},
+                {"id": "T019", "title": "Blocked downstream task", "status": "pending", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T018"], "output_tests": [], "output_paths": ["frontend/src/downstream.tsx"]},
+                {"id": "T-FINAL", "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T019"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+    import delivery.control_plane as control_plane
+
+    monkeypatch.setattr(control_plane, "requirements_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "blocking_clarifications_present", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "architecture_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "ui_required", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "context_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_items_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_item_contract_errors", lambda project_root: {})
+    monkeypatch.setattr(control_plane, "needs_scaffold", lambda project_root: False)
+    monkeypatch.setattr(
+        control_plane,
+        "runtime_status",
+        lambda project_root: {
+            "project": str(project_root),
+            "counts": {"verified": 1, "exception": 1, "pending": 2},
+            "next_task": {"id": "T-FINAL", "title": "Final", "status": "pending", "task_kind": "feature"},
+            "review_pending_task": None,
+            "active_task": None,
+            "stale_active_tasks": [],
+            "paused": False,
+            "final_verify_ready": False,
+            "invalid_verified_tasks": {},
+            "requirements_source_archived": True,
+            "gates": {
+                "schema_version": "1",
+                "project": project_root.name,
+                "complexity": {"tier": "M", "score": 0, "signals": {}, "source": "task-decompose"},
+                "gates": [
+                    {
+                        "id": "GATE-frontend",
+                        "kind": "module",
+                        "title": "Frontend gate",
+                        "status": "blocked",
+                        "scope_tasks": ["T018"],
+                        "scope_requirements": ["REQ-001"],
+                        "required_test_types": ["browser"],
+                        "source": "task-decompose",
+                        "repair_candidates": ["T018", "T019"],
+                        "blocked_reason": "scope tasks are not verified: T018",
+                        "report_artifact": "docs/reviews/gate-report-GATE-frontend.md",
+                    }
+                ],
+            },
+        },
+    )
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(project_root),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["control_status"] == "in_progress"
+    assert payload["next_step"]["action"] == "auto_repair_exception"
+    assert payload["next_step"]["owner"] == "framework"
+    assert payload["next_step"]["task_id"] == "T018"
+    assert payload["next_step"]["gate_id"] == "GATE-frontend"
+    assert payload["next_step"]["repair_candidates"] == ["T018", "T019"]
+
+    control_plane.mark_auto_exception_repair_attempted(project_root, "T018")
+    payload_again = control_plane.routed_status(project_root)
+    assert payload_again["control_status"] == "in_progress"
+    assert payload_again["next_step"]["action"] == "review_gate_blocker"
+    assert payload_again["next_step"]["owner"] == "host"
+    assert payload_again["next_step"]["task_id"] == "T018"
+
+
+def test_cmd_control_status_auto_repairs_exception_blocking_gate_even_when_not_repair_candidate(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    project_root = tmp_path
+    save_work_items(
+        project_root,
+        {
+            "schema_version": "2",
+            "project": project_root.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T004", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": [], "review_status": "pass"},
+                {"id": "T-FRONTEND-API-AUDIT", "title": "Frontend audit", "status": "exception", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T004"], "output_tests": [], "output_paths": [], "attempts": 3},
+                {"id": "T900", "title": "Production gate", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T-FRONTEND-API-AUDIT"], "output_tests": [], "output_paths": []},
+                {"id": "T901", "title": "Security gate", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T900"], "output_tests": [], "output_paths": []},
+                {"id": "T-FINAL", "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T901"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+    import delivery.control_plane as control_plane
+
+    monkeypatch.setattr(control_plane, "requirements_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "blocking_clarifications_present", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "architecture_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "ui_required", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "context_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_items_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_item_contract_errors", lambda project_root: {})
+    monkeypatch.setattr(control_plane, "needs_scaffold", lambda project_root: False)
+    monkeypatch.setattr(
+        control_plane,
+        "runtime_status",
+        lambda project_root: {
+            "project": str(project_root),
+            "counts": {"verified": 1, "exception": 1, "pending": 3},
+            "next_task": None,
+            "review_pending_task": None,
+            "active_task": None,
+            "stale_active_tasks": [],
+            "paused": False,
+            "final_verify_ready": False,
+            "invalid_verified_tasks": {},
+            "requirements_source_archived": True,
+            "gates": {
+                "schema_version": "1",
+                "project": project_root.name,
+                "complexity": {},
+                "gates": [
+                    {
+                        "id": "GATE-frontend",
+                        "status": "blocked",
+                        "repair_candidates": ["T004", "T900"],
+                        "blocked_reason": "missing required test types: accessibility",
+                        "report_artifact": "docs/reviews/gate-report-GATE-frontend.md",
+                    }
+                ],
+            },
+        },
+    )
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(project_root),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["next_step"]["action"] == "auto_repair_exception"
+    assert payload["next_step"]["task_id"] == "T-FRONTEND-API-AUDIT"
+    assert payload["next_step"]["gate_id"] == "GATE-frontend"
+    assert payload["next_step"]["blocked_pending_task_ids"] == ["T900", "T901"]
+
+
+def test_cmd_control_status_auto_repairs_one_of_multiple_exception_blockers(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": tmp_path.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T001", "title": "Foundation", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T008", "title": "Agent graph", "status": "exception", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": [], "output_paths": []},
+                {"id": "T011", "title": "Control tower", "status": "exception", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": [], "output_paths": []},
+                {"id": "T009", "title": "Plan flow", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T008"], "output_tests": [], "output_paths": []},
+                {"id": "T012", "title": "RCA", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T008"], "output_tests": [], "output_paths": []},
+                {"id": "T900", "title": "Prod gate", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T009", "T011"], "output_tests": [], "output_paths": []},
+                {"id": "T-FINAL", "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T900"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+    import delivery.control_plane as control_plane
+
+    monkeypatch.setattr(control_plane, "requirements_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "blocking_clarifications_present", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "architecture_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "ui_required", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "context_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_items_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_item_contract_errors", lambda project_root: {})
+    monkeypatch.setattr(control_plane, "needs_scaffold", lambda project_root: False)
+    monkeypatch.setattr(
+        control_plane,
+        "runtime_status",
+        lambda project_root: {
+            "project": str(project_root),
+            "counts": {"verified": 1, "exception": 2, "pending": 4},
+            "next_task": None,
+            "review_pending_task": None,
+            "active_task": None,
+            "stale_active_tasks": [],
+            "paused": False,
+            "final_verify_ready": False,
+            "invalid_verified_tasks": {},
+            "requirements_source_archived": True,
+            "gates": {"schema_version": "1", "project": tmp_path.name, "complexity": {}, "gates": []},
+        },
+    )
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["next_step"]["action"] == "auto_repair_exception"
+    assert payload["next_step"]["task_id"] == "T008"
+    assert payload["next_step"]["blocked_pending_task_ids"] == ["T009", "T012", "T900"]
+
+
+def test_cmd_control_status_auto_repairs_exception_when_blocked_gate_has_no_candidates(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": tmp_path.name,
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T001", "title": "Foundation", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T008", "title": "Agent graph", "status": "exception", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": [], "output_paths": []},
+                {"id": "T009", "title": "Plan flow", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T008"], "output_tests": [], "output_paths": []},
+                {"id": "T-FINAL", "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T009"], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+    import delivery.control_plane as control_plane
+
+    monkeypatch.setattr(control_plane, "requirements_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "blocking_clarifications_present", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "architecture_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "ui_required", lambda project_root: False)
+    monkeypatch.setattr(control_plane, "context_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_items_ready", lambda project_root: True)
+    monkeypatch.setattr(control_plane, "work_item_contract_errors", lambda project_root: {})
+    monkeypatch.setattr(control_plane, "needs_scaffold", lambda project_root: False)
+    monkeypatch.setattr(
+        control_plane,
+        "runtime_status",
+        lambda project_root: {
+            "project": str(project_root),
+            "counts": {"verified": 1, "exception": 1, "pending": 2},
+            "next_task": None,
+            "review_pending_task": None,
+            "active_task": None,
+            "stale_active_tasks": [],
+            "paused": False,
+            "final_verify_ready": False,
+            "invalid_verified_tasks": {},
+            "requirements_source_archived": True,
+            "gates": {
+                "schema_version": "1",
+                "project": tmp_path.name,
+                "complexity": {},
+                "gates": [
+                    {
+                        "id": "GATE-agent-decision",
+                        "status": "blocked",
+                        "repair_candidates": [],
+                        "blocked_reason": "scope tasks are not verified: T008",
+                        "report_artifact": "docs/reviews/gate-report-GATE-agent-decision.md",
+                    }
+                ],
+            },
+        },
+    )
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["next_step"]["action"] == "auto_repair_exception"
+    assert payload["next_step"]["task_id"] == "T008"
+    assert payload["next_step"]["gate_id"] == "GATE-agent-decision"
+    assert payload["next_step"]["blocked_pending_task_ids"] == ["T009"]
 
 def test_cmd_control_status_prefers_runnable_next_task_over_blocked_future_gate(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     from delivery.state import save_gates
@@ -1993,6 +2717,68 @@ def test_status_keeps_final_verify_blocked_after_repair_limit(tmp_path: Path, mo
     assert payload["final_verify"]["will_continue"] is False
     assert payload["final_verify"]["repair_task_id"] == "T005"
     assert payload["final_verify"]["repair_task_status"] == "verified"
+
+
+def test_cmd_control_status_blocks_active_final_repair_after_limit(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr("delivery.control_plane.requirements_ready", lambda project_root: True)
+    monkeypatch.setattr("delivery.control_plane.blocking_clarifications_present", lambda project_root: False)
+    monkeypatch.setattr("delivery.control_plane.architecture_ready", lambda project_root: True)
+    monkeypatch.setattr("delivery.control_plane.ui_required", lambda project_root: False)
+    monkeypatch.setattr("delivery.control_plane.context_ready", lambda project_root: True)
+    monkeypatch.setattr("delivery.control_plane.work_items_ready", lambda project_root: True)
+    monkeypatch.setattr("delivery.control_plane.work_item_contract_errors", lambda project_root: {})
+    monkeypatch.setattr("delivery.control_plane.needs_scaffold", lambda project_root: False)
+    monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"]},
+                {"id": "T003", "title": "Final Verification Repair Bundle (T009)", "status": "active", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000", "T002"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"]},
+                {"id": "T004", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000", "T002", "T003"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": "pass"},
+                {"id": "T005", "title": "Final Verification Repair Bundle (T002)", "status": "verified", "task_kind": "repair", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000", "T002", "T003", "T004"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature.py"], "review_status": "pass"},
+                {"id": "T-FINAL", "title": "Final verification", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002", "T003", "T004", "T005"], "output_tests": [], "output_paths": [], "blocked_reason": "final verification reached maximum repair iterations (3); remaining failures require manual escalation"},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T-FINAL",
+        {
+            "task_id": "T-FINAL",
+            "final_verify_status": "blocked",
+            "final_repair_limit_reached": True,
+            "repair_candidates": ["T002"],
+            "repair_task_id": "T005",
+        },
+    )
+    save_task_runtime_state(tmp_path, "T003", {"task_id": "T003", "status": "interrupted"})
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="status",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["control_status"] == "blocked"
+    assert payload["must_continue"] is False
+    assert payload["next_step"] is None
+    assert payload["final_verify"]["will_continue"] is False
+
 
 def test_status_defers_final_verify_repair_context_until_non_final_tasks_are_complete(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("delivery.loop_reporting.repair_invalid_verified_tasks", lambda project_root, tasks: (tasks, {}))

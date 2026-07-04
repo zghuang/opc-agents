@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from delivery.builtin_tasks import FINAL_VERIFY_TASK_ID, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from delivery.state import save_gates, save_test_plan, save_test_results, save_work_items
 from delivery.task import Task, check_requirements_coverage, check_test_type_coverage, decompose_tasks, lint_task_contract, mark_task, pick_next_task, referenced_req_ids, reset_task
@@ -220,7 +222,7 @@ def test_decompose_tasks_adds_dynamic_production_gates_for_matching_project(tmp_
 
     titles = [item["title"] for item in payload["items"]]
     assert "Production Gate: Real backend E2E validation" in titles
-    assert "Production Gate: Security and RBAC enforcement" in titles
+    assert "Production Gate: Security and access control enforcement" in titles
     assert "Production Gate: Real agent integration" in titles
     assert "Production Gate: Approval and execution loop" in titles
     assert payload["items"][-2]["id"] == PREFINAL_AUDIT_TASK_ID
@@ -359,15 +361,28 @@ def test_decompose_tasks_allows_architecture_selected_top_level_mcp_server_contr
 def test_normalize_complexity_override_requires_task_decompose_metadata() -> None:
     payload = normalize_complexity_override(
         {
-            "tier": "M",
+            "tier": "L",
             "rationale": "Multi-domain project with milestone validation needs.",
             "signals": {"estimated_loc": 80000, "estimated_tasks": 18},
         },
     )
 
-    assert payload["tier"] == "M"
+    assert payload["tier"] == "L"
     assert payload["source"] == "task-decompose"
     assert payload["signals"]["estimated_tasks"] == 18
+
+
+def test_normalize_complexity_override_rejects_understated_tier() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        normalize_complexity_override(
+            {
+                "tier": "S",
+                "rationale": "Incorrectly marked small.",
+                "signals": {"estimated_loc": 120000, "estimated_modules": 14, "estimated_tasks": 16},
+            }
+        )
+
+    assert "minimum expected tier is L" in str(exc_info.value)
 
 def test_normalize_stage_gates_keeps_simple_task_decompose_gate_shape() -> None:
     gates = normalize_stage_gates(

@@ -46,15 +46,15 @@ REAL_BACKEND_E2E_GATE = ProductionGateSpec(
 
 
 SECURITY_GATE = ProductionGateSpec(
-    key="security-rbac",
-    title="Production Gate: Security and RBAC enforcement",
-    reason="Requirements mention roles, permissions, authentication, authorization, or data isolation.",
-    keywords=("rbac", "auth", "authentication", "authorization", "security", "permission", "role", "角色", "权限", "认证", "授权", "安全", "数据隔离", "脱敏"),
+    key="security-access-control",
+    title="Production Gate: Security and access control enforcement",
+    reason="Requirements mention authentication, authorization, access control, permissions, roles, policies, or data isolation.",
+    keywords=("rbac", "abac", "auth", "authentication", "authorization", "security", "access control", "permission", "policy", "role", "角色", "权限", "认证", "授权", "安全", "数据隔离", "脱敏"),
     output_tests=(f"{BACKEND_TEST_ROOT}/security/",),
     output_paths=(
         f"{PYTHON_REACT_CONTRACT.backend_source_root}/",
         f"{BACKEND_TEST_ROOT}/security/",
-        "docs/reviews/production-gate-security-rbac.md",
+        "docs/reviews/production-gate-security-access-control.md",
     ),
 )
 

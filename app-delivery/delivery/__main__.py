@@ -4,9 +4,12 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import signal
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -21,11 +24,12 @@ from .loop import DeliveryLoop, PAUSE_FILE, project_summary
 from .loop_task_prompt import build_stalled_recovery_prompt
 from .loop_review import import_final_review, import_task_review
 from . import project_readiness as readiness
+from .production_semantics import scan_production_semantics
 from .review_artifacts import code_review_request_path, final_review_request_path
 from .runtime_config import load_project_metadata, resolve_project_root, resolve_runtime
 from .scaffold import write_project_structure_snapshot
 from .session import RuntimeSession, current_session, retire_session, save_current_session
-from .watchdog import save_watchdog_state, should_watchdog_resume, spawn_watchdog
+from .watchdog import process_alive, save_watchdog_state, should_watchdog_resume, spawn_watchdog
 from .stage_harness import import_arch_design, import_context_sync, import_decompose, import_spec_review, import_ui_design, load_stage_payload, stage_import_command, stage_input_path, stage_missing_error
 from .loop_gitops import reapply_task_exception_patch
 from .state import (
@@ -33,18 +37,29 @@ from .state import (
     latest_task_log_event,
     load_active_task_records,
     load_task_runtime_state,
+    load_json,
     normalize_task_runtime_state,
     read_lock_metadata,
     render_work_items_markdown,
     save_task_runtime_state,
     task_runtime_state_path,
     utc_now_iso,
+    write_json,
 )
-from .task import all_tasks, mark_task, reset_task, save_tasks
+from .task import FINAL_VERIFY_TASK_ID, all_tasks, mark_task, reset_task, save_tasks
 
 
 CONTROL_STEP_LIMIT = 128
 EXECUTION_LOCK_TIMEOUT_SECONDS = 5.0
+HOST_HANDOFF_FILE = Path(".app-delivery-runtime") / "host-handoff.json"
+HOST_HANDOFF_RETRY_AFTER_SECONDS = 60
+HOST_HANDOFF_MAX_RETRY_ATTEMPTS = 1
+HOST_FALLBACK_FILE = Path(".app-delivery-runtime") / "host-fallback.json"
+HOST_FALLBACK_LOCK_FILE = Path(".app-delivery-runtime") / "host-fallback-lock.json"
+HOST_FALLBACK_DEFAULT_AFTER_SECONDS = 600
+HOST_FALLBACK_DEFAULT_MAX_ATTEMPTS = 1
+FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
+FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
 
 
 def _command_runtime(args: argparse.Namespace, project_root: Path | None = None) -> str:
@@ -58,6 +73,79 @@ def _command_locked(args: argparse.Namespace) -> bool:
 def _watchdog_enabled_for(project_root: Path | str) -> bool:
     metadata = load_project_metadata(project_root)
     return metadata.get("watchdog_enabled") is True
+
+
+def _host_step_expects_importable_artifact(step: dict[str, Any]) -> bool:
+    return bool(str(step.get("skill") or "").strip() and str(step.get("expected_input_path") or "").strip())
+
+
+def _snapshot_needs_watchdog(snapshot: dict[str, Any]) -> bool:
+    control_status = str(snapshot.get("control_status") or "").strip()
+    if control_status == "running":
+        return True
+    if control_status != "in_progress" or not snapshot.get("must_continue"):
+        return False
+    next_step = snapshot.get("next_step") if isinstance(snapshot.get("next_step"), dict) else {}
+    owner = str(next_step.get("owner") or "framework").strip()
+    if owner == "host":
+        return _host_step_expects_importable_artifact(next_step)
+    return owner == "framework"
+
+
+def _host_fallback_enabled_for(project_root: Path | str) -> bool:
+    metadata = load_project_metadata(project_root)
+    if "host_fallback_enabled" in metadata:
+        return metadata.get("host_fallback_enabled") is True
+    return metadata.get("watchdog_enabled") is True
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _host_fallback_after_seconds(project_root: Path | str) -> int:
+    metadata = load_project_metadata(project_root)
+    return _positive_int(metadata.get("host_fallback_after_seconds"), HOST_FALLBACK_DEFAULT_AFTER_SECONDS)
+
+
+def _host_fallback_max_attempts(project_root: Path | str) -> int:
+    metadata = load_project_metadata(project_root)
+    return _positive_int(metadata.get("host_fallback_max_attempts"), HOST_FALLBACK_DEFAULT_MAX_ATTEMPTS)
+
+
+def _is_final_repair_task(task: Any) -> bool:
+    title = str(getattr(task, "title", "") or "").strip()
+    task_kind = str(getattr(task, "task_kind", "") or "").strip()
+    return task_kind == "repair" and (
+        title.startswith(FINAL_REPAIR_TASK_PREFIX)
+        or title.startswith(FINAL_REVIEW_REPAIR_TASK_PREFIX)
+    )
+
+
+def _guard_final_repair_limit_not_reopened(project_root: Path, task: Any | None) -> None:
+    if task is None or not _is_final_repair_task(task):
+        return
+    final_runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, FINAL_VERIFY_TASK_ID))
+    if not bool(final_runtime_state.get("final_repair_limit_reached")):
+        return
+    raise DeliveryError(
+        code="final_repair_limit_reached",
+        message=(
+            f"final verification has reached the maximum repair iterations; refusing to reopen final repair task {task.id}. "
+            "Resolve remaining failures through explicit manual escalation instead of ordinary fix/reset-repair."
+        ),
+        exit_code=2,
+        details={
+            "task_id": task.id,
+            "task_title": getattr(task, "title", ""),
+            "final_repair_limit_reached": True,
+            "current_final_repair_task_id": str(final_runtime_state.get("repair_task_id") or "").strip() or None,
+        },
+    )
 
 
 @contextlib.contextmanager
@@ -151,6 +239,66 @@ def cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _claim_blockers(project_root: Path, status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    counts = status_payload.get("counts") if isinstance(status_payload.get("counts"), dict) else {}
+    for status_name, count in sorted(counts.items()):
+        if status_name != "verified" and count:
+            blockers.append({"kind": "task_status", "status": status_name, "count": count})
+    if isinstance(status_payload.get("active_task"), dict):
+        blockers.append({"kind": "active_task", "task_id": status_payload["active_task"].get("id")})
+    if isinstance(status_payload.get("review_pending_task"), dict):
+        blockers.append({"kind": "review_pending_task", "task_id": status_payload["review_pending_task"].get("id")})
+    if isinstance(status_payload.get("next_task"), dict):
+        blockers.append({"kind": "next_task", "task_id": status_payload["next_task"].get("id"), "status": status_payload["next_task"].get("status")})
+    final_verify = status_payload.get("final_verify") if isinstance(status_payload.get("final_verify"), dict) else {}
+    if final_verify and str(final_verify.get("status") or "").strip() not in {"", "pass", "verified"}:
+        blockers.append({"kind": "final_verify", "status": final_verify.get("status"), "blocked_reason": final_verify.get("blocked_reason"), "repair_task_id": final_verify.get("repair_task_id"), "will_continue": final_verify.get("will_continue")})
+    semantic_findings = scan_production_semantics(project_root)
+    if semantic_findings:
+        blockers.append({"kind": "production_semantics", "count": len(semantic_findings), "findings": [finding.__dict__ for finding in semantic_findings[:20]]})
+    return blockers
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root(args.project)
+    status_payload = routed_status(project_root)
+    blockers = _claim_blockers(project_root, status_payload)
+    checked_at = utc_now_iso()
+    claim_allowed = bool(status_payload.get("delivery_claim_allowed")) and not blockers
+    payload = {
+        "schema_version": "1",
+        "status": "claimed" if claim_allowed else "blocked",
+        "project": str(project_root),
+        "checked_at": checked_at,
+        "claimed_at": checked_at if claim_allowed else None,
+        "delivery_claim_allowed": claim_allowed,
+        "control_status": status_payload.get("control_status"),
+        "blockers": blockers,
+    }
+    if claim_allowed:
+        docs_dir = project_root / "docs"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        (docs_dir / "delivery-claim.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        (docs_dir / "delivery-claim.md").write_text(
+            "\n".join([
+                "# Delivery Claim",
+                "",
+                "status: claimed",
+                f"claimed_at: {checked_at}",
+                f"project: {project_root}",
+                "",
+                "## Evidence",
+                "",
+                "- Task ledger reports delivery claim allowed.",
+                "- No unwaived production semantic findings were found.",
+            ]) + "\n",
+            encoding="utf-8",
+        )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if claim_allowed else 1
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     payload = doctor_report(resolve_runtime(getattr(args, "runtime", None)), framework_root=args.framework_root, opc_home=args.opc_home)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -172,7 +320,7 @@ def cmd_init_project(args: argparse.Namespace) -> int:
         stack=args.stack,
         force=args.force,
         framework_root=args.framework_root,
-        watchdog_enabled=bool(getattr(args, "watchdog", False)),
+        watchdog_enabled=bool(getattr(args, "watchdog", True)),
     )
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
@@ -248,7 +396,6 @@ def _run_fix_once(
 ) -> dict[str, Any] | None:
     resolved = resolve_project_root(project_root)
     with _project_execution_guard(resolved, already_locked=False):
-        _terminate_runtime_for_task(resolved, task_id)
         tasks = all_tasks(resolved)
         current = next((task for task in tasks if task.id == task_id), None)
         if current is not None and current.status == "verified" and current.task_kind != "repair":
@@ -261,6 +408,8 @@ def _run_fix_once(
                 exit_code=2,
                 details={"task_id": task_id, "status": current.status, "task_kind": current.task_kind},
             )
+        _guard_final_repair_limit_not_reopened(resolved, current)
+        _terminate_runtime_for_task(resolved, task_id)
         updated = reset_task(tasks, task_id)
         save_tasks(resolved, updated)
         if current and current.status_session_id:
@@ -271,6 +420,10 @@ def _run_fix_once(
         runtime_path = task_runtime_state_path(resolved, task_id)
         if runtime_path.exists():
             runtime_path.unlink()
+        save_task_runtime_state(resolved, task_id, {"force_task_prompt": True, "force_task_prompt_reason": "manual_fix"})
+        prompt_path = resolved / ".app-delivery-runtime" / "prompts" / f"{task_id}.md"
+        if prompt_path.exists():
+            prompt_path.unlink()
         review_path = resolved / "docs" / "reviews" / f"code-review-{task_id}.md"
         if review_path.exists():
             review_path.unlink()
@@ -510,19 +663,405 @@ def _run_host_skill_for_control_step(step: dict[str, Any], project_root: Path) -
     return None
 
 
+def _host_handoff_path(project_root: Path | str) -> Path:
+    project_dir = resolve_project_root(project_root)
+    path = project_dir / HOST_HANDOFF_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _host_handoff_id(next_step: dict[str, Any], project_root: Path | None = None) -> str:
+    payload_data: dict[str, Any] = dict(next_step)
+    if project_root is not None:
+        skill = str(next_step.get("skill") or "").strip()
+        task_id = str(next_step.get("task_id") or "").strip()
+        request_path: Path | None = None
+        if skill == "code-review" and task_id:
+            request_path = code_review_request_path(project_root, task_id)
+        elif skill == "final-review":
+            request_path = final_review_request_path(project_root)
+        if request_path is not None and request_path.exists():
+            stat = request_path.stat()
+            payload_data["request_path"] = str(request_path)
+            payload_data["request_mtime_ns"] = stat.st_mtime_ns
+    payload = json.dumps(payload_data, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _host_handoff_retry_due(existing: dict[str, Any], handoff_id: str, now: dt.datetime) -> bool:
+    if str(existing.get("handoff_id") or "") != handoff_id:
+        return False
+    if str(existing.get("status") or "") != "waiting_for_host":
+        return False
+    if _nonnegative_int(existing.get("retry_attempts")) >= HOST_HANDOFF_MAX_RETRY_ATTEMPTS:
+        return False
+    updated_at = _parse_iso_datetime(existing.get("updated_at"))
+    if updated_at is None:
+        return True
+    return (now - updated_at).total_seconds() >= HOST_HANDOFF_RETRY_AFTER_SECONDS
+
+
+def _save_host_handoff(project_root: Path, next_step: dict[str, Any]) -> dict[str, Any]:
+    path = _host_handoff_path(project_root)
+    handoff_id = _host_handoff_id(next_step, project_root)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    now_iso = now.isoformat().replace("+00:00", "Z")
+    existing = load_json(path, {})
+    same_waiting_handoff = isinstance(existing, dict) and str(existing.get("handoff_id") or "") == handoff_id and str(existing.get("status") or "") == "waiting_for_host"
+    retry_attempts = _nonnegative_int(existing.get("retry_attempts")) if same_waiting_handoff else 0
+    retry_due = _host_handoff_retry_due(existing, handoff_id, now) if isinstance(existing, dict) else False
+    if retry_due:
+        retry_attempts += 1
+    body: dict[str, Any] = {
+        "schema_version": "1",
+        "handoff_id": handoff_id,
+        "status": "waiting_for_host",
+        "project": str(project_root),
+        "requested_at": str(existing.get("requested_at") or now_iso) if same_waiting_handoff else now_iso,
+        "updated_at": now_iso,
+        "kind": str(next_step.get("kind") or ""),
+        "action": str(next_step.get("action") or ""),
+        "skill": str(next_step.get("skill") or ""),
+        "task_id": str(next_step.get("task_id") or ""),
+        "task_title": str(next_step.get("task_title") or ""),
+        "expected_input_path": str(next_step.get("expected_input_path") or ""),
+        "message": str(next_step.get("message") or ""),
+        "prompt": str(next_step.get("prompt") or ""),
+        "import_command": str(next_step.get("import_command") or ""),
+        "retry_attempts": retry_attempts,
+        "retry_after_seconds": HOST_HANDOFF_RETRY_AFTER_SECONDS,
+        "max_retry_attempts": HOST_HANDOFF_MAX_RETRY_ATTEMPTS,
+        "next_step": next_step,
+    }
+    if same_waiting_handoff and isinstance(existing, dict):
+        for key in ("retry_requested_at", "retry_reason"):
+            if existing.get(key):
+                body[key] = existing[key]
+    if retry_due:
+        body["retry_requested_at"] = now_iso
+        body["retry_reason"] = "host handoff remained waiting_for_host after retry interval"
+    write_json(path, body)
+    return body
+
+
+def _mark_host_handoff_imported(project_root: Path, *, skill: str, task_id: str | None, input_path: Path, exit_code: int) -> None:
+    path = _host_handoff_path(project_root)
+    existing = load_json(path, {})
+    body = dict(existing) if isinstance(existing, dict) else {}
+    body.update(
+        {
+            "schema_version": "1",
+            "status": "imported",
+            "project": str(project_root),
+            "updated_at": utc_now_iso(),
+            "imported_at": utc_now_iso(),
+            "skill": skill,
+            "task_id": str(task_id or body.get("task_id") or ""),
+            "input_path": str(input_path),
+            "import_exit_code": exit_code,
+        }
+    )
+    write_json(path, body)
+
+
+def _mark_host_handoff_notice(project_root: Path, next_step: dict[str, Any]) -> dict[str, Any]:
+    body = {
+        "schema_version": "1",
+        "status": "notice",
+        "project": str(project_root),
+        "updated_at": utc_now_iso(),
+        "kind": str(next_step.get("kind") or ""),
+        "action": str(next_step.get("action") or ""),
+        "skill": "",
+        "task_id": str(next_step.get("task_id") or ""),
+        "expected_input_path": "",
+        "message": str(next_step.get("message") or ""),
+        "prompt": str(next_step.get("prompt") or ""),
+        "import_command": str(next_step.get("import_command") or ""),
+        "next_step": next_step,
+    }
+    write_json(_host_handoff_path(project_root), body)
+    return body
+
+
 def _save_waiting_for_host_step(project_root: Path, next_step: dict[str, Any]) -> None:
+    handoff = _save_host_handoff(project_root, next_step) if _host_step_expects_importable_artifact(next_step) else _mark_host_handoff_notice(project_root, next_step)
+    handoff_status = str(handoff.get("status") or "")
     save_watchdog_state(
         project_root,
         {
             "pid": os.getpid(),
             "project": str(project_root),
-            "status": "waiting_for_host",
+            "status": "waiting_for_host" if handoff_status == "waiting_for_host" else "host_notice",
             "last_action": str(next_step.get("action") or "host_step"),
             "skill": str(next_step.get("skill") or ""),
             "task_id": str(next_step.get("task_id") or ""),
             "expected_input_path": str(next_step.get("expected_input_path") or ""),
+            "host_handoff_id": str(handoff.get("handoff_id") or ""),
+            "host_handoff_retry_attempts": _nonnegative_int(handoff.get("retry_attempts")),
+            **({"host_handoff_retry_requested_at": str(handoff.get("retry_requested_at"))} if handoff.get("retry_requested_at") else {}),
         },
     )
+
+
+def _host_fallback_path(project_root: Path | str) -> Path:
+    project_dir = resolve_project_root(project_root)
+    path = project_dir / HOST_FALLBACK_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _host_fallback_lock_path(project_root: Path | str) -> Path:
+    project_dir = resolve_project_root(project_root)
+    path = project_dir / HOST_FALLBACK_LOCK_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _host_handoff_wait_seconds(handoff: dict[str, Any], now: dt.datetime | None = None) -> int:
+    started_at = _parse_iso_datetime(handoff.get("requested_at")) or _parse_iso_datetime(handoff.get("updated_at"))
+    if started_at is None:
+        return 0
+    current = now or dt.datetime.now(dt.timezone.utc)
+    return max(0, int((current - started_at).total_seconds()))
+
+
+def _host_fallback_attempt_count(state: dict[str, Any], handoff_id: str) -> int:
+    attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
+    try:
+        return max(0, int(attempts.get(handoff_id) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _write_host_fallback_state(project_root: Path, payload: dict[str, Any]) -> None:
+    path = _host_fallback_path(project_root)
+    existing = load_json(path, {})
+    existing_state = dict(existing) if isinstance(existing, dict) else {}
+    attempts = existing_state.get("attempts") if isinstance(existing_state.get("attempts"), dict) else {}
+    payload_handoff_id = str(payload.get("handoff_id") or "").strip()
+    existing_handoff_id = str(existing_state.get("handoff_id") or "").strip()
+    if str(payload.get("status") or "").strip() == "running" or (payload_handoff_id and existing_handoff_id and payload_handoff_id != existing_handoff_id):
+        state = {"attempts": attempts}
+    else:
+        state = existing_state
+    state.update(payload)
+    if str(state.get("status") or "").strip() == "running":
+        state.pop("completed_at", None)
+    state["updated_at"] = utc_now_iso()
+    write_json(path, state)
+
+
+def _record_host_fallback_attempt(project_root: Path, handoff_id: str) -> int:
+    path = _host_fallback_path(project_root)
+    existing = load_json(path, {})
+    state = dict(existing) if isinstance(existing, dict) else {}
+    attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
+    count = _host_fallback_attempt_count(state, handoff_id) + 1
+    attempts[handoff_id] = count
+    state["attempts"] = attempts
+    state["updated_at"] = utc_now_iso()
+    write_json(path, state)
+    return count
+
+
+def _reconcile_host_fallback_lock(project_root: Path) -> dict[str, Any] | None:
+    lock_path = _host_fallback_lock_path(project_root)
+    lock = load_json(lock_path, {})
+    if not isinstance(lock, dict) or str(lock.get("status") or "").strip() != "running":
+        return None
+    try:
+        pid = int(lock.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if process_alive(pid):
+        handoff = load_json(_host_handoff_path(project_root), {})
+        handoff_id = str(lock.get("handoff_id") or "").strip()
+        current_handoff_id = str(handoff.get("handoff_id") or "").strip() if isinstance(handoff, dict) else ""
+        current_status = str(handoff.get("status") or "").strip() if isinstance(handoff, dict) else ""
+        if current_handoff_id == handoff_id and current_status == "imported":
+            payload = {
+                **lock,
+                "status": "completed",
+                "reason": "handoff_imported_while_fallback_process_alive",
+                "completed_at": utc_now_iso(),
+            }
+            _write_host_fallback_state(project_root, payload)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            return payload
+        return lock
+
+    handoff = load_json(_host_handoff_path(project_root), {})
+    handoff_id = str(lock.get("handoff_id") or "").strip()
+    current_handoff_id = str(handoff.get("handoff_id") or "").strip() if isinstance(handoff, dict) else ""
+    current_status = str(handoff.get("status") or "").strip() if isinstance(handoff, dict) else ""
+    if current_handoff_id and current_handoff_id != handoff_id:
+        status = "superseded"
+        reason = "handoff_changed_after_fallback_exit"
+    elif current_status == "imported":
+        status = "completed"
+        reason = "handoff_imported_after_fallback_exit"
+    else:
+        status = "failed"
+        reason = "fallback_process_exited_before_handoff_imported"
+    payload = {
+        **lock,
+        "status": status,
+        "reason": reason,
+        "completed_at": utc_now_iso(),
+    }
+    _write_host_fallback_state(project_root, payload)
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    return payload
+
+
+def _resolve_hermes_bin() -> str | None:
+    for candidate in (
+        os.environ.get("APP_DELIVERY_HERMES_BIN"),
+        os.environ.get("HERMES_BIN"),
+        shutil.which("hermes"),
+        str(Path.home() / ".local" / "bin" / "hermes"),
+    ):
+        if not candidate:
+            continue
+        path = Path(str(candidate)).expanduser()
+        if path.exists() and os.access(path, os.X_OK):
+            return str(path)
+    return None
+
+
+def _host_fallback_prompt(project_root: Path, handoff: dict[str, Any]) -> str:
+    task_id = str(handoff.get("task_id") or "").strip()
+    expected_input = str(handoff.get("expected_input_path") or "").strip()
+    next_step = handoff.get("next_step") if isinstance(handoff.get("next_step"), dict) else {}
+    import_command = str((next_step.get("import_command") if isinstance(next_step, dict) else "") or handoff.get("import_command") or "").strip()
+    return (
+        "Use the app-delivery skill to consume the current host handoff exactly once.\n"
+        f"Project: {project_root}\n"
+        f"Handoff file: {project_root / HOST_HANDOFF_FILE}\n"
+        f"Task id: {task_id}\n"
+        "Requested host skill: code-review\n"
+        f"Expected JSON output: {expected_input}\n"
+        f"Import command: {import_command}\n\n"
+        "Rules:\n"
+        "- Do not edit target-project implementation code.\n"
+        "- Read the code-review request for the task id from .app-delivery-runtime/review-requests/.\n"
+        "- Produce the canonical code-review JSON at the expected output path.\n"
+        "- Run the exact import command after writing the JSON.\n"
+        "- If the import command fails, leave the JSON file in place and report the failure.\n"
+        "- Return only a concise summary of what happened.\n"
+    )
+
+
+def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    handoff_id = str(handoff.get("handoff_id") or "").strip()
+    task_id = str(handoff.get("task_id") or "").strip()
+    hermes_bin = _resolve_hermes_bin()
+    if not hermes_bin:
+        result = {"status": "failed", "reason": "hermes_binary_missing", "handoff_id": handoff_id, "task_id": task_id}
+        _write_host_fallback_state(project_root, result)
+        return result
+
+    lock_path = _host_fallback_lock_path(project_root)
+    _reconcile_host_fallback_lock(project_root)
+    lock = load_json(lock_path, {})
+    if isinstance(lock, dict) and str(lock.get("handoff_id") or "") == handoff_id:
+        try:
+            pid = int(lock.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if process_alive(pid):
+            return {"status": "running", "reason": "existing_fallback_running", "handoff_id": handoff_id, "task_id": task_id, "pid": pid}
+        _write_host_fallback_state(project_root, {"status": "failed", "reason": "previous_fallback_exited_without_clearing_handoff", "handoff_id": handoff_id, "task_id": task_id, "pid": pid})
+
+    fallback_state = load_json(_host_fallback_path(project_root), {})
+    attempts = _host_fallback_attempt_count(fallback_state if isinstance(fallback_state, dict) else {}, handoff_id)
+    max_attempts = _host_fallback_max_attempts(project_root)
+    if attempts >= max_attempts:
+        return {"status": "skipped", "reason": "max_attempts_reached", "handoff_id": handoff_id, "task_id": task_id, "attempts": attempts, "max_attempts": max_attempts}
+
+    logs_dir = project_root / ".app-delivery-runtime" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    started_at = utc_now_iso()
+    safe_handoff_id = handoff_id or hashlib.sha256(json.dumps(handoff, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    stdout_path = logs_dir / f"host-fallback-{safe_handoff_id}.out.log"
+    stderr_path = logs_dir / f"host-fallback-{safe_handoff_id}.err.log"
+    command = [hermes_bin, "--oneshot", _host_fallback_prompt(project_root, handoff), "--skills", "app-delivery"]
+    env = os.environ.copy()
+    env.setdefault("OPC_HOME", str(Path.home() / "opc"))
+    stdout_handle = stdout_path.open("ab")
+    stderr_handle = stderr_path.open("ab")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(project_root),
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=True,
+            env=env,
+        )
+    finally:
+        stdout_handle.close()
+        stderr_handle.close()
+
+    attempt = _record_host_fallback_attempt(project_root, handoff_id)
+    lock_payload = {
+        "schema_version": "1",
+        "status": "running",
+        "handoff_id": handoff_id,
+        "task_id": task_id,
+        "skill": "code-review",
+        "pid": process.pid,
+        "started_at": started_at,
+        "reason": reason,
+        "stdout_log": str(stdout_path),
+        "stderr_log": str(stderr_path),
+        "command": command,
+    }
+    write_json(lock_path, lock_payload)
+    _write_host_fallback_state(project_root, {**lock_payload, "attempt": attempt})
+    return {"status": "started", "handoff_id": handoff_id, "task_id": task_id, "pid": process.pid, "attempt": attempt, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path)}
+
+
+def _maybe_start_code_review_host_fallback(project_root: Path) -> dict[str, Any]:
+    _reconcile_host_fallback_lock(project_root)
+    if not _host_fallback_enabled_for(project_root):
+        return {"status": "skipped", "reason": "host_fallback_disabled"}
+    handoff = load_json(_host_handoff_path(project_root), {})
+    if not isinstance(handoff, dict):
+        return {"status": "skipped", "reason": "host_handoff_missing"}
+    if str(handoff.get("status") or "").strip() != "waiting_for_host":
+        return {"status": "skipped", "reason": "host_handoff_not_waiting", "handoff_status": str(handoff.get("status") or "")}
+    if str(handoff.get("skill") or "").strip() != "code-review":
+        return {"status": "skipped", "reason": "unsupported_host_skill", "skill": str(handoff.get("skill") or "")}
+    task_id = str(handoff.get("task_id") or "").strip()
+    if not task_id:
+        return {"status": "skipped", "reason": "task_id_missing"}
+
+    next_step = handoff.get("next_step") if isinstance(handoff.get("next_step"), dict) else handoff
+    result = _execute_host_control_step_if_ready(next_step, project_root)
+    if result is not None:
+        return {"status": "imported_ready_artifact", "result": result}
+
+    wait_seconds = _host_handoff_wait_seconds(handoff)
+    after_seconds = _host_fallback_after_seconds(project_root)
+    if wait_seconds < after_seconds:
+        return {"status": "skipped", "reason": "not_due", "wait_seconds": wait_seconds, "after_seconds": after_seconds, "task_id": task_id}
+    return _start_code_review_host_fallback(project_root, handoff, reason=f"waiting_for_host exceeded {after_seconds} seconds")
 
 
 def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path) -> dict[str, Any] | None:
@@ -580,6 +1119,7 @@ def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path
     result: dict[str, Any] = {"status": "imported", "skill": skill, "input_path": str(loaded_input_path), "exit_code": exit_code}
     if task_id:
         result["task_id"] = task_id
+    _mark_host_handoff_imported(project_root, skill=skill, task_id=task_id or None, input_path=loaded_input_path, exit_code=exit_code)
     return result
 
 
@@ -624,6 +1164,17 @@ def _execute_framework_control_step(step: dict[str, Any], args: argparse.Namespa
         )
     if action == "run_final_verify":
         return _run_verify_once(project_root, runtime=getattr(args, "runtime", None), mode="all")
+    if action == "recover_stalled":
+        task_id = str(step.get("task_id") or "").strip()
+        if not task_id:
+            raise DeliveryError(code="stalled_recovery_task_missing", message="recover_stalled step is missing task_id", exit_code=2, details={"step": step})
+        return _run_stalled_recovery_once(
+            project_root,
+            task_id=task_id,
+            runtime=getattr(args, "runtime", None),
+            runtime_attention=step,
+            spawn_watchdog_after=False,
+        )
     if action == "auto_repair_exception":
         task_id = str(step.get("task_id") or "").strip()
         if not task_id:
@@ -741,17 +1292,41 @@ def cmd_control(args: argparse.Namespace) -> int:
         snapshot["executed_steps"] = executed_steps
 
     deferred_to_host = any(step.get("deferred_to_host") for step in executed_steps)
-    if control_goal in {"auto", "repair"} and _watchdog_enabled_for(project_root):
+    if deferred_to_host:
+        next_step = snapshot.get("next_step") if isinstance(snapshot.get("next_step"), dict) else {}
+        if _host_step_expects_importable_artifact(next_step):
+            snapshot["host_handoff"] = _save_host_handoff(project_root, next_step)
+        else:
+            snapshot["host_handoff"] = _mark_host_handoff_notice(project_root, next_step)
+            save_watchdog_state(
+                project_root,
+                {
+                    "pid": 0,
+                    "project": str(project_root),
+                    "status": "host_notice",
+                    "last_action": str(next_step.get("action") or "host_notice"),
+                    "task_id": str(next_step.get("task_id") or ""),
+                },
+            )
+    if goal == "auto" and _watchdog_enabled_for(project_root):
         next_step = snapshot.get("next_step") if isinstance(snapshot.get("next_step"), dict) else {}
         if deferred_to_host:
-            _save_waiting_for_host_step(project_root, next_step)
+            if _host_step_expects_importable_artifact(next_step):
+                spawn_watchdog(project_root)
         else:
             control_status = str(snapshot.get("control_status") or "").strip()
             if control_status in {"in_progress", "running"}:
                 spawn_watchdog(project_root)
+    elif goal == "status" and _watchdog_enabled_for(project_root) and _snapshot_needs_watchdog(snapshot):
+        snapshot["watchdog_pid"] = spawn_watchdog(project_root)
 
     print(json.dumps(snapshot, indent=2, ensure_ascii=False))
-    if goal in {"auto", "step"} and deferred_to_host:
+    if goal == "step" and deferred_to_host:
+        return 1
+    if goal == "auto" and deferred_to_host:
+        next_step = snapshot.get("next_step") if isinstance(snapshot.get("next_step"), dict) else {}
+        if _watchdog_enabled_for(project_root) and _host_step_expects_importable_artifact(next_step):
+            return 0
         return 1
     return 0 if str(snapshot.get("control_status") or "") not in {"blocked"} else 1
 
@@ -861,6 +1436,7 @@ def cmd_task(args: argparse.Namespace) -> int:
                     exit_code=2,
                     details={"task_id": task_id, "status": task.status, "task_kind": task.task_kind},
                 )
+            _guard_final_repair_limit_not_reopened(project_root, task)
             tasks = reset_task(tasks, task_id, blocked_reason=f"manual repair reset: {reason}")
             save_tasks(project_root, tasks)
             save_task_runtime_state(
@@ -897,7 +1473,10 @@ def cmd_code_review(args: argparse.Namespace) -> int:
         payload, input_path = load_stage_payload(project_root, "code-review", args.input, expected_type=dict)
         assert isinstance(payload, dict)
         import_exit_code = import_task_review(project_root, args.task_id, payload, input_path)
+        _mark_host_handoff_imported(project_root, skill="code-review", task_id=args.task_id, input_path=input_path, exit_code=import_exit_code)
         _refresh_project_summary_best_effort(project_root)
+    if _watchdog_enabled_for(project_root):
+        spawn_watchdog(project_root)
     print(json.dumps({"status": "imported", "stage": "code-review", "task_id": args.task_id, "input_path": str(input_path), "import_exit_code": import_exit_code}, indent=2, ensure_ascii=False))
     return 0
 
@@ -908,6 +1487,9 @@ def cmd_final_review(args: argparse.Namespace) -> int:
         payload, input_path = load_stage_payload(project_root, "final-review", args.input, expected_type=dict)
         assert isinstance(payload, dict)
         import_exit_code = import_final_review(project_root, payload, input_path)
+        _mark_host_handoff_imported(project_root, skill="final-review", task_id="T-FINAL", input_path=input_path, exit_code=import_exit_code)
+    if _watchdog_enabled_for(project_root):
+        spawn_watchdog(project_root)
     print(json.dumps({"status": "imported", "stage": "final-review", "input_path": str(input_path), "import_exit_code": import_exit_code}, indent=2, ensure_ascii=False))
     return 0
 
@@ -1094,8 +1676,42 @@ def cmd_watchdog_run(args: argparse.Namespace) -> int:
             next_step = payload.get("next_step") if isinstance(payload.get("next_step"), dict) else {}
             owner = str(next_step.get("owner") or "framework").strip()
             if owner == "host":
+                if not _host_step_expects_importable_artifact(next_step):
+                    _save_waiting_for_host_step(project_root, next_step)
+                    return 0
+                result = _execute_host_control_step_if_ready(next_step, project_root)
+                if result is not None:
+                    save_watchdog_state(
+                        project_root,
+                        {
+                            "pid": os.getpid(),
+                            "project": str(project_root),
+                            "status": "running",
+                            "last_action": "host_artifact_imported",
+                            "skill": str(next_step.get("skill") or ""),
+                            "task_id": str(next_step.get("task_id") or ""),
+                            "input_path": str(result.get("input_path") or ""),
+                            "import_exit_code": result.get("exit_code"),
+                        },
+                    )
+                    continue
                 _save_waiting_for_host_step(project_root, next_step)
-                return 0
+                fallback_result = _maybe_start_code_review_host_fallback(project_root) if _host_step_expects_importable_artifact(next_step) else {"status": "skipped", "reason": "host_notice_without_import_artifact"}
+                if str(fallback_result.get("status") or "") in {"started", "running", "failed", "imported_ready_artifact"}:
+                    save_watchdog_state(
+                        project_root,
+                        {
+                            "pid": os.getpid(),
+                            "project": str(project_root),
+                            "status": "waiting_for_host",
+                            "last_action": "host_fallback",
+                            "skill": str(next_step.get("skill") or ""),
+                            "task_id": str(next_step.get("task_id") or ""),
+                            "host_fallback": fallback_result,
+                        },
+                    )
+                time.sleep(interval_seconds)
+                continue
             save_watchdog_state(project_root, {"pid": os.getpid(), "project": str(project_root), "status": "running", "last_action": "resume"})
             cmd_control(
                 argparse.Namespace(
@@ -1115,6 +1731,47 @@ def cmd_watchdog_run(args: argparse.Namespace) -> int:
 
 
 def cmd_fix(args: argparse.Namespace) -> int:
+    if getattr(args, "background", False) and getattr(args, "no_start", False):
+        raise DeliveryError(
+            code="fix_mode_invalid",
+            message="--background cannot be combined with --no-start/--no-run",
+            exit_code=2,
+            details={"task_id": args.task_id},
+        )
+    if getattr(args, "background", False):
+        _run_fix_once(
+            args.project,
+            task_id=args.task_id,
+            runtime=getattr(args, "runtime", None),
+            no_start=True,
+            spawn_watchdog_after=False,
+        )
+        project_root = resolve_project_root(args.project)
+        command = [sys.executable, "-m", "delivery", "control", "--goal", "auto", "--project", str(project_root)]
+        if getattr(args, "runtime", None):
+            command.extend(["--runtime", str(args.runtime)])
+        process = subprocess.Popen(
+            command,
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "background_started",
+                    "project": str(project_root),
+                    "task_id": str(args.task_id),
+                    "pid": process.pid,
+                    "command": command,
+                    "status_command": f"app-delivery control --goal status --project {project_root}",
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
     result = _run_fix_once(
         args.project,
         task_id=args.task_id,
@@ -1137,6 +1794,13 @@ def cmd_fix(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
+
+
+def cmd_host_fallback(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root(args.project)
+    result = _maybe_start_code_review_host_fallback(project_root)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if str(result.get("status") or "") in {"started", "running", "skipped", "imported_ready_artifact"} else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1218,6 +1882,10 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--project", required=True)
     summary.set_defaults(func=cmd_summary)
 
+    claim = subparsers.add_parser("claim")
+    claim.add_argument("--project", required=True)
+    claim.set_defaults(func=cmd_claim)
+
     control = subparsers.add_parser("control")
     control.add_argument("--project", required=True)
     control.add_argument("--goal", choices=["auto", "status", "pause", "repair", "step"], default="auto")
@@ -1255,7 +1923,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_project.add_argument("--stack", default="python-react")
     init_project.add_argument("--framework-root")
     init_project.add_argument("--force", action="store_true")
-    init_project.add_argument("--watchdog", action=argparse.BooleanOptionalAction, default=False)
+    init_project.add_argument("--watchdog", action=argparse.BooleanOptionalAction, default=True)
     init_project.set_defaults(func=cmd_init_project)
 
     pause = subparsers.add_parser("pause")
@@ -1273,6 +1941,8 @@ def build_parser() -> argparse.ArgumentParser:
     fix.add_argument("--task-id", required=True)
     fix.add_argument("--runtime")
     fix.add_argument("--no-start", action="store_true")
+    fix.add_argument("--no-run", dest="no_start", action="store_true")
+    fix.add_argument("--background", action="store_true")
     fix.set_defaults(func=cmd_fix)
 
     status = subparsers.add_parser("status")
@@ -1283,6 +1953,10 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog_run.add_argument("--project", required=True)
     watchdog_run.add_argument("--interval-seconds", type=int, default=30)
     watchdog_run.set_defaults(func=cmd_watchdog_run)
+
+    host_fallback = subparsers.add_parser("host-fallback")
+    host_fallback.add_argument("--project", required=True)
+    host_fallback.set_defaults(func=cmd_host_fallback)
 
     return parser
 

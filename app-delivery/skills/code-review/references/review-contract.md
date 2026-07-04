@@ -11,6 +11,7 @@ Verdict rules:
 Assessment rules:
 - For every declared requirement, include exactly one `requirement_assessment` row with `id`, `status`, and `notes`.
 - For every declared acceptance scenario, include exactly one `acceptance_assessment` row with `id`, `status`, and `notes`.
+- For large repair bundles, you may use `requirement_assessment_mode="pass_all_except"` with `requirement_assessment_defaults={"notes":"..."}` and list only non-passing requirement rows; the framework expands missing declared IDs to pass. Use the same `acceptance_assessment_mode="pass_all_except"` pattern for large acceptance sets.
 - Use empty arrays when no rows exist.
 - Use task intent only for purpose, `done_when`, and `non_goals`; ID assessments stay tied to declared requirement and acceptance IDs.
 - If task intent is present, include `intent_assessment`. Missing `done_when` items or violated `non_goals` require `changes_requested`.

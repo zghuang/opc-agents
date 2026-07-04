@@ -280,7 +280,7 @@ def initialize_project(
     stack: str = "python-react",
     force: bool = False,
     framework_root: Path | str | None = None,
-    watchdog_enabled: bool = False,
+    watchdog_enabled: bool = True,
 ) -> dict[str, Any]:
     normalized_runtime = runtime_command_name(runtime)
     normalized_stack = str(stack or "python-react").strip().lower()
@@ -316,6 +316,9 @@ def initialize_project(
         "stack": normalized_stack,
         "mock_server": "embedded",
         "watchdog_enabled": bool(watchdog_enabled),
+        "host_fallback_enabled": bool(watchdog_enabled),
+        "host_fallback_after_seconds": 600,
+        "host_fallback_max_attempts": 1,
         "created_at": utc_now_iso(),
         "dependency_hints": [],
     }
