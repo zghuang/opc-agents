@@ -32,6 +32,7 @@ Intent rules:
 - `done_when` should contain two to four concrete completion signals that help runtime and review understand what done means.
 - `non_goals` is optional. Use it only when the task is likely to overlap neighboring tasks or invite scope creep.
 - Intent must be grounded in the same requirements and acceptance scenarios as the task. Do not add new product scope through intent.
+- Use `docs/requirements-source.md` only as supporting evidence when `requirements.json` lacks enough detail to decide task boundaries, acceptance ownership, technology ownership, or workflow sequencing. Do not create, rename, merge, split, or reinterpret canonical requirement IDs from the raw source.
 - If two generated tasks have nearly identical objectives or journeys, merge them, clarify their boundaries, or add an explicit dependency so they do not duplicate work.
 - The size checks apply only to non-built-in delivery tasks. Framework-inserted scaffold, shared foundation, audit, final, and production-gate tasks are not part of this limit.
 - If a task has more than 12 requirements, more than 5 acceptance scenarios, or more than 8 output tests, and two or more of those are true, reassess the boundary. Decide whether it is one coherent independently testable capability or should be split into vertical slices. Record the decision in `intent.split_justification`.

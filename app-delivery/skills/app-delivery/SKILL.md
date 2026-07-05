@@ -17,6 +17,8 @@ Rules:
 - On Hermes, `app-delivery control --goal auto ...` and `app-delivery control --goal repair ...` are long-running bounded commands. Launch them with Hermes-managed background execution: `terminal(command="...", background=true, notify_on_complete=true)`. Do not run them as foreground terminal calls, and do not use shell-level backgrounding such as `&`, `nohup`, `disown`, or `setsid`.
 - On Hermes, after launching a managed background `control --goal auto ...` or repair command, report that the delivery run is hosted in the background and wait for the completion notification. When the notification arrives, run status-only inspection, then continue any required host/framework step from the reported `next_step`.
 - Outside Hermes, the bash snippets below are plain CLI commands. Use the equivalent managed-background/notify primitive if the host platform has one; otherwise run status polling explicitly.
+- When enabled, the project watchdog is project-scoped and may run detached from Hermes; closing Hermes is not a watchdog stop operation.
+- To stop automatic continuation, use `control --goal pause --project {project}`. For explicit immediate termination, only target processes whose command line contains the exact project path and `watchdog-run`, `oc-exec.py`, or that project's active runtime.
 - If a planning host skill returns a contract-style failure such as `stage_output_invalid` or `work_items_contract_invalid`, rerun the exact requested host skill once with the reported contract errors fed back into the prompt, then rerun `app-delivery control --goal auto`. Do not retry the same failing planning artifact more than once unless the artifact changed.
 - When `control --goal auto` returns `must_continue=true` with `next_step.owner=host`, execute that host step immediately instead of only reporting it. Then rerun `app-delivery control --goal auto` and continue the same loop until the framework no longer requires immediate continuation or a real blocking condition occurs.
 - Host-owned steps are also persisted in `{project}/.app-delivery-runtime/host-handoff.json` for visibility. Treat `status="waiting_for_host"` as an outstanding host action. If `expected_input_path` already exists, do not wait for the host again; immediately run the provided `import_command` or rerun `app-delivery control --goal auto` so the framework imports it. If the same handoff later has `retry_attempts > 0` / `retry_requested_at`, run the indicated host skill again using the current request artifact and overwrite any stale input. A host executor can mark it `running` when work starts, and the core marks it `imported` when the artifact is imported.
@@ -48,6 +50,16 @@ Pause:
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery control --goal pause --project {project}
 ```
+
+Immediate operator stop, only when explicitly requested:
+
+```bash
+project="{project}"
+pkill -TERM -f "watchdog-run --project ${project}"
+pkill -TERM -f "oc-exec.py --project-root ${project}"
+```
+
+Use this only for the exact project path; do not use broad `app-delivery`, runtime, or project-name-only patterns.
 
 Explicit repair of a task or final-verify-routed repair target, command string:
 

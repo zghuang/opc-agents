@@ -27,6 +27,7 @@ Procedure:
 	- if merging two tasks would create a broad, unfocused implementation session, keep them separate; if splitting a task would scatter one feature across many handoff points, keep it together
 	- if one task combines multiple independently testable capability surfaces, split by workflow, sub-capability, or bounded context unless `intent.split_justification` explains why it is one coherent vertical slice
 	- each `done_when` item should be covered by task-owned `output_tests` or an explicit validation task dependency; if coverage is partial, refine the boundary or add focused tests before import
+	- use `docs/requirements-source.md` only as supporting evidence when canonical requirements do not provide enough detail to assign task boundaries, acceptance ownership, technology ownership, or dependency order; do not create or reinterpret canonical requirement IDs from the raw source
 5. Produce a JSON object with all of these top-level fields:
 	- `items`: the work-item draft array
 	- `delivery_complexity`: a coarse project classification (`S`, `M`, `L`, or `XL`) with short rationale and rough signals

@@ -28,6 +28,9 @@ def test_task_decompose_prompt_flags_mixed_capability_surfaces() -> None:
     assert "multiple independently testable capability surfaces" in prompt
     assert "Coherence is semantic" in prompt
     assert "Every `done_when` item should map to task-owned `output_tests`" in prompt
+    assert "docs/requirements-source.md" in prompt
+    assert "supporting evidence" in prompt
+    assert "Do not create, rename, merge, split, or reinterpret canonical requirement IDs" in prompt
     assert "ingestion + normalization" not in prompt
     assert "numeric limits" not in prompt
 
