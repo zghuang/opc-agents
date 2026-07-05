@@ -25,7 +25,7 @@ STATIC_RESPONSE_NAME_PATTERN = re.compile(r"\b(STUB|DEFAULT|DEMO|MOCK|SAMPLE)[A-
 SYNTHETIC_DATA_NAME_PATTERN = re.compile(r"(?:^|_)(?:default|demo|mock|sample|fake|synthetic|fixture)(?:_|$)", re.IGNORECASE)
 SERVICE_BACKED_PATTERN = re.compile(r"\b(await|session|db|repository|repo|service|client|gateway|producer|consumer|query|execute|fetch|select|commit|rollback)\b|\b(?:store|manager|registry|provider)\.[A-Za-z_]", re.IGNORECASE)
 FASTAPI_ROUTE_PATTERN = re.compile(r"@router\.(get|post|put|patch|delete)\(")
-AUTH_DEPENDENCY_PATTERN = re.compile(r"Depends\((?:[A-Za-z_][A-Za-z0-9_]*\.)?(?:require_[A-Za-z0-9_]*|get_current_user|get_authenticated_user|get_user|current_user|auth[A-Za-z0-9_]*|require_role|require_permission)")
+AUTH_DEPENDENCY_PATTERN = re.compile(r"(?:Depends|Security)\((?:[A-Za-z_][A-Za-z0-9_]*\.)?(?:require_[A-Za-z0-9_]*|get_current_user|get_authenticated_user|get_user|current_user|auth[A-Za-z0-9_]*|require_role|require_permission)")
 PAGE_ROUTE_PATTERN = re.compile(r"\bpage\.route\s*\(")
 ROUTE_DECORATOR_METHODS = {"get", "post", "put", "patch", "delete"}
 NON_PRODUCTION_BACKEND_PARTS = {"__tests__", "fixtures", "mock", "mocks", "test", "tests"}
@@ -369,15 +369,190 @@ def _scan_static_route_responses(project_dir: Path) -> list[SemanticFinding]:
     return findings[:20]
 
 
-def _auth_dependency_in_ast(node: ast.AST, text: str) -> bool:
-    return AUTH_DEPENDENCY_PATTERN.search(ast.get_source_segment(text, node) or "") is not None
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
 
 
-def _call_has_auth_dependency(call: ast.Call, text: str) -> bool:
-    for keyword in call.keywords:
-        if keyword.arg == "dependencies" and _auth_dependency_in_ast(keyword.value, text):
+def _is_depends_or_security_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _call_name(node.func).split(".")[-1] in {"Depends", "Security"}
+
+
+def _dependency_callable_exprs(node: ast.AST) -> list[ast.AST]:
+    result: list[ast.AST] = []
+    for child in ast.walk(node):
+        if not _is_depends_or_security_call(child):
+            continue
+        assert isinstance(child, ast.Call)
+        if child.args:
+            result.append(child.args[0])
+    return result
+
+
+def _module_path_from_name(project_dir: Path, module_name: str) -> Path | None:
+    normalized = str(module_name or "").strip()
+    if not normalized:
+        return None
+    parts = normalized.split(".")
+    candidates: list[Path] = []
+    backend_dir = project_dir / "backend"
+    if parts[0] == "app":
+        suffix = parts[1:]
+        candidates.extend(
+            [
+                backend_dir / "app" / Path(*suffix).with_suffix(".py") if suffix else backend_dir / "app.py",
+                backend_dir / "app" / Path(*suffix) / "__init__.py" if suffix else backend_dir / "app" / "__init__.py",
+            ]
+        )
+    candidates.extend(
+        [
+            backend_dir / Path(*parts).with_suffix(".py"),
+            backend_dir / Path(*parts) / "__init__.py",
+            backend_dir / "src" / Path(*parts).with_suffix(".py"),
+            backend_dir / "src" / Path(*parts) / "__init__.py",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _function_defs(tree: ast.AST) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    return {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _status_code_is_auth_failure(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return node.value in {401, 403}
+    if isinstance(node, ast.Attribute):
+        return node.attr in {"HTTP_401_UNAUTHORIZED", "HTTP_403_FORBIDDEN"}
+    if isinstance(node, ast.Name):
+        return node.id in {"HTTP_401_UNAUTHORIZED", "HTTP_403_FORBIDDEN"}
+    return False
+
+
+def _function_raises_auth_failure(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call) or _call_name(node.func).split(".")[-1] != "HTTPException":
+            continue
+        if node.args and _status_code_is_auth_failure(node.args[0]):
+            return True
+        if any(keyword.arg == "status_code" and _status_code_is_auth_failure(keyword.value) for keyword in node.keywords):
             return True
     return False
+
+
+def _function_uses_fastapi_security(fn: ast.FunctionDef | ast.AsyncFunctionDef, text: str) -> bool:
+    source = ast.get_source_segment(text, fn) or ""
+    markers = (
+        "Security(",
+        "HTTPBearer",
+        "HTTPAuthorizationCredentials",
+        "APIKeyHeader",
+        "APIKeyCookie",
+        "OAuth2PasswordBearer",
+        "Authorization",
+        "credentials",
+        "token",
+        "api_key",
+        "permission",
+        "scope",
+        "role",
+    )
+    return any(marker in source for marker in markers)
+
+
+def _load_module_ast(path: Path) -> tuple[str, ast.AST] | None:
+    text = _read(path)
+    try:
+        return text, ast.parse(text)
+    except SyntaxError:
+        return None
+
+
+def _semantic_auth_function(text: str, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    return _function_raises_auth_failure(fn) and _function_uses_fastapi_security(fn, text)
+
+
+def _dependency_expr_is_auth(
+    expr: ast.AST,
+    *,
+    project_dir: Path,
+    current_path: Path,
+    current_text: str,
+    current_tree: ast.AST,
+    aliases: dict[str, str],
+) -> bool:
+    source = ast.get_source_segment(current_text, expr) or ""
+    if AUTH_DEPENDENCY_PATTERN.search(f"Depends({source})"):
+        return True
+    name = _call_name(expr)
+    if not name:
+        return False
+    local_name = name.split(".")[-1]
+    current_defs = _function_defs(current_tree)
+    if local_name in current_defs and _semantic_auth_function(current_text, current_defs[local_name]):
+        return True
+
+    module_name = ""
+    function_name = local_name
+    if isinstance(expr, ast.Name):
+        imported = aliases.get(expr.id, "")
+        if "." in imported:
+            module_name, function_name = imported.rsplit(".", 1)
+    elif isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+        imported = aliases.get(expr.value.id, expr.value.id)
+        module_name = imported
+        function_name = expr.attr
+    if not module_name:
+        return False
+    module_path = _module_path_from_name(project_dir, module_name)
+    if module_path is None:
+        return False
+    loaded = _load_module_ast(module_path)
+    if loaded is None:
+        return False
+    module_text, module_tree = loaded
+    target = _function_defs(module_tree).get(function_name)
+    return target is not None and _semantic_auth_function(module_text, target)
+
+
+def _auth_dependency_in_ast(node: ast.AST, *, project_dir: Path, current_path: Path, text: str, tree: ast.AST, aliases: dict[str, str]) -> bool:
+    return any(
+        _dependency_expr_is_auth(
+            expr,
+            project_dir=project_dir,
+            current_path=current_path,
+            current_text=text,
+            current_tree=tree,
+            aliases=aliases,
+        )
+        for expr in _dependency_callable_exprs(node)
+    )
+
+
+def _call_has_auth_dependency(call: ast.Call, *, project_dir: Path, current_path: Path, text: str, tree: ast.AST, aliases: dict[str, str]) -> bool:
+    for keyword in call.keywords:
+        if keyword.arg == "dependencies" and _auth_dependency_in_ast(keyword.value, project_dir=project_dir, current_path=current_path, text=text, tree=tree, aliases=aliases):
+            return True
+    return False
+
+
+def _route_function_has_auth_dependency(fn: ast.FunctionDef | ast.AsyncFunctionDef, *, project_dir: Path, current_path: Path, text: str, tree: ast.AST, aliases: dict[str, str]) -> bool:
+    defaults = [*fn.args.defaults, *[value for value in fn.args.kw_defaults if value is not None]]
+    return any(
+        _auth_dependency_in_ast(default, project_dir=project_dir, current_path=current_path, text=text, tree=tree, aliases=aliases)
+        for default in defaults
+    )
 
 
 def _module_name_for_path(project_dir: Path, path: Path) -> str | None:
@@ -454,7 +629,7 @@ def _app_level_secured_route_modules(project_dir: Path) -> set[str]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "include_router":
                 continue
-            if not node.args or not _call_has_auth_dependency(node, text):
+            if not node.args or not _call_has_auth_dependency(node, project_dir=project_dir, current_path=path, text=text, tree=tree, aliases=aliases):
                 continue
             module_name = _router_expr_module(node.args[0], aliases)
             if module_name and module_name in module_to_rel:
@@ -474,8 +649,9 @@ def _app_has_global_auth_dependency(project_dir: Path) -> bool:
             tree = ast.parse(text)
         except SyntaxError:
             continue
+        aliases = _import_aliases(tree)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "FastAPI" and _call_has_auth_dependency(node, text):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "FastAPI" and _call_has_auth_dependency(node, project_dir=project_dir, current_path=path, text=text, tree=tree, aliases=aliases):
                 return True
     return False
 
@@ -496,14 +672,26 @@ def _scan_missing_route_auth(project_dir: Path) -> list[SemanticFinding]:
                 continue
             if rel in app_secured_routes:
                 continue
-            if AUTH_DEPENDENCY_PATTERN.search(text):
-                continue
             try:
                 tree = ast.parse(text)
             except SyntaxError:
                 tree = None
-            if tree is not None and any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "APIRouter" and _call_has_auth_dependency(node, text) for node in ast.walk(tree)):
-                continue
+            if tree is not None:
+                aliases = _import_aliases(tree)
+                if any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "APIRouter"
+                    and _call_has_auth_dependency(node, project_dir=project_dir, current_path=path, text=text, tree=tree, aliases=aliases)
+                    for node in ast.walk(tree)
+                ):
+                    continue
+                route_functions = [node for node in ast.walk(tree) if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and _route_path(node) is not None]
+                if route_functions and all(
+                    _route_function_has_auth_dependency(fn, project_dir=project_dir, current_path=path, text=text, tree=tree, aliases=aliases)
+                    for fn in route_functions
+                ):
+                    continue
             findings.append(
                 SemanticFinding(
                     category="security-access-control",

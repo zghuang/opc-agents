@@ -911,3 +911,17 @@ def test_project_execution_guard_prunes_dead_pid_lock(tmp_path: Path, monkeypatc
     assert removed is True
     assert not lock_path.exists()
 
+def test_project_execution_guard_prunes_dead_pid_lock_before_zero_timeout_busy_check(tmp_path: Path, monkeypatch) -> None:
+    lock_dir = tmp_path / ".app-delivery-runtime" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "execution.lock"
+    lock_path.write_text('{"pid":999999,"heartbeat_at":"2026-06-24T00:00:00Z"}\n', encoding="utf-8")
+
+    monkeypatch.setenv("APP_DELIVERY_EXECUTION_LOCK_TIMEOUT_SECONDS", "0")
+    monkeypatch.setattr(cli, "_pid_is_running", lambda pid: False if pid == 999999 else True)
+
+    with cli._project_execution_guard(tmp_path, already_locked=False):
+        metadata = cli.read_lock_metadata(lock_path)
+
+    assert metadata["pid"] == os.getpid()
+

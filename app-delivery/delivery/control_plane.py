@@ -571,12 +571,33 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
             "Stop only if that deterministic action fails or requires a genuine human decision."
         )
 
+    waiting_for: dict[str, Any] | None = None
+    blocking_condition: dict[str, Any] | None = None
+    if not must_continue:
+        if control_status == "running" and isinstance(base.get("active_task"), dict):
+            active = base["active_task"]
+            task_id = str(active.get("id") or "").strip()
+            phase = str(active.get("phase") or "implementation").strip() or "implementation"
+            waiting_for = {
+                "kind": "active_task_completion",
+                "task_id": task_id or None,
+                "phase": phase,
+                "message": f"Waiting for active task {task_id or '<unknown>'} completion.",
+            }
+        elif control_status == "blocked" and next_step is None:
+            blocking_condition = {
+                "kind": "no_routable_next_step",
+                "message": "No deterministic framework or host next_step is currently routable from this state.",
+            }
+
     return {
         **base,
         "control_status": control_status,
         "delivery_claim_allowed": delivery_claim_allowed,
         "next_step": next_step,
         "must_continue": must_continue,
+        "waiting_for": waiting_for,
+        "blocking_condition": blocking_condition,
         "continue_instruction": continue_instruction,
         "planning_blocker_code": blocker_code,
         "requirements_path": str(archived_requirements) if archived_requirements is not None else None,

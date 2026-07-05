@@ -12,6 +12,26 @@ from delivery.task import _validate_task_shape
 from delivery.gates import normalize_complexity_override, normalize_stage_gates, refresh_gates, validate_validation_tasks, validate_gate_references
 
 
+def test_task_decompose_prompt_flags_mixed_capability_surfaces() -> None:
+    from delivery.skill_prompts import render_skill_prompt
+
+    prompt = render_skill_prompt(
+        "decompose.md",
+        requirements_json="{}",
+        architecture_md="",
+        shared_components_md="",
+        architecture_meta_json="{}",
+        test_plan_json="{}",
+        clarification_answers_md="",
+    )
+
+    assert "multiple independently testable capability surfaces" in prompt
+    assert "Coherence is semantic" in prompt
+    assert "Every `done_when` item should map to task-owned `output_tests`" in prompt
+    assert "ingestion + normalization" not in prompt
+    assert "numeric limits" not in prompt
+
+
 def test_decompose_tasks_inserts_builtin_foundations(tmp_path: Path) -> None:
     payload = decompose_tasks(
         tmp_path,

@@ -35,6 +35,8 @@ Intent rules:
 - If two generated tasks have nearly identical objectives or journeys, merge them, clarify their boundaries, or add an explicit dependency so they do not duplicate work.
 - The size checks apply only to non-built-in delivery tasks. Framework-inserted scaffold, shared foundation, audit, final, and production-gate tasks are not part of this limit.
 - If a task has more than 12 requirements, more than 5 acceptance scenarios, or more than 8 output tests, and two or more of those are true, reassess the boundary. Decide whether it is one coherent independently testable capability or should be split into vertical slices. Record the decision in `intent.split_justification`.
+- Reassess task boundaries when a task mixes multiple independently testable capability surfaces. Split by workflow, sub-capability, or bounded context unless the task is a single coherent vertical slice and `intent.split_justification` explains why.
+- Every `done_when` item should map to task-owned `output_tests` or an explicit validation task dependency. If coverage is partial, refine the task boundary or add focused tests.
 - If the graph has more than 20 non-built-in delivery tasks, reassess whether the count is appropriate for the project size and module boundaries. Keep tasks separate when each is a coherent independently testable slice; merge only when the merged task remains focused. Record the decision in `intent.split_justification` for intentionally retained count-heavy boundaries.
 
 `technology_constraints` must use this shape on every task. Use an empty array only when no project technology choice is specifically owned or required by that task:
@@ -68,6 +70,7 @@ Constraints:
 - Prefer complete user-visible slices over layer-by-layer tasks.
 - Decompose from overall product capability into executable vertical slices.
 - Choose the smallest coherent task that still delivers a meaningful product capability.
+- Coherence is semantic: a task should not combine independent lifecycle phases, subsystems, or workflows that can be implemented and reviewed separately unless that combination is required for a usable vertical slice.
 - Assign each explicit project-wide technology choice from requirements, architecture, or project technology constraints to at least one owning task through `technology_constraints`.
 - A task may cross backend, frontend, mock-server, tests, and shared components when that is the smallest coherent slice.
 - Avoid horizontal or layer-only tasks such as "all DB models" or "all frontend pages".

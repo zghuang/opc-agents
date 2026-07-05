@@ -187,6 +187,7 @@ def _project_execution_guard(project_root: Path, *, already_locked: bool) -> Any
         timeout = float(os.environ.get("APP_DELIVERY_EXECUTION_LOCK_TIMEOUT_SECONDS") or EXECUTION_LOCK_TIMEOUT_SECONDS)
     except ValueError:
         timeout = EXECUTION_LOCK_TIMEOUT_SECONDS
+    _prune_stale_execution_lock(project_root)
     if timeout <= 0 and read_lock_metadata(lock_path):
         raise DeliveryError(
             code="project_busy",
@@ -195,7 +196,6 @@ def _project_execution_guard(project_root: Path, *, already_locked: bool) -> Any
             details={"project": str(project_root), "lock_path": str(lock_path), "lock_owner": read_lock_metadata(lock_path)},
             suggested_action="Wait for the active app-delivery run to finish, or stop the other process before retrying.",
         )
-    _prune_stale_execution_lock(project_root)
     try:
         with acquire_lock(project_root, name="execution", timeout=max(0.0, timeout)):
             yield lock_path
@@ -751,6 +751,10 @@ def _save_host_handoff(project_root: Path, next_step: dict[str, Any]) -> dict[st
     return body
 
 
+def _review_import_outcome(exit_code: int) -> str:
+    return "accepted_pass" if exit_code == 0 else "accepted_changes_requested"
+
+
 def _mark_host_handoff_imported(project_root: Path, *, skill: str, task_id: str | None, input_path: Path, exit_code: int) -> None:
     path = _host_handoff_path(project_root)
     existing = load_json(path, {})
@@ -766,6 +770,7 @@ def _mark_host_handoff_imported(project_root: Path, *, skill: str, task_id: str 
             "task_id": str(task_id or body.get("task_id") or ""),
             "input_path": str(input_path),
             "import_exit_code": exit_code,
+            "import_outcome": _review_import_outcome(exit_code) if skill in {"code-review", "final-review"} else ("imported" if exit_code == 0 else "imported_nonzero"),
         }
     )
     write_json(path, body)
@@ -1117,6 +1122,8 @@ def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path
         return None
 
     result: dict[str, Any] = {"status": "imported", "skill": skill, "input_path": str(loaded_input_path), "exit_code": exit_code}
+    if skill in {"code-review", "final-review"}:
+        result["import_outcome"] = _review_import_outcome(exit_code)
     if task_id:
         result["task_id"] = task_id
     _mark_host_handoff_imported(project_root, skill=skill, task_id=task_id or None, input_path=loaded_input_path, exit_code=exit_code)
@@ -1477,7 +1484,7 @@ def cmd_code_review(args: argparse.Namespace) -> int:
         _refresh_project_summary_best_effort(project_root)
     if _watchdog_enabled_for(project_root):
         spawn_watchdog(project_root)
-    print(json.dumps({"status": "imported", "stage": "code-review", "task_id": args.task_id, "input_path": str(input_path), "import_exit_code": import_exit_code}, indent=2, ensure_ascii=False))
+    print(json.dumps({"status": "imported", "stage": "code-review", "task_id": args.task_id, "input_path": str(input_path), "import_exit_code": import_exit_code, "import_outcome": _review_import_outcome(import_exit_code)}, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -1490,7 +1497,7 @@ def cmd_final_review(args: argparse.Namespace) -> int:
         _mark_host_handoff_imported(project_root, skill="final-review", task_id="T-FINAL", input_path=input_path, exit_code=import_exit_code)
     if _watchdog_enabled_for(project_root):
         spawn_watchdog(project_root)
-    print(json.dumps({"status": "imported", "stage": "final-review", "input_path": str(input_path), "import_exit_code": import_exit_code}, indent=2, ensure_ascii=False))
+    print(json.dumps({"status": "imported", "stage": "final-review", "input_path": str(input_path), "import_exit_code": import_exit_code, "import_outcome": _review_import_outcome(import_exit_code)}, indent=2, ensure_ascii=False))
     return 0
 
 

@@ -654,7 +654,7 @@ def test_cmd_code_review_rejects_prefinal_audit_pass_when_report_declares_blocke
     assert payload["items"][0]["review_status"] == "changes_requested"
     assert "T-FINAL should not proceed" in payload["items"][0]["blocked_reason"]
 
-def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp_path: Path, monkeypatch) -> None:
+def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     save_work_items(
         tmp_path,
         {
@@ -709,6 +709,9 @@ def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp
     result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id=FRONTEND_API_AUDIT_TASK_ID, input=str(input_path)))
 
     assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["import_exit_code"] == 2
+    assert output["import_outcome"] == "accepted_changes_requested"
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     assert payload["items"][0]["status"] == "pending"
     assert payload["items"][0]["review_status"] == "changes_requested"
@@ -719,6 +722,7 @@ def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp
     assert handoff["skill"] == "code-review"
     assert handoff["task_id"] == FRONTEND_API_AUDIT_TASK_ID
     assert handoff["import_exit_code"] == 2
+    assert handoff["import_outcome"] == "accepted_changes_requested"
 
 def test_cmd_code_review_rejects_frontend_api_audit_pass_when_stubs_are_nonblocking(tmp_path: Path, monkeypatch) -> None:
     report_path = tmp_path / FRONTEND_API_AUDIT_REPORT_PATH
@@ -891,6 +895,7 @@ def test_cmd_final_review_import_changes_requested_creates_repair_bundle(tmp_pat
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "imported"
     assert output["import_exit_code"] == 2
+    assert output["import_outcome"] == "accepted_changes_requested"
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     by_id = {item["id"]: item for item in payload["items"]}
     repair_id = next(item["id"] for item in payload["items"] if item.get("task_kind") == "repair")

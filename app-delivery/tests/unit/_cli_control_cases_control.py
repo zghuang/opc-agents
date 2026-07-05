@@ -292,6 +292,46 @@ def test_cmd_control_tolerates_project_summary_refresh_failure(tmp_path: Path, m
     assert result == 0
     assert payload["control_status"] == "in_progress"
 
+def test_routed_status_explains_normal_active_task_wait(tmp_path: Path, monkeypatch) -> None:
+    from delivery import control_plane
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "active", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature.py"]},
+            ],
+        },
+    )
+    monkeypatch.setattr(control_plane, "_planning_blocker_code", lambda project_root: None)
+    monkeypatch.setattr(
+        control_plane,
+        "runtime_status",
+        lambda project_root: {
+            "project": str(tmp_path),
+            "counts": {"active": 1},
+            "active_task": {"id": "T002", "title": "Feature", "status": "active", "phase": "implementation", "runtime_state": {"status": "running"}},
+            "gates": {"gates": []},
+        },
+    )
+
+    payload = control_plane.routed_status(tmp_path)
+
+    assert payload["control_status"] == "running"
+    assert payload["must_continue"] is False
+    assert payload["next_step"] is None
+    assert payload["waiting_for"] == {
+        "kind": "active_task_completion",
+        "task_id": "T002",
+        "phase": "implementation",
+        "message": "Waiting for active task T002 completion.",
+    }
+    assert payload["blocking_condition"] is None
+
 def test_cmd_start_reuses_existing_bootstrap(tmp_path: Path, monkeypatch) -> None:
     project_root = tmp_path
     docs_dir = project_root / "docs"

@@ -1307,6 +1307,130 @@ def test_import_task_review_pass_rejects_root_frontend_shims(tmp_path: Path) -> 
     assert item["review_status"] == "changes_requested"
     assert "unsupported top-level frontend paths" in item["blocked_reason"]
 
+def test_production_semantic_scan_accepts_router_level_verify_api_key_dependency(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    auth_path = tmp_path / "backend" / "app" / "auth" / "__init__.py"
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(
+        "from fastapi import HTTPException, Security, status\n"
+        "from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer\n\n"
+        "security = HTTPBearer(auto_error=False)\n\n"
+        "async def verify_api_key(credentials: HTTPAuthorizationCredentials | None = Security(security)):\n"
+        "    if credentials is None:\n"
+        "        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='missing')\n"
+        "    if credentials.credentials != 'secret':\n"
+        "        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='invalid')\n"
+        "    return credentials\n",
+        encoding="utf-8",
+    )
+    route_path = tmp_path / "backend" / "app" / "api" / "v1" / "inbound.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter, Depends\n"
+        "from app.auth import verify_api_key\n\n"
+        "router = APIRouter(prefix='/api/inbound', dependencies=[Depends(verify_api_key)])\n\n"
+        "@router.post('/events')\n"
+        "async def receive_event(payload: dict) -> dict:\n"
+        "    return {'status': 'accepted', 'payload': payload}\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert not [finding for finding in findings if finding.category == "security-access-control"]
+
+def test_production_semantic_scan_accepts_route_parameter_security_dependency(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    auth_path = tmp_path / "backend" / "app" / "auth.py"
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(
+        "from fastapi import HTTPException, Security, status\n"
+        "from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer\n\n"
+        "bearer = HTTPBearer(auto_error=False)\n\n"
+        "async def verify_api_key(credentials: HTTPAuthorizationCredentials | None = Security(bearer)):\n"
+        "    if credentials is None:\n"
+        "        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='missing')\n"
+        "    if credentials.credentials != 'secret':\n"
+        "        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='invalid')\n"
+        "    return credentials\n",
+        encoding="utf-8",
+    )
+    route_path = tmp_path / "backend" / "app" / "api" / "v1" / "callbacks.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter, Security\n"
+        "from app.auth import verify_api_key\n\n"
+        "router = APIRouter(prefix='/api/callbacks')\n\n"
+        "@router.post('/external')\n"
+        "async def receive_callback(payload: dict, _auth = Security(verify_api_key)) -> dict:\n"
+        "    return {'status': 'accepted', 'payload': payload}\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert not [finding for finding in findings if finding.category == "security-access-control"]
+
+def test_import_task_review_repeated_machine_precondition_blocks_without_consuming_review_limit(tmp_path: Path, monkeypatch) -> None:
+    from delivery import loop_review
+    from delivery.loop_review import import_task_review
+    from delivery.task import all_tasks, mark_task, save_tasks
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Inbound API",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_inbound.py"],
+                    "output_paths": ["backend/app/api/inbound.py"],
+                    "status_session_id": "ses-1",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(loop_review, "_review_pass_precondition_errors", lambda project_root, task: ["route lacks authenticated principal"])
+    review_payload = {
+        "status": "pass",
+        "summary": "External review accepts the implementation.",
+        "findings": [],
+        "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+        "acceptance_assessment": [],
+    }
+
+    first_result = import_task_review(tmp_path, "T002", review_payload, tmp_path / "review-1.json")
+    first_state = load_task_runtime_state(tmp_path, "T002")
+    first_item = all_tasks(tmp_path)[0]
+    assert first_result == 2
+    assert first_item.status == "pending"
+    assert first_state["review_changes_requested_count"] == 1
+    assert first_state["machine_precondition_repeat_count"] == 0
+
+    save_tasks(tmp_path, mark_task(all_tasks(tmp_path), "T002", "review_pending", status_session_id="ses-2"))
+    second_result = import_task_review(tmp_path, "T002", review_payload, tmp_path / "review-2.json")
+
+    second_state = load_task_runtime_state(tmp_path, "T002")
+    second_item = all_tasks(tmp_path)[0]
+    assert second_result == 2
+    assert second_item.status == "blocked"
+    assert second_item.review_status == "changes_requested"
+    assert "repeated machine-precondition finding" in str(second_item.blocked_reason)
+    assert second_state["review_changes_requested_count"] == 1
+    assert second_state["machine_precondition_repeat_count"] == 1
+    assert second_state["escalation"]["kind"] == "repeated_machine_precondition"
+    assert second_state.get("review_repair_limit_reached") is not True
+
 def test_import_task_review_pass_accepts_route_fetch_passthrough_e2e(tmp_path: Path, monkeypatch) -> None:
     from delivery.loop_review import import_task_review
 

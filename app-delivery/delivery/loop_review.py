@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -301,6 +302,18 @@ def _precondition_failure_review_payload(task: Task, parsed: dict[str, Any], err
     }
 
 
+def _machine_precondition_fingerprint(review_payload: dict[str, Any]) -> str:
+    if str(review_payload.get("review_type") or "").strip() != "machine-precondition":
+        return ""
+    if str(review_payload.get("external_review_status") or "").strip().casefold() != "pass":
+        return ""
+    errors = [str(error).strip() for error in review_payload.get("machine_precondition_errors", []) if str(error).strip()]
+    if not errors:
+        return ""
+    payload = json.dumps(errors, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def write_code_review_request(
     project_root: Path | str,
     task: Task,
@@ -554,6 +567,57 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         refresh_gates(project_dir)
         return 0
 
+    machine_fingerprint = _machine_precondition_fingerprint(parsed)
+    if machine_fingerprint and str(runtime_state.get("machine_precondition_fingerprint") or "") == machine_fingerprint:
+        machine_repeat_count = int(runtime_state.get("machine_precondition_repeat_count") or 0) + 1
+        blocked_reason = (
+            "repeated machine-precondition finding after external review pass; "
+            f"host escalation required instead of another automatic repair loop; see {review_artifact}"
+        )
+        tasks = mark_task(
+            all_tasks(project_dir),
+            task.id,
+            "blocked",
+            git_commit=None,
+            status_session_id=task.status_session_id,
+            started_at=None,
+            completed_at=None,
+            review_status=review_status,
+            review_artifact=review_artifact,
+            reviewed_at=reviewed_at,
+            verified_at=None,
+            blocked_reason=blocked_reason,
+            attempts=max(task.attempts, 1),
+        )
+        save_tasks(project_dir, tasks)
+        active_session = current_session(project_dir)
+        if active_session is not None and active_session.id == task.status_session_id:
+            retire_session(project_dir, active_session)
+        save_task_runtime_state(
+            project_dir,
+            task_id,
+            {
+                "machine_precondition_fingerprint": machine_fingerprint,
+                "machine_precondition_repeat_count": machine_repeat_count,
+                "machine_precondition_errors": list(parsed.get("machine_precondition_errors", [])),
+                "machine_precondition_blocked_at": reviewed_at,
+                "last_changes_requested_review_artifact": review_artifact,
+                "last_changes_requested_reviewed_at": reviewed_at,
+                "review_requested_scope_paths": accepted_scope_paths,
+                "pending_scope_report": None,
+                "escalation": {
+                    "status": "required",
+                    "kind": "repeated_machine_precondition",
+                    "reason": "same machine-precondition finding repeated after external review pass",
+                    "escalated_at": reviewed_at,
+                    "review_artifact": review_artifact,
+                    "fingerprint": machine_fingerprint,
+                },
+            },
+        )
+        refresh_gates(project_dir)
+        return 2
+
     review_changes_requested_count = int(runtime_state.get("review_changes_requested_count") or 0) + 1
     review_repair_state = {
         "review_changes_requested_count": review_changes_requested_count,
@@ -561,6 +625,14 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         "last_changes_requested_review_artifact": review_artifact,
         "last_changes_requested_reviewed_at": reviewed_at,
     }
+    if machine_fingerprint:
+        review_repair_state.update(
+            {
+                "machine_precondition_fingerprint": machine_fingerprint,
+                "machine_precondition_repeat_count": 0,
+                "machine_precondition_errors": list(parsed.get("machine_precondition_errors", [])),
+            }
+        )
     if review_changes_requested_count >= MAX_CODE_REVIEW_REPAIR_ATTEMPTS:
         exception_report = _write_review_repair_limit_report(
             project_dir,
