@@ -195,3 +195,22 @@ def test_scaffold_project_creates_directory_skeleton_from_module_architecture(tm
     assert (project_root / "frontend" / "src" / "features" / ".gitkeep").is_file()
     assert (project_root / "docs" / "modules").is_dir()
     assert (project_root / "docs" / "modules" / ".gitkeep").is_file()
+
+
+def test_scaffold_project_parses_ascii_tree_without_literal_tree_marker_dirs(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    project_root = tmp_path / "project"
+    template_root.mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True, exist_ok=True)
+    (project_root / "docs" / "architecture.md").write_text(
+        "# Architecture\n\n## Module Architecture\n\n```text\notif-01/\n|-- backend/\n|   |-- app/\n|   |   |-- services/\n|   |   |   |-- sync/\n|   |   |-- __init__.py\n|-- frontend/\n|   |-- src/\n|   |   |-- pages/\n|-- mock-server/\n|   |-- routers/\n```\n",
+        encoding="utf-8",
+    )
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    assert (project_root / "backend" / "app" / "services" / "sync").is_dir()
+    assert (project_root / "backend" / "app" / "__init__.py").is_file()
+    assert (project_root / "frontend" / "src" / "pages").is_dir()
+    assert (project_root / "mock-server" / "routers").is_dir()
+    assert not any(path.name.startswith("|") for path in project_root.iterdir())

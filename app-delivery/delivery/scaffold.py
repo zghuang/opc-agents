@@ -37,6 +37,7 @@ MAX_PROJECT_STRUCTURE_CHILDREN = 40
 MODULE_ARCHITECTURE_HEADING_RE = re.compile(r"^##+\s+(?:\d+\.\s*)?(?:Module Architecture|模块架构)\s*$", re.IGNORECASE | re.MULTILINE)
 FENCED_BLOCK_RE = re.compile(r"```(?:text|plaintext|txt)?\n(?P<body>.*?)\n```", re.DOTALL | re.IGNORECASE)
 TREE_LINE_RE = re.compile(r"^(?P<prefix>(?:│   |    )*)(?:(?:├── |└── ))?(?P<content>.+?)\s*$")
+TREE_CONNECTOR_RE = re.compile(r"^(?P<prefix>.*?)(?:├── |└── |\|-- )(?P<content>.+?)\s*$")
 
 
 def _copy_tree(src: Path, dst: Path) -> None:
@@ -171,6 +172,33 @@ def _extract_module_architecture_tree(architecture_text: str) -> str:
     return str(fenced.group("body") or "").strip()
 
 
+def _tree_prefix_depth(prefix: str) -> int:
+    visible_depth = prefix.count("|") + prefix.count("│")
+    return max(visible_depth, len(prefix) // 4)
+
+
+def _parse_architecture_tree_line(raw_line: str) -> tuple[int, str] | None:
+    line = raw_line.rstrip()
+    if not line.strip():
+        return None
+    connector_match = TREE_CONNECTOR_RE.match(line)
+    if connector_match:
+        depth = _tree_prefix_depth(str(connector_match.group("prefix") or ""))
+        content = str(connector_match.group("content") or "")
+    else:
+        if line.lstrip().startswith(("|", "│")):
+            return None
+        match = TREE_LINE_RE.match(line)
+        if not match:
+            return None
+        depth = _tree_prefix_depth(str(match.group("prefix") or ""))
+        content = str(match.group("content") or "")
+    content = re.split(r"\s+#", content, maxsplit=1)[0].strip()
+    if not content or content.startswith(("|", "│", "├", "└")):
+        return None
+    return depth, content
+
+
 def _create_scaffold_from_module_architecture(project_root: Path) -> None:
     architecture_path = project_root / "docs" / "architecture.md"
     if not architecture_path.exists():
@@ -182,17 +210,10 @@ def _create_scaffold_from_module_architecture(project_root: Path) -> None:
     stack: list[str] = []
     saw_tree_root = False
     for raw_line in tree_body.splitlines():
-        line = raw_line.rstrip()
-        if not line.strip():
+        parsed = _parse_architecture_tree_line(raw_line)
+        if parsed is None:
             continue
-        match = TREE_LINE_RE.match(line)
-        if not match:
-            continue
-        prefix = str(match.group("prefix") or "")
-        content = re.split(r"\s+#", str(match.group("content") or ""), maxsplit=1)[0].rstrip()
-        if not content:
-            continue
-        depth = len(prefix) // 4
+        depth, content = parsed
         if content.endswith("/") and depth == 0 and not saw_tree_root:
             saw_tree_root = True
             stack = []
