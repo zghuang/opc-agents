@@ -71,6 +71,27 @@ def test_work_items_markdown_compacts_long_requirement_lists(tmp_path: Path) -> 
     assert "REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, ... See docs/work-items.json for details" in work_items_md
 
 
+def test_work_items_markdown_compacts_long_dependency_lists(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "2",
+        "project": "demo",
+        "generated_at": "2026-06-24T00:00:00Z",
+        "last_updated_commit": "abc",
+        "items": [
+            {
+                "id": "T100",
+                "title": "Long deps",
+                "status": "pending",
+                "requirements": [],
+                "dependencies": [f"T{idx:03d}" for idx in range(1, 11)],
+            }
+        ],
+    }
+    save_work_items(tmp_path, payload)
+    work_items_md = (tmp_path / "docs" / "work-items.md").read_text(encoding="utf-8")
+    assert "T001, T002, T003, T004, T005, ... See docs/work-items.json for details" in work_items_md
+
+
 def test_work_items_markdown_compacts_session_history(tmp_path: Path) -> None:
     payload = {
         "schema_version": "2",

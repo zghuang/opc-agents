@@ -35,6 +35,7 @@ REVIEWS_DIR = DOCS_DIR / "reviews"
 TOKEN_USAGE_LOG_FILE = RUNTIME_DIR / "token-usage.jsonl"
 
 MARKDOWN_REQ_COLLAPSE_THRESHOLD = 8
+MARKDOWN_DEP_COLLAPSE_THRESHOLD = 8
 MARKDOWN_REQ_PREVIEW_COUNT = 5
 WORK_ITEMS_JSON_REFERENCE = "See docs/work-items.json for details"
 
@@ -141,6 +142,16 @@ def _compact_requirement_ids(values: list[Any]) -> str:
     if not normalized:
         return "-"
     if len(normalized) <= MARKDOWN_REQ_COLLAPSE_THRESHOLD:
+        return ", ".join(normalized)
+    preview = ", ".join(normalized[:MARKDOWN_REQ_PREVIEW_COUNT])
+    return f"{preview}, ... {WORK_ITEMS_JSON_REFERENCE}"
+
+
+def _compact_dependency_ids(values: list[Any]) -> str:
+    normalized = [str(value).strip() for value in values if str(value).strip()]
+    if not normalized:
+        return "-"
+    if len(normalized) < MARKDOWN_DEP_COLLAPSE_THRESHOLD:
         return ", ".join(normalized)
     preview = ", ".join(normalized[:MARKDOWN_REQ_PREVIEW_COUNT])
     return f"{preview}, ... {WORK_ITEMS_JSON_REFERENCE}"
@@ -764,7 +775,7 @@ def render_work_items_markdown(project_root: Path | str, payload: dict[str, Any]
         if not isinstance(item, dict):
             continue
         requirements = _compact_requirement_ids(item.get("requirements", []))
-        dependencies = ", ".join(str(value) for value in item.get("dependencies", [])) or "-"
+        dependencies = _compact_dependency_ids(item.get("dependencies", []))
         commit = str(item.get("git_commit") or "-")
         session_id = _compact_session_ids(item.get("session_ids", []), str(item.get("status_session_id") or "").strip() or None)
         item_status = str(item.get("status") or "-")
