@@ -11,7 +11,7 @@ Inputs:
 
 Procedure:
 1. Read `{project}/.app-delivery-runtime/review-requests/code-review-{task_id}.md`.
-2. If `{project}/.app-delivery-runtime/host-handoff.json` exists for this task, a host executor can update it to `status="running"` with `started_at` before doing review work; the core will mark it `imported` after import.
+2. If `{project}/.app-delivery-runtime/host-handoff.json` exists and has matching `skill="code-review"`, `task_id`, and `status="waiting_for_host"`, update only these fields before long review work: `status="running"`, `running_at=<current UTC ISO time>`, and `updated_at=<same timestamp>`. Do not change task state or import fields; the core will mark it `imported` after import.
 3. Inspect the current repository state and the task-scoped diff.
 4. Produce raw JSON that follows the review request and [references/review-contract.md](./references/review-contract.md).
 5. Write that JSON to `{project}/.app-delivery-runtime/review-inputs/code-review-{task_id}.json`.

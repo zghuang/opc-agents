@@ -10,7 +10,7 @@ Inputs:
 
 Procedure:
 1. Read `{project}/.app-delivery-runtime/review-requests/final-review.md`.
-2. If `{project}/.app-delivery-runtime/host-handoff.json` exists for this review, a host executor can update it to `status="running"` with `started_at` before doing review work; the core will mark it `imported` after import.
+2. If `{project}/.app-delivery-runtime/host-handoff.json` exists and has matching `skill="final-review"` and `status="waiting_for_host"`, update only these fields before long review work: `status="running"`, `running_at=<current UTC ISO time>`, and `updated_at=<same timestamp>`. Do not change task state or import fields; the core will mark it `imported` after import.
 3. Inspect the repository state, release evidence, and current final verification outputs.
 4. Produce raw JSON with fields:
    - `status`: `pass` or `changes_requested`

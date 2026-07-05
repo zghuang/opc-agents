@@ -512,6 +512,53 @@ def test_command_for_frontend_e2e_spec_auto_wires_backend_when_template_backend_
     assert "uvicorn main:app --host 127.0.0.1 --port 8000" in command[2]
 
 
+def test_command_for_frontend_e2e_spec_uses_project_backend_port_and_health_path(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("BACKEND_HOST_PORT=18100\n", encoding="utf-8")
+    (tmp_path / "frontend").mkdir(parents=True)
+    (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "backend" / "app").mkdir(parents=True)
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "backend" / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "app" / "main.py").write_text(
+        "from fastapi import FastAPI\n"
+        "app = FastAPI()\n"
+        "@app.get('/api/health')\n"
+        "async def health():\n"
+        "    return {'status': 'ok'}\n",
+        encoding="utf-8",
+    )
+
+    command = _command_for_test_spec(tmp_path, "frontend/e2e/app-shell.spec.ts")
+
+    assert "uvicorn app.main:app --host 127.0.0.1 --port 18100" in command[2]
+    assert "VITE_API_PROXY_TARGET=http://127.0.0.1:18100" in command[2]
+    assert "E2E_BACKEND_HEALTHCHECK_URL=http://127.0.0.1:18100/api/health" in command[2]
+
+
+def test_command_for_frontend_e2e_spec_discovers_readiness_health_path_without_parameterized_status(tmp_path: Path) -> None:
+    (tmp_path / "frontend").mkdir(parents=True)
+    (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "backend" / "app").mkdir(parents=True)
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "backend" / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "app" / "main.py").write_text(
+        "from fastapi import FastAPI\n"
+        "app = FastAPI()\n"
+        "@app.get('/orders/{order_id}/status')\n"
+        "async def order_status(order_id: str):\n"
+        "    return {'status': 'draft'}\n"
+        "@app.get('/api/v1/readiness')\n"
+        "async def readiness():\n"
+        "    return {'status': 'ok'}\n",
+        encoding="utf-8",
+    )
+
+    command = _command_for_test_spec(tmp_path, "frontend/e2e/app-shell.spec.ts")
+
+    assert "E2E_BACKEND_HEALTHCHECK_URL=http://127.0.0.1:8000/api/v1/readiness" in command[2]
+    assert "orders" not in command[2]
+
+
 def test_command_for_frontend_e2e_spec_auto_wires_package_backend_entrypoint(tmp_path: Path) -> None:
     (tmp_path / "frontend").mkdir(parents=True)
     (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")

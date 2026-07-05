@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -69,26 +70,108 @@ def validation_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _configured_backend_host() -> str:
-    return str(os.environ.get("APP_DELIVERY_BACKEND_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+def _dotenv_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        normalized_key = key.strip()
+        if not normalized_key:
+            continue
+        values[normalized_key] = value.strip().strip('"').strip("'")
+    return values
 
 
-def _configured_backend_port() -> str:
-    return str(os.environ.get("APP_DELIVERY_BACKEND_PORT") or "8000").strip() or "8000"
+def _project_env_value(project_root: Path | str | None, key: str) -> str:
+    if project_root is None:
+        return ""
+    project_dir = Path(project_root).expanduser().resolve()
+    for path in (project_dir / ".env", project_dir / "backend" / ".env"):
+        value = _dotenv_values(path).get(key, "").strip()
+        if value:
+            return value
+    return ""
 
 
-def _configured_backend_base_url() -> str:
-    explicit = str(os.environ.get("APP_DELIVERY_BACKEND_BASE_URL") or "").strip()
+def _configured_backend_host(project_root: Path | str | None = None) -> str:
+    return str(os.environ.get("APP_DELIVERY_BACKEND_HOST") or _project_env_value(project_root, "BACKEND_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+
+
+def _configured_backend_port(project_root: Path | str | None = None) -> str:
+    return str(
+        os.environ.get("APP_DELIVERY_BACKEND_PORT")
+        or _project_env_value(project_root, "BACKEND_HOST_PORT")
+        or _project_env_value(project_root, "BACKEND_PORT")
+        or "8000"
+    ).strip() or "8000"
+
+
+def _configured_backend_base_url(project_root: Path | str | None = None) -> str:
+    explicit = str(os.environ.get("APP_DELIVERY_BACKEND_BASE_URL") or _project_env_value(project_root, "BACKEND_BASE_URL") or "").strip()
     if explicit:
         return explicit.rstrip("/")
-    return f"http://{_configured_backend_host()}:{_configured_backend_port()}"
+    return f"http://{_configured_backend_host(project_root)}:{_configured_backend_port(project_root)}"
 
 
-def _configured_backend_health_url() -> str:
-    explicit = str(os.environ.get("APP_DELIVERY_BACKEND_HEALTH_URL") or "").strip()
+PATH_LITERAL_PATTERN = re.compile(r"['\"](?P<path>/[A-Za-z0-9_./{}-]+)['\"]")
+HEALTH_PATH_SEGMENTS = {"health", "healthz", "ready", "readyz", "readiness", "live", "livez", "liveness", "status", "ping"}
+
+
+def _looks_like_backend_health_path(value: str) -> bool:
+    path = str(value or "").strip().split("?", 1)[0].rstrip("/")
+    if not path.startswith("/") or "{" in path or "}" in path:
+        return False
+    segments = [segment.casefold() for segment in path.split("/") if segment]
+    return bool(segments) and segments[-1] in HEALTH_PATH_SEGMENTS
+
+
+def _discovered_backend_health_paths(project_root: Path | str | None) -> list[str]:
+    if project_root is None:
+        return []
+    backend_root = Path(project_root).expanduser().resolve() / "backend"
+    if not backend_root.exists():
+        return []
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for path in sorted(backend_root.rglob("*.py")):
+        try:
+            relative = path.relative_to(backend_root)
+        except ValueError:
+            continue
+        if any(part in BACKEND_ENTRYPOINT_EXCLUDED_PARTS or part.startswith(".") for part in relative.parts[:-1]):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in PATH_LITERAL_PATTERN.finditer(text):
+            value = match.group("path").strip()
+            if _looks_like_backend_health_path(value) and value not in seen:
+                seen.add(value)
+                ordered.append(value)
+    return ordered
+
+
+def _configured_backend_health_urls(project_root: Path | str | None = None) -> list[str]:
+    explicit = str(os.environ.get("APP_DELIVERY_BACKEND_HEALTH_URL") or _project_env_value(project_root, "BACKEND_HEALTH_URL") or "").strip()
     if explicit:
-        return explicit
-    return _configured_backend_base_url() + "/health"
+        return [explicit]
+    base_url = _configured_backend_base_url(project_root)
+    paths = [*_discovered_backend_health_paths(project_root), "/health", "/api/health"]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        url = base_url + normalized_path
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def _configured_backend_health_url(project_root: Path | str | None = None) -> str:
+    return _configured_backend_health_urls(project_root)[0]
 
 
 def _backend_entrypoint_module(backend_root: Path, main_path: Path) -> str | None:
@@ -137,7 +220,7 @@ def default_backend_e2e_command(project_root: Path | str) -> str | None:
         return None
     return (
         f"cd {shlex.quote(str(backend_root))} && uv run uvicorn {entrypoint} "
-        f"--host {_configured_backend_host()} --port {_configured_backend_port()}"
+        f"--host {_configured_backend_host(project_dir)} --port {_configured_backend_port(project_dir)}"
     )
 
 
@@ -147,7 +230,9 @@ def frontend_e2e_env_prefix(project_root: Path | str) -> str:
     if backend_command is not None:
         env_parts.append(f"E2E_BACKEND_CMD={shlex.quote(backend_command)}")
     if backend_command is not None and not str(os.environ.get("VITE_API_PROXY_TARGET") or "").strip():
-        env_parts.append(f"VITE_API_PROXY_TARGET={_configured_backend_base_url()}")
+        env_parts.append(f"VITE_API_PROXY_TARGET={_configured_backend_base_url(project_root)}")
+    if backend_command is not None and not str(os.environ.get("E2E_BACKEND_HEALTHCHECK_URL") or "").strip():
+        env_parts.append(f"E2E_BACKEND_HEALTHCHECK_URL={_configured_backend_health_url(project_root)}")
     return (" ".join(env_parts) + " ") if env_parts else ""
 
 
@@ -342,13 +427,15 @@ def _probe_backend_health(project_root: Path, command: str, *, timeout_seconds: 
             if process.poll() is not None:
                 output = process.stdout.read() if process.stdout is not None else ""
                 return {"ready": False, "message": (output or "backend exited before health probe succeeded").strip()[:4000]}
-            try:
-                with urllib.request.urlopen(_configured_backend_health_url(), timeout=1.5) as response:
+            for health_url in _configured_backend_health_urls(project_root):
+                try:
+                    response = urllib.request.urlopen(health_url, timeout=1.5)
+                except (urllib.error.URLError, TimeoutError, ConnectionError):
+                    continue
+                with response:
                     body = response.read().decode("utf-8", errors="replace")
                     if response.status == 200:
-                        return {"ready": True, "message": body.strip() or "ok"}
-            except (urllib.error.URLError, TimeoutError, ConnectionError):
-                pass
+                        return {"ready": True, "message": body.strip() or "ok", "health_url": health_url}
             time.sleep(0.5)
         return {"ready": False, "message": "backend health probe timed out"}
     finally:
