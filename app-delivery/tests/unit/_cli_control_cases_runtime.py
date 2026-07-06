@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import os
 import signal
+import time
 from importlib import import_module
 from pathlib import Path
 
@@ -46,6 +47,10 @@ def test_cmd_init_project_defaults_watchdog_enabled(tmp_path: Path, capsys: pyte
     assert metadata["host_fallback_enabled"] is True
     assert metadata["host_fallback_after_seconds"] == 600
     assert metadata["host_fallback_max_attempts"] == 1
+    assert metadata["review_runner_mode"] == "framework"
+    assert metadata["review_runner_after_seconds"] == 0
+    assert metadata["review_runner_max_attempts"] == 3
+    assert metadata["review_runner_idle_timeout_seconds"] == 600
 
 
 def test_cmd_init_project_can_disable_watchdog_explicitly(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -649,6 +654,10 @@ def test_cmd_host_fallback_starts_code_review_oneshot_when_handoff_is_due(tmp_pa
     assert lock["status"] == "running"
     assert lock["handoff_id"] == "handoff-1"
     assert state["attempts"]["handoff-1"] == 1
+    handoff = json.loads((tmp_path / ".app-delivery-runtime" / "host-handoff.json").read_text(encoding="utf-8"))
+    assert handoff["status"] == "review_running"
+    assert handoff["handler"] == "review_runner"
+    assert handoff["runner_pid"] == 12345
 
 
 def test_cmd_host_fallback_skips_non_code_review_handoff(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -707,7 +716,9 @@ def test_cmd_host_fallback_reconciles_imported_handoff_even_when_process_alive(t
         json.dumps({"status": "imported", "handoff_id": "done", "skill": "code-review", "task_id": "T007"}),
         encoding="utf-8",
     )
+    terminated: list[int] = []
     monkeypatch.setattr(cli, "process_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_terminate_pid", lambda pid: terminated.append(pid))
 
     result = cli.cmd_host_fallback(argparse.Namespace(project=str(tmp_path)))
 
@@ -719,6 +730,37 @@ def test_cmd_host_fallback_reconciles_imported_handoff_even_when_process_alive(t
     assert state["status"] == "completed"
     assert state["reason"] == "handoff_imported_while_fallback_process_alive"
     assert state["handoff_id"] == "done"
+    assert terminated == [12345]
+
+
+def test_cmd_host_fallback_reconciles_imported_handoff_without_lock(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(json.dumps({"watchdog_enabled": True, "host_fallback_enabled": True}), encoding="utf-8")
+    runtime_dir = tmp_path / ".app-delivery-runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "host-fallback.json").write_text(
+        json.dumps({"attempts": {"done": 1}, "status": "running", "handoff_id": "done", "task_id": "T007", "pid": 12345}),
+        encoding="utf-8",
+    )
+    (runtime_dir / "host-handoff.json").write_text(
+        json.dumps({"status": "imported", "handoff_id": "done", "skill": "code-review", "task_id": "T007"}),
+        encoding="utf-8",
+    )
+    terminated: list[int] = []
+    monkeypatch.setattr(cli, "process_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_terminate_pid", lambda pid: terminated.append(pid))
+
+    result = cli.cmd_host_fallback(argparse.Namespace(project=str(tmp_path)))
+
+    output = json.loads(capsys.readouterr().out)
+    state = json.loads((runtime_dir / "host-fallback.json").read_text(encoding="utf-8"))
+    assert result == 0
+    assert output == {"status": "skipped", "reason": "host_handoff_not_waiting", "handoff_status": "imported"}
+    assert state["status"] == "completed"
+    assert state["reason"] == "handoff_imported_after_fallback_state_running"
+    assert state["handoff_id"] == "done"
+    assert terminated == [12345]
 
 
 def test_host_fallback_start_clears_previous_handoff_terminal_fields(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -787,6 +829,289 @@ def test_host_fallback_start_clears_previous_handoff_terminal_fields(tmp_path: P
     assert state["task_id"] == "T007"
     assert "completed_at" not in state
     assert state["attempts"] == {"old-handoff": 1, "new-handoff": 1}
+
+
+def test_review_runner_default_starts_code_review_without_legacy_wait(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(json.dumps({"watchdog_enabled": True, "host_fallback_enabled": True}), encoding="utf-8")
+    request_path = tmp_path / ".app-delivery-runtime" / "review-requests" / "code-review-T004.md"
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_text("review request\n", encoding="utf-8")
+    input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T004.json"
+    handoff_path = tmp_path / ".app-delivery-runtime" / "host-handoff.json"
+    handoff_path.parent.mkdir(parents=True, exist_ok=True)
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "handoff_id": "handoff-now",
+                "status": "waiting_for_host",
+                "project": str(tmp_path),
+                "requested_at": "2026-06-24T00:00:00Z",
+                "updated_at": "2026-06-24T00:00:00Z",
+                "action": "run_code_review",
+                "skill": "code-review",
+                "task_id": "T004",
+                "expected_input_path": str(input_path),
+                "next_step": {"owner": "host", "skill": "code-review", "action": "run_code_review", "task_id": "T004", "expected_input_path": str(input_path)},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeProcess:
+        pid = 54321
+
+    monkeypatch.setattr(cli, "_resolve_hermes_bin", lambda: "/bin/hermes")
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda command, **kwargs: FakeProcess())
+
+    result = cli._maybe_start_code_review_host_fallback(tmp_path)
+
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    assert result["status"] == "started"
+    assert result["pid"] == 54321
+    assert handoff["status"] == "review_running"
+    assert handoff["handler"] == "review_runner"
+
+
+def test_review_runner_failed_state_reverts_handoff_to_waiting(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(json.dumps({"watchdog_enabled": True, "host_fallback_enabled": True, "review_runner_max_attempts": 1}), encoding="utf-8")
+    runtime_dir = tmp_path / ".app-delivery-runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    input_path = runtime_dir / "review-inputs" / "code-review-T004.json"
+    handoff_path = runtime_dir / "host-handoff.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "handoff_id": "handoff-failed",
+                "status": "review_running",
+                "project": str(tmp_path),
+                "requested_at": "2026-06-24T00:00:00Z",
+                "updated_at": "2026-06-24T00:00:00Z",
+                "action": "run_code_review",
+                "skill": "code-review",
+                "task_id": "T004",
+                "expected_input_path": str(input_path),
+                "runner_pid": 12345,
+                "runner_stdout_log": str(runtime_dir / "logs" / "host-fallback-handoff-failed.out.log"),
+                "runner_stderr_log": str(runtime_dir / "logs" / "host-fallback-handoff-failed.err.log"),
+                "next_step": {"owner": "host", "skill": "code-review", "action": "run_code_review", "task_id": "T004", "expected_input_path": str(input_path)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runtime_dir / "host-fallback.json").write_text(
+        json.dumps(
+            {
+                "attempts": {"handoff-failed": 1},
+                "schema_version": "1",
+                "status": "failed",
+                "handoff_id": "handoff-failed",
+                "task_id": "T004",
+                "pid": 12345,
+                "reason": "fallback_process_exited_before_handoff_imported",
+                "stdout_log": str(runtime_dir / "logs" / "host-fallback-handoff-failed.out.log"),
+                "stderr_log": str(runtime_dir / "logs" / "host-fallback-handoff-failed.err.log"),
+                "completed_at": "2026-06-24T00:02:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cli._maybe_start_code_review_host_fallback(tmp_path)
+
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    assert result["status"] == "skipped"
+    assert result["reason"] == "max_attempts_reached"
+    assert handoff["status"] == "review_runner_failed"
+    assert handoff["review_runner_status"] == "failed"
+    assert handoff["review_runner_reason"] == "fallback_process_exited_before_handoff_imported"
+    assert "Review runner failed before importing" in handoff["message"]
+
+
+def test_review_runner_failed_state_annotates_existing_waiting_handoff(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(json.dumps({"watchdog_enabled": True, "host_fallback_enabled": True, "review_runner_max_attempts": 1}), encoding="utf-8")
+    runtime_dir = tmp_path / ".app-delivery-runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    input_path = runtime_dir / "review-inputs" / "code-review-T004.json"
+    handoff_path = runtime_dir / "host-handoff.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "handoff_id": "handoff-failed",
+                "status": "waiting_for_host",
+                "project": str(tmp_path),
+                "requested_at": "2026-06-24T00:00:00Z",
+                "updated_at": "2026-06-24T00:00:00Z",
+                "action": "run_code_review",
+                "skill": "code-review",
+                "task_id": "T004",
+                "expected_input_path": str(input_path),
+                "handler": "review_runner",
+                "runner_pid": 12345,
+                "next_step": {"owner": "host", "skill": "code-review", "action": "run_code_review", "task_id": "T004", "expected_input_path": str(input_path)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runtime_dir / "host-fallback.json").write_text(
+        json.dumps(
+            {
+                "attempts": {"handoff-failed": 1},
+                "schema_version": "1",
+                "status": "failed",
+                "handoff_id": "handoff-failed",
+                "task_id": "T004",
+                "pid": 12345,
+                "reason": "fallback_process_exited_before_handoff_imported",
+                "completed_at": "2026-06-24T00:02:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cli._maybe_start_code_review_host_fallback(tmp_path)
+
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    assert result["status"] == "skipped"
+    assert result["reason"] == "max_attempts_reached"
+    assert handoff["status"] == "review_runner_failed"
+    assert handoff["review_runner_status"] == "failed"
+    assert handoff["review_runner_reason"] == "fallback_process_exited_before_handoff_imported"
+
+
+def test_review_runner_dead_process_retries_immediately(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(json.dumps({"watchdog_enabled": True, "host_fallback_enabled": True, "review_runner_max_attempts": 3}), encoding="utf-8")
+    runtime_dir = tmp_path / ".app-delivery-runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    input_path = runtime_dir / "review-inputs" / "code-review-T004.json"
+    handoff_path = runtime_dir / "host-handoff.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "handoff_id": "handoff-retry",
+                "status": "review_running",
+                "project": str(tmp_path),
+                "requested_at": "2026-06-24T00:00:00Z",
+                "updated_at": "2026-06-24T00:00:00Z",
+                "skill": "code-review",
+                "task_id": "T004",
+                "expected_input_path": str(input_path),
+                "next_step": {"owner": "host", "skill": "code-review", "action": "run_code_review", "task_id": "T004", "expected_input_path": str(input_path)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runtime_dir / "host-fallback-lock.json").write_text(json.dumps({"status": "running", "handoff_id": "handoff-retry", "task_id": "T004", "pid": 11111, "started_at": "2026-06-24T00:01:00Z"}), encoding="utf-8")
+    (runtime_dir / "host-fallback.json").write_text(json.dumps({"attempts": {"handoff-retry": 1}, "status": "running", "handoff_id": "handoff-retry", "task_id": "T004", "pid": 11111}), encoding="utf-8")
+
+    class FakeProcess:
+        pid = 22222
+
+    monkeypatch.setattr(cli, "process_alive", lambda pid: False)
+    monkeypatch.setattr(cli, "_resolve_hermes_bin", lambda: "/bin/hermes")
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda command, **kwargs: FakeProcess())
+
+    result = cli._maybe_start_code_review_host_fallback(tmp_path)
+
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    state = json.loads((runtime_dir / "host-fallback.json").read_text(encoding="utf-8"))
+    assert result["status"] == "started"
+    assert result["attempt"] == 2
+    assert result["pid"] == 22222
+    assert handoff["status"] == "review_running"
+    assert handoff["runner_pid"] == 22222
+    assert state["attempts"]["handoff-retry"] == 2
+
+
+def test_review_runner_idle_timeout_uses_rolling_activity_and_retries(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(
+        json.dumps({"watchdog_enabled": True, "host_fallback_enabled": True, "review_runner_max_attempts": 3, "review_runner_idle_timeout_seconds": 1}),
+        encoding="utf-8",
+    )
+    runtime_dir = tmp_path / ".app-delivery-runtime"
+    logs_dir = runtime_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stdout_log = logs_dir / "host-fallback-handoff-idle.out.log"
+    stderr_log = logs_dir / "host-fallback-handoff-idle.err.log"
+    stdout_log.write_text("", encoding="utf-8")
+    stderr_log.write_text("", encoding="utf-8")
+    old_timestamp = time.time() - 120
+    os.utime(stdout_log, (old_timestamp, old_timestamp))
+    os.utime(stderr_log, (old_timestamp, old_timestamp))
+    input_path = runtime_dir / "review-inputs" / "code-review-T004.json"
+    handoff_path = runtime_dir / "host-handoff.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "handoff_id": "handoff-idle",
+                "status": "review_running",
+                "project": str(tmp_path),
+                "requested_at": "2026-06-24T00:00:00Z",
+                "updated_at": "2026-06-24T00:00:00Z",
+                "skill": "code-review",
+                "task_id": "T004",
+                "expected_input_path": str(input_path),
+                "next_step": {"owner": "host", "skill": "code-review", "action": "run_code_review", "task_id": "T004", "expected_input_path": str(input_path)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runtime_dir / "host-fallback-lock.json").write_text(
+        json.dumps({"status": "running", "handoff_id": "handoff-idle", "task_id": "T004", "pid": 33333, "started_at": "2026-06-24T00:01:00Z", "stdout_log": str(stdout_log), "stderr_log": str(stderr_log)}),
+        encoding="utf-8",
+    )
+    (runtime_dir / "host-fallback.json").write_text(json.dumps({"attempts": {"handoff-idle": 1}, "status": "running", "handoff_id": "handoff-idle", "task_id": "T004", "pid": 33333}), encoding="utf-8")
+    terminated: list[int] = []
+
+    class FakeProcess:
+        pid = 44444
+
+    monkeypatch.setattr(cli, "process_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_terminate_pid", lambda pid: terminated.append(pid))
+    monkeypatch.setattr(cli, "_resolve_hermes_bin", lambda: "/bin/hermes")
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda command, **kwargs: FakeProcess())
+
+    result = cli._maybe_start_code_review_host_fallback(tmp_path)
+
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    state = json.loads((runtime_dir / "host-fallback.json").read_text(encoding="utf-8"))
+    assert terminated == [33333]
+    assert result["status"] == "started"
+    assert result["attempt"] == 2
+    assert handoff["status"] == "review_running"
+    assert handoff["runner_pid"] == 44444
+    assert state["attempts"]["handoff-idle"] == 2
+
+
+def test_review_runner_legacy_mode_preserves_deferred_wait(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "project-bootstrap.json").write_text(
+        json.dumps({"watchdog_enabled": True, "host_fallback_enabled": True, "review_runner_mode": "deferred", "host_fallback_after_seconds": 600}),
+        encoding="utf-8",
+    )
+    handoff_path = tmp_path / ".app-delivery-runtime" / "host-handoff.json"
+    handoff_path.parent.mkdir(parents=True, exist_ok=True)
+    handoff_path.write_text(json.dumps({"status": "waiting_for_host", "handoff_id": "wait", "skill": "code-review", "task_id": "T004", "requested_at": cli.utc_now_iso()}), encoding="utf-8")
+
+    result = cli._maybe_start_code_review_host_fallback(tmp_path)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "not_due"
 
 def test_cmd_fix_reapplies_exception_patch(tmp_path: Path) -> None:
     from delivery.loop_gitops import ensure_git_repo, git

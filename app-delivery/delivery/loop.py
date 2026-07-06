@@ -7,7 +7,7 @@ from typing import Any
 from .environment_repair import ENVIRONMENT_REPAIR_TASK_PREFIX, build_environment_repair_plan, has_environment_failures
 from .errors import DeliveryError
 from .gates import refresh_gates
-from .loop_gitops import ensure_git_repo, git_commit_task, git_commit_timestamp, git_head_sha, git_latest_task_commit, git_stage_task_snapshot, park_task_exception_changes, repair_invalid_verified_tasks, review_artifact_status, task_scoped_changed_paths
+from .loop_gitops import ensure_git_repo, git_commit_task, git_commit_timestamp, git_head_sha, git_latest_task_commit, git_stage_task_snapshot, is_runtime_protected_framework_artifact, park_task_exception_changes, repair_invalid_verified_tasks, review_artifact_status, task_scoped_changed_paths
 from .loop_gitops import git_changed_paths, restore_paths_to_head, task_scope_delta
 from .loop_reporting import PAUSE_FILE, project_summary, render_release_evidence, status
 from .loop_review import write_code_review_request, write_final_review_request
@@ -140,6 +140,24 @@ def _write_exception_report(project_root: Path | str, task: Task, summary: str, 
         lines.extend(["", "## Exception Patch", "", f"- {patch_relative_path}"])
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(report_path.relative_to(project_dir))
+
+
+def _preserved_framework_review_artifact_paths(task: Task, runtime_state: dict[str, Any]) -> list[str]:
+    candidates = [
+        getattr(task, "review_artifact", None),
+        runtime_state.get("last_changes_requested_review_artifact"),
+        runtime_state.get("review_repair_limit_report"),
+    ]
+    paths: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = str(candidate or "").strip()
+        if not path or path in seen:
+            continue
+        if is_runtime_protected_framework_artifact(path):
+            seen.add(path)
+            paths.append(path)
+    return paths
 
 
 def _dedupe_task_ids(values: list[str]) -> list[str]:
@@ -621,7 +639,7 @@ class DeliveryLoop:
         resolved_session_id = str(exc.session_id or session.id or task.status_session_id or "").strip()
         runtime_attention = {
             "kind": "stalled_runtime",
-            "message": ((exc.output or str(exc)).strip()[:1000] or "runtime stalled without useful progress"),
+            "message": ((exc.output or str(exc)).strip() or "runtime stalled without useful progress"),
             "session_id": resolved_session_id or None,
         }
         recovery_prompt = build_stalled_recovery_prompt(
@@ -827,11 +845,36 @@ class DeliveryLoop:
                     return False, "blocked"
                 test_result = run_task_tests(self.project_root, current.to_dict(), attempt=cycle_count)
                 if test_result.passed:
+                    test_report_artifact = f"docs/reviews/test-report-{current.id}.md"
+                    preserved_paths = [
+                        *baseline_changed_paths,
+                        *_preserved_framework_review_artifact_paths(current, runtime_state),
+                    ]
+                    baseline_path_set = {str(path).strip() for path in baseline_changed_paths if str(path).strip()}
+                    runtime_written_protected_paths = [
+                        path
+                        for path in git_changed_paths(self.project_root)
+                        if is_runtime_protected_framework_artifact(path)
+                        and path != test_report_artifact
+                        and path not in baseline_path_set
+                    ]
+                    if runtime_written_protected_paths:
+                        restore_paths_to_head(self.project_root, runtime_written_protected_paths)
                     scope_report = task_scope_delta(
                         self.project_root,
                         current,
-                        preserved_paths=baseline_changed_paths,
+                        extra_paths=[test_report_artifact],
+                        preserved_paths=preserved_paths,
                     )
+                    protected_out_of_scope = [path for path in scope_report["out_of_scope"] if is_runtime_protected_framework_artifact(path)]
+                    if protected_out_of_scope:
+                        restore_paths_to_head(self.project_root, protected_out_of_scope)
+                        scope_report = task_scope_delta(
+                            self.project_root,
+                            current,
+                            extra_paths=[test_report_artifact],
+                            preserved_paths=preserved_paths,
+                        )
                     save_task_runtime_state(
                         self.project_root,
                         current.id,
@@ -840,8 +883,11 @@ class DeliveryLoop:
                     git_stage_task_snapshot(
                         self.project_root,
                         current,
-                        extra_paths=scope_report["out_of_scope"],
-                        preserved_paths=baseline_changed_paths,
+                        extra_paths=[
+                            test_report_artifact,
+                            *[path for path in scope_report["out_of_scope"] if not is_runtime_protected_framework_artifact(path)],
+                        ],
+                        preserved_paths=preserved_paths,
                     )
                     try:
                         write_code_review_request(self.project_root, current, scope_report=scope_report)

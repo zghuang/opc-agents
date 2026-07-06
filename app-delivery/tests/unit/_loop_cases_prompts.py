@@ -743,6 +743,73 @@ def test_build_stalled_recovery_prompt_focuses_on_existing_work_and_stall_eviden
     assert "Do not re-scan the whole repository from scratch" in prompt
     assert "Continue from the existing implementation already on disk" in prompt
 
+
+def test_task_prompts_keep_current_file_and_append_history(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import Task
+    import delivery.loop_task_prompt as prompt_module
+
+    timestamps = iter(["20260706T100000Z", "20260706T101000Z"])
+    monkeypatch.setattr(prompt_module, "_prompt_history_timestamp", lambda: next(timestamps))
+    task = Task(
+        "T007",
+        "OTIF Calculation",
+        "pending",
+        ["REQ-001"],
+        [],
+        [],
+        ["backend/tests/monitoring/test_otif_calc.py"],
+        ["backend/app/monitoring/otif_engine.py"],
+    )
+
+    initial_prompt = build_task_prompt(tmp_path, task)
+    task.review_status = "changes_requested"
+    task.review_artifact = "docs/reviews/code-review-T007.md"
+    repair_prompt = build_task_prompt(tmp_path, task)
+
+    current_path = tmp_path / ".app-delivery-runtime" / "prompts" / "T007.md"
+    history_dir = tmp_path / ".app-delivery-runtime" / "prompt-history" / "T007"
+    assert current_path.read_text(encoding="utf-8") == repair_prompt
+    assert (history_dir / "20260706T100000Z-task.md").read_text(encoding="utf-8") == initial_prompt
+    assert (history_dir / "20260706T101000Z-review-repair.md").read_text(encoding="utf-8") == repair_prompt
+    assert "Review repair mode:" not in initial_prompt
+    assert "Review repair mode:" in repair_prompt
+
+
+def test_build_stalled_recovery_prompt_summarizes_wrapper_heartbeat_spam(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    prompt = build_stalled_recovery_prompt(
+        tmp_path,
+        Task(
+            "T006",
+            "Event Ingestion",
+            "active",
+            ["REQ-006"],
+            [],
+            [],
+            ["backend/tests/ingestion/test_order_import.py"],
+            ["backend/app/ingestion/service.py"],
+        ),
+        runtime_state={"session_id": "ses-op-stall", "started_at": "2026-07-06T08:27:27Z", "last_tool_at": "2026-07-06T08:28:59Z"},
+        runtime_attention={
+            "kind": "stalled_runtime",
+            "message": "\n".join(
+                [
+                    "[app-delivery] implementation T006: still running (30s elapsed)",
+                    "[app-delivery] implementation T006: still running (60s elapsed)",
+                    "[app-delivery] implementation T006: still running (125s elapsed)",
+                    "[app-delivery] implementation T006: still running (155s elapsed)",
+                    "[app-delivery] stalled_runtime: runtime liveness stalled: no recent tool, mutation, or output progress",
+                ]
+            ),
+            "last_tool_name": "todowrite",
+        },
+    )
+
+    assert "Wrapper heartbeat summary: 4 repeated still-running lines for implementation T006; elapsed range 30s-155s." in prompt
+    assert "runtime liveness stalled: no recent tool, mutation, or output progress" in prompt
+    assert "[app-delivery] implementation T006: still running" not in prompt
+
 def test_build_stalled_recovery_prompt_includes_browser_e2e_backend_env_prefix(tmp_path: Path) -> None:
     from delivery.task import Task
 

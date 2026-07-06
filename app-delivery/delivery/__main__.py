@@ -56,10 +56,14 @@ HOST_HANDOFF_RETRY_AFTER_SECONDS = 60
 HOST_HANDOFF_MAX_RETRY_ATTEMPTS = 1
 HOST_FALLBACK_FILE = Path(".app-delivery-runtime") / "host-fallback.json"
 HOST_FALLBACK_LOCK_FILE = Path(".app-delivery-runtime") / "host-fallback-lock.json"
-HOST_FALLBACK_DEFAULT_AFTER_SECONDS = 600
+REVIEW_RUNNER_DEFAULT_AFTER_SECONDS = 0
+REVIEW_RUNNER_DEFAULT_MAX_ATTEMPTS = 3
+REVIEW_RUNNER_DEFAULT_IDLE_TIMEOUT_SECONDS = 600
 HOST_FALLBACK_DEFAULT_MAX_ATTEMPTS = 1
 FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
+HANDOFF_REVIEW_RUNNING_STATUS = "review_running"
+HANDOFF_REVIEW_RUNNER_FAILED_STATUS = "review_runner_failed"
 
 
 def _command_runtime(args: argparse.Namespace, project_root: Path | None = None) -> str:
@@ -107,14 +111,33 @@ def _positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _nonnegative_int_config(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _host_fallback_after_seconds(project_root: Path | str) -> int:
     metadata = load_project_metadata(project_root)
-    return _positive_int(metadata.get("host_fallback_after_seconds"), HOST_FALLBACK_DEFAULT_AFTER_SECONDS)
+    mode = str(metadata.get("review_runner_mode") or "framework").strip().casefold()
+    if mode in {"deferred", "legacy", "legacy_handoff"}:
+        return _positive_int(metadata.get("host_fallback_after_seconds"), 600)
+    return _nonnegative_int_config(metadata.get("review_runner_after_seconds"), REVIEW_RUNNER_DEFAULT_AFTER_SECONDS)
 
 
 def _host_fallback_max_attempts(project_root: Path | str) -> int:
     metadata = load_project_metadata(project_root)
+    mode = str(metadata.get("review_runner_mode") or "framework").strip().casefold()
+    if mode not in {"deferred", "legacy", "legacy_handoff"}:
+        return _positive_int(metadata.get("review_runner_max_attempts"), REVIEW_RUNNER_DEFAULT_MAX_ATTEMPTS)
     return _positive_int(metadata.get("host_fallback_max_attempts"), HOST_FALLBACK_DEFAULT_MAX_ATTEMPTS)
+
+
+def _review_runner_idle_timeout_seconds(project_root: Path | str) -> int:
+    metadata = load_project_metadata(project_root)
+    return _positive_int(metadata.get("review_runner_idle_timeout_seconds"), REVIEW_RUNNER_DEFAULT_IDLE_TIMEOUT_SECONDS)
 
 
 def _is_final_repair_task(task: Any) -> bool:
@@ -322,6 +345,9 @@ def _watch_status_snapshot(project_root: Path) -> dict[str, Any]:
                 "status": handoff_status or None,
                 "skill": handoff_skill or None,
                 "task_id": handoff_task_id or None,
+                "review_runner_status": str(handoff.get("review_runner_status") or "").strip() or None,
+                "review_runner_reason": str(handoff.get("review_runner_reason") or "").strip() or None,
+                "runner_pid": handoff.get("runner_pid"),
             }
 
     return {
@@ -362,6 +388,9 @@ def _watch_status_event(
         event["host_status"] = str(handoff.get("status") or "").strip() or None
         event["host_skill"] = str(handoff.get("skill") or "").strip() or None
         event["host_task_id"] = str(handoff.get("task_id") or "").strip() or None
+        event["review_runner_status"] = str(handoff.get("review_runner_status") or "").strip() or None
+        event["review_runner_reason"] = str(handoff.get("review_runner_reason") or "").strip() or None
+        event["review_runner_pid"] = handoff.get("runner_pid")
     if error:
         compact_error = " ".join(str(error).split())
         event["error"] = compact_error[:240]
@@ -878,7 +907,8 @@ def _save_host_handoff(project_root: Path, next_step: dict[str, Any]) -> dict[st
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     now_iso = now.isoformat().replace("+00:00", "Z")
     existing = load_json(path, {})
-    same_waiting_handoff = isinstance(existing, dict) and str(existing.get("handoff_id") or "") == handoff_id and str(existing.get("status") or "") == "waiting_for_host"
+    existing_status = str(existing.get("status") or "") if isinstance(existing, dict) else ""
+    same_waiting_handoff = isinstance(existing, dict) and str(existing.get("handoff_id") or "") == handoff_id and existing_status in {"waiting_for_host", HANDOFF_REVIEW_RUNNING_STATUS, HANDOFF_REVIEW_RUNNER_FAILED_STATUS}
     retry_attempts = _nonnegative_int(existing.get("retry_attempts")) if same_waiting_handoff else 0
     retry_due = _host_handoff_retry_due(existing, handoff_id, now) if isinstance(existing, dict) else False
     if retry_due:
@@ -886,7 +916,7 @@ def _save_host_handoff(project_root: Path, next_step: dict[str, Any]) -> dict[st
     body: dict[str, Any] = {
         "schema_version": "1",
         "handoff_id": handoff_id,
-        "status": "waiting_for_host",
+        "status": existing_status if same_waiting_handoff and existing_status in {HANDOFF_REVIEW_RUNNING_STATUS, HANDOFF_REVIEW_RUNNER_FAILED_STATUS} else "waiting_for_host",
         "project": str(project_root),
         "requested_at": str(existing.get("requested_at") or now_iso) if same_waiting_handoff else now_iso,
         "updated_at": now_iso,
@@ -905,7 +935,7 @@ def _save_host_handoff(project_root: Path, next_step: dict[str, Any]) -> dict[st
         "next_step": next_step,
     }
     if same_waiting_handoff and isinstance(existing, dict):
-        for key in ("retry_requested_at", "retry_reason"):
+        for key in ("retry_requested_at", "retry_reason", "handler", "runner_pid", "runner_started_at", "runner_stdout_log", "runner_stderr_log", "review_runner_status", "review_runner_reason", "review_runner_completed_at", "review_runner_stdout_log", "review_runner_stderr_log", "review_runner_last_activity_at", "review_runner_idle_seconds"):
             if existing.get(key):
                 body[key] = existing[key]
     if retry_due:
@@ -976,6 +1006,71 @@ def _mark_host_handoff_imported(project_root: Path, *, skill: str, task_id: str 
     write_json(path, body)
 
 
+def _mark_host_handoff_review_running(project_root: Path, handoff: dict[str, Any], *, pid: int, started_at: str, stdout_log: Path, stderr_log: Path) -> None:
+    path = _host_handoff_path(project_root)
+    existing = load_json(path, {})
+    body = dict(existing) if isinstance(existing, dict) else dict(handoff)
+    for key in (
+        "review_runner_status",
+        "review_runner_reason",
+        "review_runner_completed_at",
+        "review_runner_stdout_log",
+        "review_runner_stderr_log",
+        "review_runner_last_activity_at",
+        "review_runner_idle_seconds",
+        "review_runner_next_retry_at",
+    ):
+        body.pop(key, None)
+    body.update(
+        {
+            "schema_version": "1",
+            "status": HANDOFF_REVIEW_RUNNING_STATUS,
+            "project": str(project_root),
+            "updated_at": utc_now_iso(),
+            "handler": "review_runner",
+            "runner_pid": pid,
+            "runner_started_at": started_at,
+            "runner_stdout_log": str(stdout_log),
+            "runner_stderr_log": str(stderr_log),
+        }
+    )
+    write_json(path, body)
+
+
+def _mark_host_handoff_review_runner_failed(project_root: Path, fallback_state: dict[str, Any], *, reason: str) -> None:
+    path = _host_handoff_path(project_root)
+    existing = load_json(path, {})
+    if not isinstance(existing, dict):
+        return
+    handoff_id = str(existing.get("handoff_id") or "").strip()
+    fallback_handoff_id = str(fallback_state.get("handoff_id") or "").strip()
+    if not handoff_id or handoff_id != fallback_handoff_id:
+        return
+    existing_status = str(existing.get("status") or "").strip()
+    if existing_status not in {HANDOFF_REVIEW_RUNNING_STATUS, "waiting_for_host", HANDOFF_REVIEW_RUNNER_FAILED_STATUS}:
+        return
+    completed_at = str(fallback_state.get("completed_at") or "").strip() or utc_now_iso()
+    body = dict(existing)
+    body.update(
+        {
+            "schema_version": "1",
+            "status": HANDOFF_REVIEW_RUNNER_FAILED_STATUS,
+            "project": str(project_root),
+            "updated_at": utc_now_iso(),
+            "handler": "review_runner",
+            "review_runner_status": "failed",
+            "review_runner_reason": reason,
+            "review_runner_completed_at": completed_at,
+            "review_runner_stdout_log": str(fallback_state.get("stdout_log") or existing.get("runner_stdout_log") or ""),
+            "review_runner_stderr_log": str(fallback_state.get("stderr_log") or existing.get("runner_stderr_log") or ""),
+            "review_runner_last_activity_at": str(fallback_state.get("last_activity_at") or "").strip() or None,
+            "review_runner_idle_seconds": fallback_state.get("idle_seconds"),
+            "message": "Review runner failed before importing a fresh code-review artifact; retry may run automatically if attempts remain.",
+        }
+    )
+    write_json(path, body)
+
+
 def _mark_host_handoff_notice(project_root: Path, next_step: dict[str, Any]) -> dict[str, Any]:
     body = {
         "schema_version": "1",
@@ -1038,6 +1133,50 @@ def _host_handoff_wait_seconds(handoff: dict[str, Any], now: dt.datetime | None 
     return max(0, int((current - started_at).total_seconds()))
 
 
+def _path_mtime_iso(path_text: Any) -> str:
+    text = str(path_text or "").strip()
+    if not text:
+        return ""
+    try:
+        path = Path(text).expanduser()
+        return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except OSError:
+        return ""
+
+
+def _newest_iso(values: list[Any]) -> str:
+    newest: dt.datetime | None = None
+    for value in values:
+        parsed = _parse_iso_datetime(value)
+        if parsed is None:
+            continue
+        if newest is None or parsed > newest:
+            newest = parsed
+    return newest.isoformat().replace("+00:00", "Z") if newest is not None else ""
+
+
+def _review_runner_activity_at(lock: dict[str, Any], handoff: dict[str, Any]) -> str:
+    return _newest_iso(
+        [
+            lock.get("started_at"),
+            lock.get("updated_at"),
+            _path_mtime_iso(lock.get("stdout_log")),
+            _path_mtime_iso(lock.get("stderr_log")),
+            _path_mtime_iso(handoff.get("expected_input_path")),
+        ]
+    )
+
+
+def _review_runner_idle_seconds(lock: dict[str, Any], handoff: dict[str, Any], *, now: dt.datetime | None = None) -> int:
+    activity_at = _parse_iso_datetime(_review_runner_activity_at(lock, handoff))
+    if activity_at is None:
+        activity_at = _parse_iso_datetime(lock.get("started_at"))
+    if activity_at is None:
+        return 0
+    current = now or dt.datetime.now(dt.timezone.utc)
+    return max(0, int((current - activity_at).total_seconds()))
+
+
 def _host_fallback_attempt_count(state: dict[str, Any], handoff_id: str) -> int:
     attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
     try:
@@ -1092,6 +1231,7 @@ def _reconcile_host_fallback_lock(project_root: Path) -> dict[str, Any] | None:
         current_handoff_id = str(handoff.get("handoff_id") or "").strip() if isinstance(handoff, dict) else ""
         current_status = str(handoff.get("status") or "").strip() if isinstance(handoff, dict) else ""
         if current_handoff_id == handoff_id and current_status == "imported":
+            _terminate_pid(pid)
             payload = {
                 **lock,
                 "status": "completed",
@@ -1099,6 +1239,26 @@ def _reconcile_host_fallback_lock(project_root: Path) -> dict[str, Any] | None:
                 "completed_at": utc_now_iso(),
             }
             _write_host_fallback_state(project_root, payload)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            return payload
+        idle_seconds = _review_runner_idle_seconds(lock, handoff if isinstance(handoff, dict) else {})
+        idle_timeout = _review_runner_idle_timeout_seconds(project_root)
+        if idle_seconds >= idle_timeout:
+            _terminate_pid(pid)
+            payload = {
+                **lock,
+                "status": "failed",
+                "reason": "review_runner_idle_timeout",
+                "completed_at": utc_now_iso(),
+                "last_activity_at": _review_runner_activity_at(lock, handoff if isinstance(handoff, dict) else {}),
+                "idle_seconds": idle_seconds,
+                "idle_timeout_seconds": idle_timeout,
+            }
+            _write_host_fallback_state(project_root, payload)
+            _mark_host_handoff_review_runner_failed(project_root, payload, reason="review_runner_idle_timeout")
             try:
                 lock_path.unlink()
             except FileNotFoundError:
@@ -1124,13 +1284,55 @@ def _reconcile_host_fallback_lock(project_root: Path) -> dict[str, Any] | None:
         "status": status,
         "reason": reason,
         "completed_at": utc_now_iso(),
+        "last_activity_at": _review_runner_activity_at(lock, handoff if isinstance(handoff, dict) else {}),
     }
     _write_host_fallback_state(project_root, payload)
+    if status == "failed":
+        _mark_host_handoff_review_runner_failed(project_root, payload, reason=reason)
     try:
         lock_path.unlink()
     except FileNotFoundError:
         pass
     return payload
+
+
+def _reconcile_host_fallback_state(project_root: Path) -> dict[str, Any] | None:
+    state = load_json(_host_fallback_path(project_root), {})
+    if not isinstance(state, dict) or str(state.get("status") or "").strip() != "running":
+        return None
+    handoff = load_json(_host_handoff_path(project_root), {})
+    if not isinstance(handoff, dict):
+        return None
+    handoff_id = str(state.get("handoff_id") or "").strip()
+    if not handoff_id or str(handoff.get("handoff_id") or "").strip() != handoff_id:
+        return None
+    if str(handoff.get("status") or "").strip() != "imported":
+        return None
+    try:
+        pid = int(state.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid > 0 and process_alive(pid):
+        _terminate_pid(pid)
+    payload = {
+        **state,
+        "status": "completed",
+        "reason": "handoff_imported_after_fallback_state_running",
+        "completed_at": utc_now_iso(),
+        "last_activity_at": _review_runner_activity_at(state, handoff),
+    }
+    _write_host_fallback_state(project_root, payload)
+    return payload
+
+
+def _reconcile_failed_review_runner_handoff(project_root: Path) -> None:
+    fallback_state = load_json(_host_fallback_path(project_root), {})
+    if not isinstance(fallback_state, dict):
+        return
+    if str(fallback_state.get("status") or "").strip() != "failed":
+        return
+    reason = str(fallback_state.get("reason") or "review_runner_failed").strip() or "review_runner_failed"
+    _mark_host_handoff_review_runner_failed(project_root, fallback_state, reason=reason)
 
 
 def _resolve_hermes_bin() -> str | None:
@@ -1146,6 +1348,14 @@ def _resolve_hermes_bin() -> str | None:
         if path.exists() and os.access(path, os.X_OK):
             return str(path)
     return None
+
+
+def _reap_child_process(process: Any) -> None:
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return
+    thread = threading.Thread(target=wait, name=f"app-delivery-reap-{getattr(process, 'pid', 'child')}", daemon=True)
+    thread.start()
 
 
 def _host_fallback_prompt(project_root: Path, handoff: dict[str, Any]) -> str:
@@ -1190,7 +1400,9 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
             pid = 0
         if process_alive(pid):
             return {"status": "running", "reason": "existing_fallback_running", "handoff_id": handoff_id, "task_id": task_id, "pid": pid}
-        _write_host_fallback_state(project_root, {"status": "failed", "reason": "previous_fallback_exited_without_clearing_handoff", "handoff_id": handoff_id, "task_id": task_id, "pid": pid})
+        failed_state = {"status": "failed", "reason": "previous_fallback_exited_without_clearing_handoff", "handoff_id": handoff_id, "task_id": task_id, "pid": pid, "completed_at": utc_now_iso()}
+        _write_host_fallback_state(project_root, failed_state)
+        _mark_host_handoff_review_runner_failed(project_root, failed_state, reason="previous_fallback_exited_without_clearing_handoff")
 
     fallback_state = load_json(_host_fallback_path(project_root), {})
     attempts = _host_fallback_attempt_count(fallback_state if isinstance(fallback_state, dict) else {}, handoff_id)
@@ -1222,6 +1434,7 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
     finally:
         stdout_handle.close()
         stderr_handle.close()
+    _reap_child_process(process)
 
     attempt = _record_host_fallback_attempt(project_root, handoff_id)
     lock_payload = {
@@ -1239,18 +1452,22 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
     }
     write_json(lock_path, lock_payload)
     _write_host_fallback_state(project_root, {**lock_payload, "attempt": attempt})
+    _mark_host_handoff_review_running(project_root, handoff, pid=process.pid, started_at=started_at, stdout_log=stdout_path, stderr_log=stderr_path)
     return {"status": "started", "handoff_id": handoff_id, "task_id": task_id, "pid": process.pid, "attempt": attempt, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path)}
 
 
 def _maybe_start_code_review_host_fallback(project_root: Path) -> dict[str, Any]:
     _reconcile_host_fallback_lock(project_root)
+    _reconcile_host_fallback_state(project_root)
+    _reconcile_failed_review_runner_handoff(project_root)
     if not _host_fallback_enabled_for(project_root):
         return {"status": "skipped", "reason": "host_fallback_disabled"}
     handoff = load_json(_host_handoff_path(project_root), {})
     if not isinstance(handoff, dict):
         return {"status": "skipped", "reason": "host_handoff_missing"}
-    if str(handoff.get("status") or "").strip() != "waiting_for_host":
-        return {"status": "skipped", "reason": "host_handoff_not_waiting", "handoff_status": str(handoff.get("status") or "")}
+    handoff_status = str(handoff.get("status") or "").strip()
+    if handoff_status not in {"waiting_for_host", HANDOFF_REVIEW_RUNNING_STATUS, HANDOFF_REVIEW_RUNNER_FAILED_STATUS}:
+        return {"status": "skipped", "reason": "host_handoff_not_waiting", "handoff_status": handoff_status}
     if str(handoff.get("skill") or "").strip() != "code-review":
         return {"status": "skipped", "reason": "unsupported_host_skill", "skill": str(handoff.get("skill") or "")}
     task_id = str(handoff.get("task_id") or "").strip()

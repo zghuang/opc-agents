@@ -18,6 +18,18 @@ LEDGER_FILES = {
     "docs/test-results.json",
 }
 
+FRAMEWORK_REVIEW_ARTIFACT_FILES = {
+    "docs/reviews/final-review.md",
+    "docs/reviews/final-repair-report.md",
+}
+
+FRAMEWORK_REVIEW_ARTIFACT_PREFIXES = (
+    "docs/reviews/code-review-",
+    "docs/reviews/exception-report-",
+)
+
+FRAMEWORK_TASK_TEST_REPORT_RE = re.compile(r"^docs/reviews/test-report-T[A-Za-z0-9_-]+\.md$")
+
 RUNTIME_STATE_PREFIXES = (
     ".app-delivery-runtime/",
     "app-delivery-runtime/",
@@ -380,6 +392,15 @@ def _relative_to_project(path: Path, project_root: Path) -> str | None:
         return None
 
 
+def _is_framework_review_artifact(path: str) -> bool:
+    normalized = _normalize_scope_path(path)
+    if normalized in FRAMEWORK_REVIEW_ARTIFACT_FILES:
+        return True
+    if any(normalized.startswith(prefix) and normalized.endswith(".md") for prefix in FRAMEWORK_REVIEW_ARTIFACT_PREFIXES):
+        return True
+    return bool(FRAMEWORK_TASK_TEST_REPORT_RE.fullmatch(normalized))
+
+
 def _extract_paths(tool_name: str, tool_input: dict[str, Any], cwd: Path, project_root: Path) -> list[str]:
     if tool_name in {"write", "edit"}:
         raw_path = str(tool_input.get("filePath") or tool_input.get("path") or "").strip()
@@ -473,6 +494,11 @@ def main() -> int:
     if any(path in LEDGER_FILES for path in rel_paths if path != TERMINAL_MUTATION):
         return _emit_block(
             "app-delivery pre-tool guard blocked a direct ledger edit. docs/work-items.json, docs/work-items.md, and summary/test ledgers are machine-owned and may only be changed through app-delivery commands."
+        )
+
+    if any(path != TERMINAL_MUTATION and _is_framework_review_artifact(path) for path in rel_paths):
+        return _emit_block(
+            "app-delivery pre-tool guard blocked a direct framework review artifact edit. code-review, exception, final-review, and task-id test-report artifacts are framework-owned and may only be changed through app-delivery review/verification commands."
         )
 
     if any(

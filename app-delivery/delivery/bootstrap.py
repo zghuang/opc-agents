@@ -345,6 +345,10 @@ def initialize_project(
         "host_fallback_enabled": bool(watchdog_enabled),
         "host_fallback_after_seconds": 600,
         "host_fallback_max_attempts": 1,
+        "review_runner_mode": "framework",
+        "review_runner_after_seconds": 0,
+        "review_runner_max_attempts": 3,
+        "review_runner_idle_timeout_seconds": 600,
         "created_at": utc_now_iso(),
         "dependency_hints": [],
     }

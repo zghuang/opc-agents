@@ -227,6 +227,40 @@ def test_gate_report_paths_are_treated_as_framework_managed() -> None:
     assert _is_always_allowed_framework_path("docs/reviews/gate-report-gate-auth.md") is True
     assert _is_always_allowed_framework_path("docs/reviews/exception-report-T007.md") is True
 
+
+def test_task_scope_delta_blocks_runtime_owned_framework_review_artifacts(tmp_path: Path) -> None:
+    from delivery.loop_gitops import ensure_git_repo, git, task_scope_delta
+    from delivery.task import Task
+
+    ensure_git_repo(tmp_path)
+    (tmp_path / "README.md").write_text("init\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+    (tmp_path / "backend" / "app").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "backend" / "app" / "feature.py").write_text("print('ok')\n", encoding="utf-8")
+    reviews_dir = tmp_path / "docs" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "code-review-T008.md").write_text("status: pass\n", encoding="utf-8")
+    (reviews_dir / "test-report-T008.md").write_text("status: pass\n", encoding="utf-8")
+    (reviews_dir / "test-report-auth-domain.md").write_text("status: pass\n", encoding="utf-8")
+    task = Task(
+        "T008",
+        "Feature",
+        "pending",
+        ["REQ-001"],
+        [],
+        [],
+        ["backend/tests/test_feature.py"],
+        ["backend/app/feature.py", "docs/reviews/test-report-auth-domain.md"],
+    )
+
+    report = task_scope_delta(tmp_path, task, extra_paths=["docs/reviews/test-report-T008.md"])
+
+    assert "backend/app/feature.py" in report["staged_paths"]
+    assert "docs/reviews/test-report-auth-domain.md" in report["staged_paths"]
+    assert "docs/reviews/test-report-T008.md" in report["staged_paths"]
+    assert "docs/reviews/code-review-T008.md" in report["out_of_scope"]
+
 def test_project_summary_reports_unplanned_requirements(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)

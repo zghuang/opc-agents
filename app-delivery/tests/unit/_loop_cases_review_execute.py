@@ -2257,7 +2257,72 @@ def test_execute_task_writes_exception_report_artifact(tmp_path: Path, monkeypat
     assert item["review_artifact"] == "docs/reviews/exception-report-T002.md"
     report_text = (tmp_path / "docs" / "reviews" / "exception-report-T002.md").read_text(encoding="utf-8")
     assert "# Exception Report" in report_text
-    assert "review request failed" in report_text
+
+
+def test_execute_task_restores_runtime_modified_review_artifact_and_continues(tmp_path: Path, monkeypatch) -> None:
+    from delivery.loop_gitops import ensure_git_repo, git
+    from delivery.task import Task
+
+    ensure_git_repo(tmp_path)
+    feature_path = tmp_path / "backend" / "src" / "login" / "service.py"
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_path.write_text("def login():\n    return True\n", encoding="utf-8")
+    review_path = tmp_path / "docs" / "reviews" / "code-review-T002.md"
+    review_path.parent.mkdir(parents=True, exist_ok=True)
+    review_path.write_text("status: changes_requested\noriginal review\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Login",
+                    "status": "pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_login.py"],
+                    "output_paths": ["backend/src/login/service.py"],
+                    "review_status": "changes_requested",
+                    "review_artifact": "docs/reviews/code-review-T002.md",
+                }
+            ],
+        },
+    )
+    save_task_runtime_state(tmp_path, "T002", {"last_changes_requested_review_artifact": "docs/reviews/code-review-T002.md"})
+    loop = DeliveryLoop(tmp_path)
+
+    class DummySession:
+        id = "session-1"
+        runtime = "opencode"
+        task_count = 0
+        created_at = "2026-06-24T00:00:00Z"
+        status = "active"
+        title = "Login"
+
+    def fake_execute(project_root, session, prompt):
+        feature_path.write_text("def login():\n    return 'fixed'\n", encoding="utf-8")
+        review_path.write_text("status: pass\nself-certified\n", encoding="utf-8")
+        return {"text": "ok"}
+
+    monkeypatch.setattr(loop, "_session_for_task", lambda task: DummySession())
+    monkeypatch.setattr("delivery.loop.execute_in_session", fake_execute)
+    monkeypatch.setattr("delivery.loop.run_task_tests", lambda project_root, task, attempt=1: type("R", (), {"passed": True, "passed_count": 1, "failed_count": 0, "failures": [], "test_files": task.get("output_tests", []), "test_types": ["unit"], "requirement_ids": task.get("requirements", []), "task_id": task.get("id", "")})())
+
+    success, state = loop._execute_task(Task("T002", "Login", "pending", ["REQ-001"], [], [], ["backend/tests/test_login.py"], ["backend/src/login/service.py"], review_status="changes_requested", review_artifact="docs/reviews/code-review-T002.md"))
+
+    assert success is False
+    assert state == "review_pending"
+    assert review_path.read_text(encoding="utf-8") == "status: changes_requested\noriginal review\n"
+    runtime_state = load_task_runtime_state(tmp_path, "T002")
+    assert "docs/reviews/code-review-T002.md" not in runtime_state["pending_scope_report"]["out_of_scope"]
+    assert "backend/src/login/service.py" in runtime_state["pending_scope_report"]["staged_paths"]
 
 def test_execute_task_blocks_if_task_disappears_mid_run(tmp_path: Path, monkeypatch) -> None:
     from delivery.task import Task

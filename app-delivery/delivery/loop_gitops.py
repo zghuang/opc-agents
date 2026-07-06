@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import json
@@ -60,6 +61,18 @@ ALWAYS_ALLOWED_FRAMEWORK_PREFIXES = (
     "docs/reviews/gate-report-",
     "docs/reviews/test-report-",
 )
+
+RUNTIME_PROTECTED_FRAMEWORK_ARTIFACT_FILES = {
+    "docs/reviews/final-review.md",
+    "docs/reviews/final-repair-report.md",
+}
+
+RUNTIME_PROTECTED_FRAMEWORK_ARTIFACT_PREFIXES = (
+    "docs/reviews/code-review-",
+    "docs/reviews/exception-report-",
+)
+
+RUNTIME_PROTECTED_TASK_TEST_REPORT_RE = re.compile(r"^docs/reviews/test-report-T[A-Za-z0-9_-]+\.md$")
 
 T000_ONLY_FRAMEWORK_PREFIXES = (
     ".app-delivery-runtime/stage-inputs/",
@@ -251,6 +264,19 @@ def _is_always_allowed_framework_path(path: str) -> bool:
     if normalized in ALWAYS_ALLOWED_FRAMEWORK_PATHS:
         return True
     return any(normalized.startswith(prefix) for prefix in ALWAYS_ALLOWED_FRAMEWORK_PREFIXES)
+
+
+def _is_runtime_protected_framework_artifact(path: str) -> bool:
+    normalized = _normalize_scope_path(path)
+    if normalized in RUNTIME_PROTECTED_FRAMEWORK_ARTIFACT_FILES:
+        return True
+    if any(normalized.startswith(prefix) and normalized.endswith(".md") for prefix in RUNTIME_PROTECTED_FRAMEWORK_ARTIFACT_PREFIXES):
+        return True
+    return bool(RUNTIME_PROTECTED_TASK_TEST_REPORT_RE.fullmatch(normalized))
+
+
+def is_runtime_protected_framework_artifact(path: str) -> bool:
+    return _is_runtime_protected_framework_artifact(path)
 
 
 def _is_t000_only_framework_path(path: str) -> bool:
@@ -446,6 +472,8 @@ def task_scoped_changed_paths(project_root: Path | str, task: Task, *, extra_pat
     scoped = [path for path in changed_paths if any(_path_in_scope(path, scope) for scope in scopes)]
     if task.id == "T000":
         scoped.extend(path for path in changed_paths if _is_t000_only_framework_path(path) and path not in scoped)
+    explicit = {_normalize_scope_path(path) for path in (extra_paths or []) if _normalize_scope_path(path)}
+    scoped = [path for path in scoped if not _is_runtime_protected_framework_artifact(path) or path in explicit]
     return scoped
 
 
@@ -460,7 +488,8 @@ def task_scope_delta(
     changed_paths = git_changed_paths(project_dir)
     scopes = scaffold_commit_paths(project_dir) if task.id == "T000" else task_commit_paths(task, extra_paths=extra_paths)
     scoped_paths = [path for path in changed_paths if any(_path_in_scope(path, scope) for scope in scopes)]
-    always_allowed_paths = [path for path in changed_paths if _is_always_allowed_framework_path(path)]
+    explicit = {_normalize_scope_path(path) for path in (extra_paths or []) if _normalize_scope_path(path)}
+    always_allowed_paths = [path for path in changed_paths if _is_always_allowed_framework_path(path) and (not _is_runtime_protected_framework_artifact(path) or path in explicit)]
     t000_only_paths = [path for path in changed_paths if task.id == "T000" and _is_t000_only_framework_path(path)]
     runtime_local_paths = [path for path in changed_paths if _is_runtime_local_only_path(path)]
     preserved = {_normalize_scope_path(path) for path in (preserved_paths or []) if _normalize_scope_path(path)}

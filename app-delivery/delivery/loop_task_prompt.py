@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,11 @@ from .task import Task, all_tasks, lint_task_contract
 FINAL_REPAIR_REPORT_PATH = "docs/reviews/final-repair-report.md"
 FINAL_VERIFICATION_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
+MAX_RUNTIME_ATTENTION_MESSAGE_CHARS = 1000
+MAX_RUNTIME_ATTENTION_DETAIL_LINES = 6
+APP_DELIVERY_HEARTBEAT_RE = re.compile(
+    r"^\[app-delivery\]\s+(?P<phase>[A-Za-z0-9_.-]+)\s+(?P<label>.*?):\s+still running(?:\s+\((?P<elapsed>\d+)s elapsed\))?\s*$"
+)
 
 
 def _prompt_dir(project_root: Path | str) -> Path:
@@ -25,9 +32,45 @@ def _prompt_dir(project_root: Path | str) -> Path:
     return prompt_dir
 
 
-def write_task_prompt(project_root: Path | str, task: Task, prompt: str) -> Path:
+def _prompt_history_dir(project_root: Path | str, task: Task) -> Path:
+    paths = project_paths(project_root)
+    history_dir = paths.runtime_dir / "prompt-history" / task.id
+    history_dir.mkdir(parents=True, exist_ok=True)
+    return history_dir
+
+
+def _safe_prompt_kind(prompt_kind: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(prompt_kind or "task").strip().lower()).strip("-._")
+    return normalized or "task"
+
+
+def _prompt_history_timestamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _prompt_history_path(project_root: Path | str, task: Task, prompt_kind: str) -> Path:
+    history_dir = _prompt_history_dir(project_root, task)
+    timestamp = _prompt_history_timestamp()
+    safe_kind = _safe_prompt_kind(prompt_kind)
+    candidate = history_dir / f"{timestamp}-{safe_kind}.md"
+    suffix = 2
+    while candidate.exists():
+        candidate = history_dir / f"{timestamp}-{safe_kind}-{suffix}.md"
+        suffix += 1
+    return candidate
+
+
+def _archive_task_prompt(project_root: Path | str, task: Task, prompt: str, *, prompt_kind: str) -> None:
+    try:
+        _prompt_history_path(project_root, task, prompt_kind).write_text(prompt, encoding="utf-8")
+    except OSError:
+        return
+
+
+def write_task_prompt(project_root: Path | str, task: Task, prompt: str, *, prompt_kind: str = "task") -> Path:
     path = _prompt_dir(project_root) / f"{task.id}.md"
     path.write_text(prompt, encoding="utf-8")
+    _archive_task_prompt(project_root, task, prompt, prompt_kind=prompt_kind)
     return path
 
 
@@ -68,6 +111,67 @@ def _relevant_failed_results(task: Task, test_results: dict[str, object]) -> lis
         ):
             relevant.append(row)
     return relevant[-5:]
+
+
+def _trim_attention_details(lines: list[str]) -> str:
+    details: list[str] = []
+    for line in lines:
+        stripped = str(line or "").strip()
+        if not stripped:
+            continue
+        if details and stripped == details[-1]:
+            continue
+        details.append(stripped)
+        if len(details) >= MAX_RUNTIME_ATTENTION_DETAIL_LINES:
+            break
+    text = "\n".join(details).strip()
+    if len(text) > MAX_RUNTIME_ATTENTION_MESSAGE_CHARS:
+        text = text[:MAX_RUNTIME_ATTENTION_MESSAGE_CHARS].rstrip() + "..."
+    return text
+
+
+def _format_heartbeat_summary(heartbeat_rows: list[dict[str, object]]) -> str:
+    first = heartbeat_rows[0]
+    phase = str(first.get("phase") or "runtime").strip() or "runtime"
+    label = str(first.get("label") or "task").strip() or "task"
+    same_target = all(str(row.get("phase") or "").strip() == phase and str(row.get("label") or "").strip() == label for row in heartbeat_rows)
+    target = f" for {phase} {label}" if same_target else ""
+    elapsed_values = [int(row["elapsed"]) for row in heartbeat_rows if isinstance(row.get("elapsed"), int)]
+    elapsed = ""
+    if elapsed_values:
+        elapsed = f"; elapsed range {elapsed_values[0]}s-{elapsed_values[-1]}s"
+    return f"Wrapper heartbeat summary: {len(heartbeat_rows)} repeated still-running lines{target}{elapsed}."
+
+
+def normalize_runtime_attention_message(message: object) -> str:
+    raw = str(message or "").strip()
+    if not raw:
+        return "Runtime stalled without meaningful progress."
+    heartbeat_rows: list[dict[str, object]] = []
+    detail_lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = APP_DELIVERY_HEARTBEAT_RE.match(stripped)
+        if match:
+            elapsed_text = match.group("elapsed")
+            heartbeat_rows.append(
+                {
+                    "phase": match.group("phase"),
+                    "label": match.group("label"),
+                    "elapsed": int(elapsed_text) if elapsed_text else None,
+                }
+            )
+            continue
+        detail_lines.append(stripped)
+    if not heartbeat_rows:
+        return _trim_attention_details(raw.splitlines()) or "Runtime stalled without meaningful progress."
+    parts = [_format_heartbeat_summary(heartbeat_rows)]
+    detail_text = _trim_attention_details(detail_lines)
+    if detail_text:
+        parts.append(detail_text)
+    return "\n".join(parts)
 
 
 def _relevant_gate_rows(project_root: Path | str, task: Task) -> list[dict[str, object]]:
@@ -432,18 +536,18 @@ def build_review_repair_prompt(project_root: Path | str, task: Task) -> str:
     lines.append("- If your changes break nearby previously passing tests, apply the minimal correct fix.")
     lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
     prompt = "\n".join(lines)
-    write_task_prompt(project_root, task, prompt)
+    write_task_prompt(project_root, task, prompt, prompt_kind="review-repair")
     return prompt
 
 
 def build_task_prompt(project_root: Path | str, task: Task) -> str:
     if task.id == FRONTEND_API_AUDIT_TASK_ID:
         prompt = render_frontend_api_audit_prompt(project_root, task)
-        write_task_prompt(project_root, task, prompt)
+        write_task_prompt(project_root, task, prompt, prompt_kind="task")
         return prompt
     if task.id == PREFINAL_AUDIT_TASK_ID:
         prompt = render_prefinal_audit_prompt(project_root, task)
-        write_task_prompt(project_root, task, prompt)
+        write_task_prompt(project_root, task, prompt, prompt_kind="task")
         return prompt
     if task.task_kind == "validation":
         return build_validation_task_prompt(project_root, task)
@@ -555,7 +659,7 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
     lines.append("- If your changes break nearby previously passing tests, apply the minimal correct fix.")
     lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
     prompt = "\n".join(lines)
-    write_task_prompt(project_root, task, prompt)
+    write_task_prompt(project_root, task, prompt, prompt_kind="task")
     return prompt
 
 
@@ -677,7 +781,7 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
     _append_validation_command_guidance(lines, project_root, task, has_backend_specs=has_backend_specs, has_frontend_specs=has_frontend_specs)
     lines.append("- When the current task is complete, blocked, or ready for review, stop and wait for the framework to route the next step.")
     prompt = "\n".join(lines)
-    write_task_prompt(project_root, task, prompt)
+    write_task_prompt(project_root, task, prompt, prompt_kind="validation")
     return prompt
 
 
@@ -723,7 +827,9 @@ def build_fix_prompt(project_root: Path | str, task: Task, test_summary: str) ->
             "- Repair the implementation or the tests if they are brittle, then stop as soon as the current task is complete, blocked, or ready for review.",
         ]
     )
-    return "\n".join(lines)
+    prompt = "\n".join(lines)
+    write_task_prompt(project_root, task, prompt, prompt_kind="test-fix")
+    return prompt
 
 
 def build_stalled_recovery_prompt(
@@ -754,7 +860,7 @@ def build_stalled_recovery_prompt(
         f"- Last file mutation timestamp: {str(runtime_state.get('last_mutation_at') or 'none recorded').strip() or 'none recorded'}",
     ]
     if runtime_attention:
-        lines.append(f"- Attention signal: {str(runtime_attention.get('kind') or 'stalled').strip()} — {str(runtime_attention.get('message') or '').strip() or 'Runtime stalled without meaningful progress.'}")
+        lines.append(f"- Attention signal: {str(runtime_attention.get('kind') or 'stalled').strip()} — {normalize_runtime_attention_message(runtime_attention.get('message'))}")
     lines.append("")
     if failed_summary:
         lines.append("Current failed-test context:")
@@ -781,7 +887,9 @@ def build_stalled_recovery_prompt(
         has_frontend_specs=any(spec.startswith("frontend/") for spec in task.output_tests),
     )
     lines.append("- When the task is complete, blocked, or ready for review, stop immediately and let the framework route the next step.")
-    return "\n".join(lines)
+    prompt = "\n".join(lines)
+    write_task_prompt(project_root, task, prompt, prompt_kind="stalled-recovery")
+    return prompt
 
 
 def build_scope_fix_prompt(task: Task, message: str) -> str:

@@ -31,6 +31,25 @@ def _run_guard(project_root: Path, command: str, *, workdir: str | None = None) 
     return json.loads(output) if output else {}
 
 
+def _run_guard_tool(project_root: Path, tool_name: str, tool_input: dict[str, object]) -> dict[str, object]:
+    payload = {
+        "tool_name": tool_name,
+        "cwd": str(project_root),
+        "tool_input": tool_input,
+    }
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT)],
+        input=json.dumps(payload),
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    output = completed.stdout.strip()
+    return json.loads(output) if output else {}
+
+
 def _seed_project(project_root: Path, *, task_id: str = "T003", output_paths: list[str] | None = None) -> None:
     (project_root / "docs").mkdir(parents=True, exist_ok=True)
     (project_root / ".app-delivery-runtime").mkdir(parents=True, exist_ok=True)
@@ -155,3 +174,26 @@ def test_guard_blocks_out_of_scope_delete(tmp_path: Path) -> None:
     result = _run_guard(tmp_path, "rm docs/requirements-source.md")
 
     assert result["decision"] == "block"
+
+
+def test_guard_blocks_direct_framework_review_artifact_writes(tmp_path: Path) -> None:
+    _seed_project(tmp_path)
+
+    for path in [
+        "docs/reviews/code-review-T008.md",
+        "docs/reviews/exception-report-T008.md",
+        "docs/reviews/test-report-T008.md",
+        "docs/reviews/final-review.md",
+        "docs/reviews/final-repair-report.md",
+    ]:
+        result = _run_guard_tool(tmp_path, "write", {"filePath": str(tmp_path / path), "content": "status: pass\n"})
+        assert result["decision"] == "block"
+        assert "framework review artifact" in str(result["reason"])
+
+
+def test_guard_allows_task_owned_review_docs_without_framework_name(tmp_path: Path) -> None:
+    _seed_project(tmp_path, output_paths=["docs/reviews/test-report-auth-domain.md"])
+
+    result = _run_guard_tool(tmp_path, "write", {"filePath": str(tmp_path / "docs/reviews/test-report-auth-domain.md"), "content": "status: pass\n"})
+
+    assert result == {}

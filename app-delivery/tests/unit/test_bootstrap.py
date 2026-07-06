@@ -50,6 +50,10 @@ def test_initialize_project_creates_scaffold_and_metadata(tmp_path: Path) -> Non
     assert bootstrap_meta["host_fallback_enabled"] is True
     assert bootstrap_meta["host_fallback_after_seconds"] == 600
     assert bootstrap_meta["host_fallback_max_attempts"] == 1
+    assert bootstrap_meta["review_runner_mode"] == "framework"
+    assert bootstrap_meta["review_runner_after_seconds"] == 0
+    assert bootstrap_meta["review_runner_max_attempts"] == 3
+    assert bootstrap_meta["review_runner_idle_timeout_seconds"] == 600
 
 
 def test_python_react_template_does_not_precreate_backend_package_layout() -> None:
