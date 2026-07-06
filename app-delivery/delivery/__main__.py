@@ -30,7 +30,7 @@ from .scaffold import write_project_structure_snapshot
 from .session import RuntimeSession, current_session, retire_session, save_current_session
 from .watchdog import process_alive, save_watchdog_state, should_watchdog_resume, spawn_watchdog
 from .stage_harness import import_arch_design, import_context_sync, import_decompose, import_spec_review, import_ui_design, load_stage_payload, stage_import_command, stage_input_path, stage_missing_error
-from .loop_gitops import reapply_task_exception_patch
+from .loop_gitops import try_reapply_task_exception_patch
 from .state import (
     acquire_lock,
     latest_task_log_event,
@@ -53,6 +53,23 @@ CONTROL_STEP_LIMIT = 128
 EXECUTION_LOCK_TIMEOUT_SECONDS = 5.0
 HOST_HANDOFF_FILE = Path(".app-delivery-runtime") / "host-handoff.json"
 HOST_HANDOFF_RETRY_AFTER_SECONDS = 60
+
+
+def _runtime_state_for_exception_patch_reapply(reapply_result: dict[str, Any]) -> dict[str, Any]:
+    status = str(reapply_result.get("status") or "").strip()
+    state: dict[str, Any] = {
+        "exception_patch_reapply": reapply_result,
+        "exception_patch_conflict": None,
+    }
+    if status == "conflict":
+        state.update(
+            {
+                "force_task_prompt": True,
+                "force_task_prompt_reason": "exception_patch_conflict",
+                "exception_patch_conflict": reapply_result,
+            }
+        )
+    return state
 HOST_HANDOFF_MAX_RETRY_ATTEMPTS = 1
 HOST_FALLBACK_FILE = Path(".app-delivery-runtime") / "host-fallback.json"
 HOST_FALLBACK_LOCK_FILE = Path(".app-delivery-runtime") / "host-fallback-lock.json"
@@ -624,11 +641,19 @@ def _run_fix_once(
             active_session = current_session(resolved)
             if active_session and active_session.id == current.status_session_id:
                 retire_session(resolved, active_session)
-        reapply_task_exception_patch(resolved, task_id)
+        reapply_result = try_reapply_task_exception_patch(resolved, task_id)
         runtime_path = task_runtime_state_path(resolved, task_id)
         if runtime_path.exists():
             runtime_path.unlink()
-        save_task_runtime_state(resolved, task_id, {"force_task_prompt": True, "force_task_prompt_reason": "manual_fix"})
+        save_task_runtime_state(
+            resolved,
+            task_id,
+            {
+                "force_task_prompt": True,
+                "force_task_prompt_reason": "manual_fix",
+                **_runtime_state_for_exception_patch_reapply(reapply_result),
+            },
+        )
         prompt_path = resolved / ".app-delivery-runtime" / "prompts" / f"{task_id}.md"
         if prompt_path.exists():
             prompt_path.unlink()
@@ -1884,7 +1909,8 @@ def cmd_task(args: argparse.Namespace) -> int:
                     "failure_message": "",
                 },
             )
-            reapply_task_exception_patch(project_root, task_id)
+            reapply_result = try_reapply_task_exception_patch(project_root, task_id)
+            save_task_runtime_state(project_root, task_id, _runtime_state_for_exception_patch_reapply(reapply_result))
         else:
             raise DeliveryError(
                 code="manual_task_action_invalid",

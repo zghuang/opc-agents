@@ -1204,6 +1204,63 @@ index 1840f4f..0c54728 100644
     assert not patch_path.exists()
 
 
+def test_cmd_fix_records_exception_patch_conflict_for_runtime_resolution(tmp_path: Path) -> None:
+    from delivery.loop_gitops import ensure_git_repo, git
+
+    ensure_git_repo(tmp_path)
+    (tmp_path / "backend" / "src" / "project").mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "backend" / "src" / "project" / "router.py"
+    target.write_text("print('base')\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+    target.write_text("print('new base')\n", encoding="utf-8")
+    git(["add", "--", "backend/src/project/router.py"], cwd=tmp_path)
+    git(["commit", "-m", "feat(T009): update router base"], cwd=tmp_path)
+
+    patch_dir = tmp_path / ".app-delivery-runtime" / "exception-patches"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = patch_dir / "T002.patch"
+    patch_path.write_text(
+        """diff --git a/backend/src/project/router.py b/backend/src/project/router.py
+index 1840f4f..0c54728 100644
+--- a/backend/src/project/router.py
++++ b/backend/src/project/router.py
+@@ -1 +1 @@
+-print('base')
++print('patched')
+""",
+        encoding="utf-8",
+    )
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/project/router.py"]},
+            ],
+        },
+    )
+
+    result = cli.cmd_fix(argparse.Namespace(project=str(tmp_path), task_id="T002", no_start=True, runtime="claude"))
+
+    runtime_state = load_task_runtime_state(tmp_path, "T002")
+    conflict = runtime_state["exception_patch_conflict"]
+    assert result == 0
+    assert target.read_text(encoding="utf-8") == "print('new base')\n"
+    assert patch_path.exists()
+    assert conflict["status"] == "conflict"
+    assert conflict["patch_path"] == ".app-delivery-runtime/exception-patches/T002.patch"
+    assert conflict["conflict_brief_path"] == ".app-delivery-runtime/exception-conflicts/T002.md"
+    assert conflict["affected_paths"] == ["backend/src/project/router.py"]
+    assert runtime_state["force_task_prompt"] is True
+    assert runtime_state["force_task_prompt_reason"] == "exception_patch_conflict"
+    assert (tmp_path / conflict["conflict_brief_path"]).exists()
+
+
 def test_cmd_fix_returns_nonzero_when_resume_finds_no_runnable_tasks(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setattr(
         cli,

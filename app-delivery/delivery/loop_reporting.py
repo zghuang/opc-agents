@@ -489,6 +489,52 @@ def _task_log_first_started_at(project_root: Path, task_id: str) -> dt.datetime 
     return min(starts) if starts else None
 
 
+def _task_log_active_duration_minutes(project_root: Path, task_id: str) -> int | None:
+    task_label = str(task_id or "").strip()
+    if not task_label:
+        return None
+    task_log = project_root / ".app-delivery-runtime" / "task-log.jsonl"
+    try:
+        lines = task_log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    starts: list[dt.datetime] = []
+    total_seconds = 0
+    saw_terminal = False
+    terminal_messages = {
+        f"Completed implementation {task_label}",
+        f"Failed implementation {task_label}",
+        f"Stalled implementation {task_label}",
+    }
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("task_id") or "").strip() != task_label:
+            continue
+        timestamp = _parse_iso_datetime(payload.get("ts"))
+        if timestamp is None:
+            continue
+        message = str(payload.get("message") or "").strip()
+        if message == f"Started implementation {task_label}":
+            starts.append(timestamp)
+            continue
+        if message not in terminal_messages or not starts:
+            continue
+        started_at = starts.pop()
+        total_seconds += max(0, int((timestamp - started_at).total_seconds()))
+        saw_terminal = True
+    if not saw_terminal:
+        return None
+    return max(0, total_seconds // 60)
+
+
 def _task_started_at_for_metrics(project_root: Path, task: Any, runtime_state: dict[str, Any]) -> dt.datetime | None:
     candidates = [
         _parse_iso_datetime(runtime_state.get("first_started_at")),
@@ -504,6 +550,9 @@ def _task_metrics(project_root: Path, task: Any) -> dict[str, Any]:
     started_at = _task_started_at_for_metrics(project_root, task, runtime_state)
     completed_at = _parse_iso_datetime(task.verified_at or task.completed_at)
     duration_minutes, duration_formatted = _duration_between(started_at, completed_at)
+    active_duration_minutes = _task_log_active_duration_minutes(project_root, task.id)
+    effective_duration_minutes = active_duration_minutes if active_duration_minutes is not None else duration_minutes
+    effective_duration_formatted = _format_minutes(effective_duration_minutes)
     records = execution_token_records_for_task(project_root, task.id)
     prompt_tokens = 0
     completion_tokens = 0
@@ -533,6 +582,10 @@ def _task_metrics(project_root: Path, task: Any) -> dict[str, Any]:
         "completed_at": completed_at.isoformat().replace("+00:00", "Z") if completed_at else None,
         "duration_minutes": duration_minutes,
         "duration_formatted": duration_formatted,
+        "active_duration_minutes": active_duration_minutes,
+        "active_duration_formatted": _format_minutes(active_duration_minutes),
+        "effective_duration_minutes": effective_duration_minutes,
+        "effective_duration_formatted": effective_duration_formatted,
         "prompt_tokens": prompt_tokens or None,
         "completion_tokens": completion_tokens or None,
         "total_tokens": total_tokens or None,
@@ -1010,7 +1063,7 @@ def render_project_summary(project_root: Path | str, payload: dict[str, Any]) ->
         "",
         f"- Verified tasks: {verified_metrics.get('verified_tasks', 0)}",
         f"- Tasks with recorded token metrics: {verified_metrics.get('tasks_with_total_tokens', 0)}",
-        f"- Summed verified task elapsed durations: {verified_metrics.get('task_duration_minutes_sum', 'unavailable')}",
+        f"- Summed verified task active durations: {verified_metrics.get('task_duration_minutes_sum', 'unavailable')}",
         f"- Verified task execution tokens: {verified_metrics.get('task_total_tokens_sum', 'unavailable')}",
         "",
     ])
@@ -1018,16 +1071,16 @@ def render_project_summary(project_root: Path | str, payload: dict[str, Any]) ->
         "",
         "## Task Metrics",
         "",
-        "Task elapsed duration is measured from the first recorded implementation start to the final verified/completed timestamp. It intentionally includes repair turns, review loops, stalls, and reruns; it is not a single runtime session duration.",
+        "Task duration shows active implementation runtime intervals when task-log events are available. The JSON also keeps wall-clock span fields from first start to final verified/completed time for auditability.",
         "",
-        "| Task | Elapsed Duration | Tokens | Session |",
+        "| Task | Active Duration | Tokens | Session |",
         "| --- | --- | --- | --- |",
     ])
     for row in payload.get("task_metrics", []) if isinstance(payload.get("task_metrics"), list) else []:
         if not isinstance(row, dict):
             continue
         lines.append(
-            f"| {row.get('task_id', '-')} | {row.get('duration_formatted', 'unavailable')} | {row.get('total_tokens', 'unavailable')} | {row.get('session_id') or '-'} |"
+            f"| {row.get('task_id', '-')} | {row.get('effective_duration_formatted') or row.get('duration_formatted', 'unavailable')} | {row.get('total_tokens', 'unavailable')} | {row.get('session_id') or '-'} |"
         )
     summary_md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return summary_json_path
@@ -1209,7 +1262,7 @@ def project_summary(project_root: Path | str) -> dict[str, Any]:
         derived_last_heartbeat = active_task.get("updated_at")
     task_metrics = [_task_metrics(project_dir, task) for task in tasks if task.id != FINAL_VERIFY_TASK_ID]
     verified_rows = [row for row in task_metrics if str(row.get("status") or "") == "verified"]
-    verified_duration_sum = sum((row.get("duration_minutes") or 0) for row in verified_rows if isinstance(row.get("duration_minutes"), int)) or None
+    verified_duration_sum = sum((row.get("effective_duration_minutes") or 0) for row in verified_rows if isinstance(row.get("effective_duration_minutes"), int)) or None
     verified_token_sum = sum((row.get("total_tokens") or 0) for row in verified_rows if isinstance(row.get("total_tokens"), int)) or None
     project_start = min(
         (

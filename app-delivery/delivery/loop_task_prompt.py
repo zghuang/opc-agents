@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .requirements_context import format_acceptance_context, format_requirement_context
-from .state import load_gates, load_test_results, project_paths
+from .state import load_gates, load_task_runtime_state, load_test_results, project_paths
 from .test_env import frontend_e2e_env_prefix
 from .builtin_task_prompts import render_frontend_api_audit_prompt, render_prefinal_audit_prompt
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, SHARED_FOUNDATION_TASK_ID
@@ -23,6 +23,8 @@ MAX_RUNTIME_ATTENTION_DETAIL_LINES = 6
 APP_DELIVERY_HEARTBEAT_RE = re.compile(
     r"^\[app-delivery\]\s+(?P<phase>[A-Za-z0-9_.-]+)\s+(?P<label>.*?):\s+still running(?:\s+\((?P<elapsed>\d+)s elapsed\))?\s*$"
 )
+OPENCODE_EVENT_LINE_RE = re.compile(r'^\{\s*"type"\s*:\s*"(?:step_start|step_finish|tool_use|text|app-delivery-wrapper-(?:start|end))"')
+SHELL_METADATA_RE = re.compile(r"</?shell_metadata>")
 
 
 def _prompt_dir(project_root: Path | str) -> Path:
@@ -79,6 +81,37 @@ def _normalize_path(path: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized
+
+
+def _append_exception_patch_conflict_section(lines: list[str], project_root: Path | str, task: Task) -> None:
+    runtime_state = load_task_runtime_state(project_root, task.id)
+    conflict = runtime_state.get("exception_patch_conflict")
+    if not isinstance(conflict, dict) or str(conflict.get("status") or "").strip() != "conflict":
+        return
+    patch_path = str(conflict.get("patch_path") or "").strip() or f".app-delivery-runtime/exception-patches/{task.id}.patch"
+    brief_path = str(conflict.get("conflict_brief_path") or "").strip() or f".app-delivery-runtime/exception-conflicts/{task.id}.md"
+    affected_paths = [str(path).strip() for path in conflict.get("affected_paths", []) if str(path).strip()] if isinstance(conflict.get("affected_paths"), list) else []
+    affected_summary = ", ".join(affected_paths) if affected_paths else "unknown"
+    git_output = str(conflict.get("git_output") or "").strip()
+    lines.extend(
+        [
+            "Exception patch conflict:",
+            f"- Patch artifact: {patch_path}",
+            f"- Conflict brief: {brief_path}",
+            f"- Affected paths: {affected_summary}",
+            "- First resolve this inside the current implementation runtime session; do not invoke an external review runner for this merge step.",
+            "- Do not add Git conflict markers. Read the patch and current files, then migrate the patch intent into the current code directly.",
+            "- Preserve current verified-task behavior unless the patch intent requires a narrow compatible change.",
+            "- After resolving the patch conflict, continue this task's normal implementation and declared tests.",
+        ]
+    )
+    if git_output:
+        lines.extend(["- git apply --check output:"])
+        for raw_line in git_output.splitlines()[:8]:
+            line = raw_line.strip()
+            if line:
+                lines.append(f"  {line}")
+    lines.append("")
 
 
 def _path_overlaps(scope: str, candidate: str) -> bool:
@@ -143,6 +176,19 @@ def _format_heartbeat_summary(heartbeat_rows: list[dict[str, object]]) -> str:
     return f"Wrapper heartbeat summary: {len(heartbeat_rows)} repeated still-running lines{target}{elapsed}."
 
 
+def _is_noisy_runtime_attention_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return True
+    if OPENCODE_EVENT_LINE_RE.match(stripped):
+        return True
+    if SHELL_METADATA_RE.search(stripped):
+        return True
+    if stripped.startswith(('"type":"', '"part":{', '"state":{', '"metadata":{', '"output":"', '"input":{')):
+        return True
+    return False
+
+
 def normalize_runtime_attention_message(message: object) -> str:
     raw = str(message or "").strip()
     if not raw:
@@ -164,9 +210,12 @@ def normalize_runtime_attention_message(message: object) -> str:
                 }
             )
             continue
+        if _is_noisy_runtime_attention_line(stripped):
+            continue
         detail_lines.append(stripped)
     if not heartbeat_rows:
-        return _trim_attention_details(raw.splitlines()) or "Runtime stalled without meaningful progress."
+        clean_lines = [line for line in raw.splitlines() if not _is_noisy_runtime_attention_line(line)]
+        return _trim_attention_details(clean_lines) or "Runtime stalled without meaningful progress."
     parts = [_format_heartbeat_summary(heartbeat_rows)]
     detail_text = _trim_attention_details(detail_lines)
     if detail_text:
@@ -497,6 +546,7 @@ def build_review_repair_prompt(project_root: Path | str, task: Task) -> str:
         f"Project path: {project_dir}",
         "",
     ]
+    _append_exception_patch_conflict_section(lines, project_root, task)
     _append_task_intent_section(lines, task)
     requirement_context = format_requirement_context(project_root, task.requirements) or []
     acceptance_context = format_acceptance_context(project_root, task.acceptance_scenarios) or []
@@ -566,6 +616,7 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
         f"Project path: {project_dir}",
         "",
     ]
+    _append_exception_patch_conflict_section(lines, project_root, task)
     _append_task_intent_section(lines, task)
     _append_repair_focus_section(lines, project_root, task)
     if task.requirements:

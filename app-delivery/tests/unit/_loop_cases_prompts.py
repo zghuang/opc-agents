@@ -775,6 +775,46 @@ def test_task_prompts_keep_current_file_and_append_history(tmp_path: Path, monke
     assert "Review repair mode:" in repair_prompt
 
 
+def test_build_task_prompt_includes_exception_patch_conflict_for_runtime_resolution(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "exception_patch_conflict": {
+                "status": "conflict",
+                "patch_path": ".app-delivery-runtime/exception-patches/T002.patch",
+                "conflict_brief_path": ".app-delivery-runtime/exception-conflicts/T002.md",
+                "affected_paths": ["backend/src/project/router.py"],
+                "git_output": "error: patch failed: backend/src/project/router.py:1",
+            }
+        },
+    )
+
+    prompt = build_task_prompt(
+        tmp_path,
+        Task(
+            "T002",
+            "Feature",
+            "pending",
+            ["REQ-001"],
+            [],
+            [],
+            ["backend/tests/test_project.py"],
+            ["backend/src/project/router.py"],
+        ),
+    )
+
+    assert "Exception patch conflict:" in prompt
+    assert "Patch artifact: .app-delivery-runtime/exception-patches/T002.patch" in prompt
+    assert "Conflict brief: .app-delivery-runtime/exception-conflicts/T002.md" in prompt
+    assert "First resolve this inside the current implementation runtime session" in prompt
+    assert "do not invoke an external review runner" in prompt
+    assert "Do not add Git conflict markers" in prompt
+    assert "error: patch failed: backend/src/project/router.py:1" in prompt
+
+
 def test_build_stalled_recovery_prompt_summarizes_wrapper_heartbeat_spam(tmp_path: Path) -> None:
     from delivery.task import Task
 
@@ -809,6 +849,49 @@ def test_build_stalled_recovery_prompt_summarizes_wrapper_heartbeat_spam(tmp_pat
     assert "Wrapper heartbeat summary: 4 repeated still-running lines for implementation T006; elapsed range 30s-155s." in prompt
     assert "runtime liveness stalled: no recent tool, mutation, or output progress" in prompt
     assert "[app-delivery] implementation T006: still running" not in prompt
+
+
+def test_build_stalled_recovery_prompt_filters_raw_runtime_jsonl_noise(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    prompt = build_stalled_recovery_prompt(
+        tmp_path,
+        Task(
+            "T904",
+            "Final Verification Repair Bundle",
+            "active",
+            [],
+            [],
+            [],
+            ["frontend/e2e/full-chain.spec.ts"],
+            ["backend/", "frontend/"],
+        ),
+        runtime_state={"session_id": "ses-op-stall", "started_at": "2026-07-06T13:27:34Z", "last_tool_at": "2026-07-06T13:35:54Z"},
+        runtime_attention={
+            "kind": "stalled_runtime",
+            "message": "\n".join(
+                [
+                    "[app-delivery] implementation T904: still running (35s elapsed)",
+                    "[app-delivery] implementation T904: still running (1136s elapsed)",
+                    "[app-delivery] stalled_runtime: runtime liveness stalled: no recent tool, mutation, or output progress",
+                    '{"type":"step_start","timestamp":1783344458558,"sessionID":"ses-op-stall","part":{"type":"step-start"}}',
+                    '{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"npm run e2e"},"output":"very long output"}}}',
+                    "<shell_metadata>",
+                    "shell tool terminated command after exceeding timeout 180000 ms.",
+                    "</shell_metadata>",
+                ]
+            ),
+            "last_tool_name": "bash",
+        },
+    )
+
+    assert "Wrapper heartbeat summary: 2 repeated still-running lines for implementation T904; elapsed range 35s-1136s." in prompt
+    assert "runtime liveness stalled: no recent tool, mutation, or output progress" in prompt
+    assert '"type":"tool_use"' not in prompt
+    assert "step_start" not in prompt
+    assert "shell_metadata" not in prompt
+    assert "npm run e2e" not in prompt
+
 
 def test_build_stalled_recovery_prompt_includes_browser_e2e_backend_env_prefix(tmp_path: Path) -> None:
     from delivery.task import Task

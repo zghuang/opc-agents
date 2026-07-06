@@ -7,6 +7,7 @@ import subprocess
 import json
 import time
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from .runtime_config import load_project_runtime
 from .production_semantics import mock_only_browser_e2e_issues
@@ -88,8 +89,10 @@ RUNTIME_LOCAL_ONLY_PREFIXES = (
 )
 
 EXCEPTION_PATCHES_DIR = Path(".app-delivery-runtime") / "exception-patches"
+EXCEPTION_CONFLICTS_DIR = Path(".app-delivery-runtime") / "exception-conflicts"
 GIT_INDEX_LOCK_RETRY_SECONDS = 10.0
 GIT_INDEX_LOCK_RETRY_INTERVAL_SECONDS = 0.5
+MAX_EXCEPTION_PATCH_CONFLICT_OUTPUT_CHARS = 4000
 
 
 def _git_index_lock_error(output: str) -> bool:
@@ -509,6 +512,92 @@ def task_exception_patch_path(project_root: Path | str, task_id: str) -> Path:
     return project_dir / EXCEPTION_PATCHES_DIR / f"{task_id}.patch"
 
 
+def task_exception_conflict_brief_path(project_root: Path | str, task_id: str) -> Path:
+    project_dir = Path(project_root).expanduser().resolve()
+    return project_dir / EXCEPTION_CONFLICTS_DIR / f"{task_id}.md"
+
+
+def _truncate_exception_patch_output(text: str) -> str:
+    normalized = str(text or "").strip()
+    if len(normalized) <= MAX_EXCEPTION_PATCH_CONFLICT_OUTPUT_CHARS:
+        return normalized
+    return normalized[:MAX_EXCEPTION_PATCH_CONFLICT_OUTPUT_CHARS].rstrip() + "\n[truncated]"
+
+
+def _patch_changed_paths(patch_text: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for raw_line in str(patch_text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("diff --git "):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        candidates = [parts[3], parts[2]]
+        for candidate in candidates:
+            if candidate == "/dev/null":
+                continue
+            if candidate.startswith("b/") or candidate.startswith("a/"):
+                candidate = candidate[2:]
+            normalized = _normalize_scope_path(candidate)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                paths.append(normalized)
+            break
+    return paths
+
+
+def clear_task_exception_patch_conflict(project_root: Path | str, task_id: str, *, remove_patch: bool = False) -> None:
+    conflict_path = task_exception_conflict_brief_path(project_root, task_id)
+    if conflict_path.exists():
+        conflict_path.unlink()
+    if remove_patch:
+        patch_path = task_exception_patch_path(project_root, task_id)
+        if patch_path.exists():
+            patch_path.unlink()
+
+
+def _write_exception_patch_conflict_brief(
+    project_root: Path | str,
+    task_id: str,
+    *,
+    patch_path: Path,
+    affected_paths: list[str],
+    git_output: str,
+) -> str:
+    project_dir = Path(project_root).expanduser().resolve()
+    brief_path = task_exception_conflict_brief_path(project_dir, task_id)
+    brief_path.parent.mkdir(parents=True, exist_ok=True)
+    patch_relative_path = str(patch_path.relative_to(project_dir))
+    affected_summary = ", ".join(affected_paths) if affected_paths else "unknown"
+    output = _truncate_exception_patch_output(git_output)
+    lines = [
+        f"# Exception Patch Conflict: {task_id}",
+        "",
+        f"- Task: {task_id}",
+        f"- Patch: {patch_relative_path}",
+        f"- Current HEAD: {git_head_sha(project_dir) or 'unknown'}",
+        f"- Affected paths: {affected_summary}",
+        "",
+        "## Runtime Handling",
+        "",
+        "- Resolve this inside the current implementation runtime session before ordinary task coding continues.",
+        "- Do not invoke an external review runner for this merge step.",
+        "- Do not add Git conflict markers; edit the current source files directly to preserve the patch intent against current HEAD.",
+        "- Keep the current verified task code unless the patch intent requires a narrow compatible change.",
+        "- After migrating the patch intent, continue the task implementation and declared tests normally.",
+        "",
+        "## git apply --check Output",
+        "",
+        "```text",
+        output or "git apply --check failed without output",
+        "```",
+    ]
+    brief_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(brief_path.relative_to(project_dir))
+
+
 def _remove_path_if_exists(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -610,28 +699,73 @@ def park_task_exception_changes(project_root: Path | str, task: Task) -> str | N
 
 
 def reapply_task_exception_patch(project_root: Path | str, task_id: str) -> str | None:
+    result = try_reapply_task_exception_patch(project_root, task_id)
+    status = str(result.get("status") or "").strip()
+    if status == "conflict":
+        raise RuntimeError(str(result.get("git_output") or "exception patch conflict"))
+    if status in {"applied", "already_applied"}:
+        return str(result.get("patch_path") or "") or None
+    return None
+
+
+def try_reapply_task_exception_patch(project_root: Path | str, task_id: str) -> dict[str, Any]:
     project_dir = Path(project_root).expanduser().resolve()
     patch_path = task_exception_patch_path(project_dir, task_id)
+    patch_relative_path = str(patch_path.relative_to(project_dir))
     if not patch_path.exists():
-        return None
+        clear_task_exception_patch_conflict(project_dir, task_id)
+        return {"status": "missing", "task_id": task_id, "patch_path": patch_relative_path}
+    try:
+        patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        patch_text = ""
+    affected_paths = _patch_changed_paths(patch_text)
     check_result = git(["apply", "--check", "--whitespace=nowarn", str(patch_path)], cwd=project_dir)
     if check_result.returncode == 0:
         apply_result = git(["apply", "--whitespace=nowarn", str(patch_path)], cwd=project_dir)
         if apply_result.returncode != 0:
-            raise RuntimeError(apply_result.stdout.strip() or f"git apply failed for {patch_path}")
+            git_output = _truncate_exception_patch_output(apply_result.stdout.strip() or f"git apply failed for {patch_path}")
+            conflict_brief_path = _write_exception_patch_conflict_brief(
+                project_dir,
+                task_id,
+                patch_path=patch_path,
+                affected_paths=affected_paths,
+                git_output=git_output,
+            )
+            return {
+                "status": "conflict",
+                "task_id": task_id,
+                "patch_path": patch_relative_path,
+                "conflict_brief_path": conflict_brief_path,
+                "affected_paths": affected_paths,
+                "git_output": git_output,
+            }
         patch_path.unlink()
-        return str(patch_path.relative_to(project_dir))
+        clear_task_exception_patch_conflict(project_dir, task_id)
+        return {"status": "applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths}
 
     reverse_check = git(["apply", "--reverse", "--check", "--whitespace=nowarn", str(patch_path)], cwd=project_dir)
     if reverse_check.returncode == 0:
         patch_path.unlink()
-        return str(patch_path.relative_to(project_dir))
+        clear_task_exception_patch_conflict(project_dir, task_id)
+        return {"status": "already_applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths}
 
-    apply_result = git(["apply", "--whitespace=nowarn", str(patch_path)], cwd=project_dir)
-    if apply_result.returncode != 0:
-        raise RuntimeError(apply_result.stdout.strip() or f"git apply failed for {patch_path}")
-    patch_path.unlink()
-    return str(patch_path.relative_to(project_dir))
+    git_output = _truncate_exception_patch_output(check_result.stdout.strip() or f"git apply --check failed for {patch_path}")
+    conflict_brief_path = _write_exception_patch_conflict_brief(
+        project_dir,
+        task_id,
+        patch_path=patch_path,
+        affected_paths=affected_paths,
+        git_output=git_output,
+    )
+    return {
+        "status": "conflict",
+        "task_id": task_id,
+        "patch_path": patch_relative_path,
+        "conflict_brief_path": conflict_brief_path,
+        "affected_paths": affected_paths,
+        "git_output": git_output,
+    }
 
 
 def git_stage_task_snapshot(

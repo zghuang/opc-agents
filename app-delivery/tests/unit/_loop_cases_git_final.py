@@ -5,6 +5,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from delivery.loop import DeliveryLoop
 from delivery.loop import recover
 from delivery.loop_gitops import git_commit_task, task_scope_delta
@@ -125,6 +127,46 @@ def test_park_task_exception_changes_handles_staged_added_paths_not_in_head(tmp_
         ["status", "--porcelain", "--", "backend/src/domain/__init__.py", "backend/src/domain/models.py"],
         cwd=tmp_path,
     ).stdout.strip() == ""
+
+
+def test_try_reapply_task_exception_patch_reports_conflict_without_touching_worktree(tmp_path: Path) -> None:
+    from delivery.loop_gitops import ensure_git_repo, git, reapply_task_exception_patch, try_reapply_task_exception_patch
+
+    ensure_git_repo(tmp_path)
+    target = tmp_path / "backend" / "src" / "project" / "router.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("print('base')\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+    target.write_text("print('new base')\n", encoding="utf-8")
+    git(["add", "--", "backend/src/project/router.py"], cwd=tmp_path)
+    git(["commit", "-m", "feat(T009): update router base"], cwd=tmp_path)
+
+    patch_path = tmp_path / ".app-delivery-runtime" / "exception-patches" / "T002.patch"
+    patch_path.parent.mkdir(parents=True, exist_ok=True)
+    patch_path.write_text(
+        """diff --git a/backend/src/project/router.py b/backend/src/project/router.py
+index 1840f4f..0c54728 100644
+--- a/backend/src/project/router.py
++++ b/backend/src/project/router.py
+@@ -1 +1 @@
+-print('base')
++print('patched')
+""",
+        encoding="utf-8",
+    )
+
+    result = try_reapply_task_exception_patch(tmp_path, "T002")
+
+    assert result["status"] == "conflict"
+    assert result["affected_paths"] == ["backend/src/project/router.py"]
+    assert target.read_text(encoding="utf-8") == "print('new base')\n"
+    assert patch_path.exists()
+    assert (tmp_path / ".app-delivery-runtime" / "exception-conflicts" / "T002.md").exists()
+    with pytest.raises(RuntimeError):
+        reapply_task_exception_patch(tmp_path, "T002")
+    assert target.read_text(encoding="utf-8") == "print('new base')\n"
+
 
 def test_git_stage_task_snapshot_ignores_deleted_added_extra_paths(tmp_path: Path) -> None:
     from delivery.loop_gitops import ensure_git_repo, git, git_stage_task_snapshot
@@ -325,7 +367,7 @@ def test_project_summary_task_duration_uses_first_runtime_start_across_review_re
             "generated_at": "2026-06-24T00:00:00Z",
             "last_updated_commit": "",
             "items": [
-                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": [], "started_at": "2026-06-24T00:00:00Z", "completed_at": "2026-06-24T00:01:00Z", "verified_at": "2026-06-24T00:01:00Z"},
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": [], "started_at": "2026-06-24T00:00:00Z", "completed_at": "2026-06-24T00:00:00Z", "verified_at": "2026-06-24T00:00:00Z"},
                 {"id": "T002", "title": "Feature", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": [], "started_at": "2026-06-24T00:20:00Z", "completed_at": "2026-06-24T00:30:00Z", "review_status": "pass", "reviewed_at": "2026-06-24T00:40:00Z", "verified_at": "2026-06-24T00:40:00Z"},
             ],
         },
@@ -342,7 +384,9 @@ def test_project_summary_task_duration_uses_first_runtime_start_across_review_re
     task_log.parent.mkdir(parents=True, exist_ok=True)
     task_log.write_text(
         json.dumps({"ts": "2026-06-24T00:05:00Z", "runtime": "opencode", "level": "INFO", "message": "Started implementation T002", "task_id": "T002", "phase": "implementation"}) + "\n"
-        + json.dumps({"ts": "2026-06-24T00:20:00Z", "runtime": "opencode", "level": "INFO", "message": "Started implementation T002", "task_id": "T002", "phase": "implementation"}) + "\n",
+        + json.dumps({"ts": "2026-06-24T00:15:00Z", "runtime": "opencode", "level": "ERROR", "message": "Stalled implementation T002", "task_id": "T002", "phase": "implementation"}) + "\n"
+        + json.dumps({"ts": "2026-06-24T00:20:00Z", "runtime": "opencode", "level": "INFO", "message": "Started implementation T002", "task_id": "T002", "phase": "implementation"}) + "\n"
+        + json.dumps({"ts": "2026-06-24T00:30:00Z", "runtime": "opencode", "level": "INFO", "message": "Completed implementation T002", "task_id": "T002", "phase": "implementation"}) + "\n",
         encoding="utf-8",
     )
     save_test_results(tmp_path, {"schema_version": "1", "project": "demo", "generated_at": "2026-06-24T00:00:00Z", "results": [], "full_suite_results": {"passed": True, "scores": {}}})
@@ -353,6 +397,9 @@ def test_project_summary_task_duration_uses_first_runtime_start_across_review_re
     assert metrics["T002"]["started_at"] == "2026-06-24T00:05:00Z"
     assert metrics["T002"]["completed_at"] == "2026-06-24T00:40:00Z"
     assert metrics["T002"]["duration_minutes"] == 35
+    assert metrics["T002"]["active_duration_minutes"] == 20
+    assert metrics["T002"]["effective_duration_minutes"] == 20
+    assert payload["verified_task_metrics"]["task_duration_minutes_sum"] == 20
     assert payload["duration"]["started_at"] == "2026-06-24T00:00:00Z"
 
 

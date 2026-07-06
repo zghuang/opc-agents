@@ -7,7 +7,7 @@ from typing import Any
 from .environment_repair import ENVIRONMENT_REPAIR_TASK_PREFIX, build_environment_repair_plan, has_environment_failures
 from .errors import DeliveryError
 from .gates import refresh_gates
-from .loop_gitops import ensure_git_repo, git_commit_task, git_commit_timestamp, git_head_sha, git_latest_task_commit, git_stage_task_snapshot, is_runtime_protected_framework_artifact, park_task_exception_changes, repair_invalid_verified_tasks, review_artifact_status, task_scoped_changed_paths
+from .loop_gitops import clear_task_exception_patch_conflict, ensure_git_repo, git_commit_task, git_commit_timestamp, git_head_sha, git_latest_task_commit, git_stage_task_snapshot, is_runtime_protected_framework_artifact, park_task_exception_changes, repair_invalid_verified_tasks, review_artifact_status, task_scoped_changed_paths
 from .loop_gitops import git_changed_paths, restore_paths_to_head, task_scope_delta
 from .loop_reporting import PAUSE_FILE, project_summary, render_release_evidence, status
 from .loop_review import write_code_review_request, write_final_review_request
@@ -889,6 +889,7 @@ class DeliveryLoop:
                         ],
                         preserved_paths=preserved_paths,
                     )
+                    clear_task_exception_patch_conflict(self.project_root, current.id, remove_patch=True)
                     try:
                         write_code_review_request(self.project_root, current, scope_report=scope_report)
                     except RuntimeError as exc:
