@@ -11,6 +11,7 @@ from delivery.state import (
     active_task_record_path,
     clear_task_runtime_failure,
     latest_task_log_event,
+    lock_file_is_locked,
     load_active_task_records,
     load_all_task_runtime_states,
     load_task_runtime_state,
@@ -194,6 +195,9 @@ def test_acquire_lock_writes_metadata(tmp_path: Path) -> None:
         assert metadata["lock_name"] == "execution"
         assert metadata["project"] == str(tmp_path.resolve())
         assert metadata["pid"] > 0
+
+    assert read_lock_metadata(lock_path) == {}
+    assert lock_file_is_locked(lock_path) is False
 
 
 def test_acquire_lock_updates_heartbeat_metadata(tmp_path: Path, monkeypatch) -> None:

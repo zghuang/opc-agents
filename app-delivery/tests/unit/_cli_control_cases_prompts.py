@@ -30,6 +30,39 @@ def test_stage_contract_reference_exists() -> None:
     assert path.exists()
     assert "structured JSON" in path.read_text(encoding="utf-8")
 
+def test_final_review_prompt_includes_deferred_semantic_risks(tmp_path: Path) -> None:
+    from delivery.review_prompts import build_final_review_request
+
+    risk_path = tmp_path / "docs" / "reviews" / "semantic-risk-register.json"
+    risk_path.parent.mkdir(parents=True, exist_ok=True)
+    risk_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "risks": [
+                    {
+                        "task_id": "T008",
+                        "categories": ["production-stub"],
+                        "repeat_count": 2,
+                        "review_artifact": "docs/reviews/code-review-T008.md",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prompt = build_final_review_request(
+        tmp_path,
+        results_summary="All tests passed.",
+        requirement_coverage={"total": 1, "covered": 1, "uncovered": []},
+        missing_test_types=[],
+    )
+
+    assert "Deferred semantic risks:" in prompt
+    assert "T008: production-stub" in prompt
+    assert "final release review must decide" in prompt
+
 def test_render_skill_prompt_reads_stage_contract_reference() -> None:
     prompt = render_skill_prompt("spec-review.md", source_document="# Raw requirements\n")
 

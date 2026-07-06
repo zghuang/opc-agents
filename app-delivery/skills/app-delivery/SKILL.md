@@ -15,7 +15,8 @@ Rules:
 - This skill and Hermes may only run the delivery CLI and the planning/review skills explicitly requested by `next_step`. If target-project code changes are needed, rerun `app-delivery control --goal auto` so the assigned runtime task session performs that work.
 - Do not stop while `must_continue=true` unless the framework reports a real blocking condition.
 - On Hermes, `app-delivery control --goal auto ...` and `app-delivery control --goal repair ...` are long-running bounded commands. Launch them with Hermes-managed background execution: `terminal(command="...", background=true, notify_on_complete=true)`. Do not run them as foreground terminal calls, and do not use shell-level backgrounding such as `&`, `nohup`, `disown`, or `setsid`.
-- On Hermes, after launching a managed background `control --goal auto ...` or repair command, report that the delivery run is hosted in the background and wait for the completion notification. When the notification arrives, run status-only inspection, then continue any required host/framework step from the reported `next_step`.
+- On Hermes, after launching a managed background `control --goal auto ...` or repair command, also launch one managed background read-only status observer for the same project: `terminal(command="${OPC_HOME:-$HOME/opc}/bin/app-delivery watch-status --project {project}", background=true, watch_patterns=["APP_DELIVERY_STATUS_CHANGE"])`.
+- The companion status observer is visibility-only. When it fires, do at most one status-only inspection. Do not resume the control loop, import artifacts, or start host/framework actions from the observer alone.
 - Outside Hermes, the bash snippets below are plain CLI commands. Use the equivalent managed-background/notify primitive if the host platform has one; otherwise run status polling explicitly.
 - When enabled, the project watchdog is project-scoped and may run detached from Hermes; closing Hermes is not a watchdog stop operation.
 - To stop automatic continuation, use `control --goal pause --project {project}`. For explicit immediate termination, only target processes whose command line contains the exact project path and `watchdog-run`, `oc-exec.py`, or that project's active runtime.
@@ -44,6 +45,14 @@ Status-only inspection:
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery control --goal status --project {project}
 ```
+
+Task-level status observer:
+
+```bash
+${OPC_HOME:-$HOME/opc}/bin/app-delivery watch-status --project {project}
+```
+
+`watch-status` is read-only and does not advance the control loop. In the default Hermes path it may be launched only as a companion visibility process.
 
 Pause:
 
@@ -83,12 +92,13 @@ Report back:
 
 Host-step loop:
 
-1. Start the default `app-delivery control --goal auto ...` command. On Hermes, start it as a managed background command with `background=true, notify_on_complete=true` and do not continue the loop until the completion notification arrives.
-2. If `must_continue=false`, stop and report status.
-3. If `must_continue=true` and `next_step.owner=framework`, rerun the requested framework step via `app-delivery control --goal auto ...` using the same host execution mode and continue looping.
-4. If `must_continue=true` and `next_step.owner=host`, execute the indicated host skill immediately:
+1. Start the default `app-delivery control --goal auto ...` command. On Hermes, start it as a managed background command with `background=true, notify_on_complete=true`, then start the companion `watch-status` observer with `watch_patterns=["APP_DELIVERY_STATUS_CHANGE"]`.
+2. If the observer fires, run one status-only inspection. Treat the observer as visibility-only; do not continue the control loop from the observer alone.
+3. If `must_continue=false`, stop and report status.
+4. If `must_continue=true` and `next_step.owner=framework`, rerun the requested framework step via `app-delivery control --goal auto ...` using the same host execution mode and continue looping.
+5. If `must_continue=true` and `next_step.owner=host`, execute the indicated host skill immediately:
    - `code-review` -> run the `code-review` skill for `next_step.task_id`
    - `final-review` -> run the `final-review` skill
    - planning skills -> run the requested planning skill with the project path / requirements path from `next_step`
-5. After the host skill finishes and imports its artifact, rerun `app-delivery control --goal auto ...` using the same host execution mode.
-6. Repeat until the framework reports a genuine blocking condition, `must_continue=false`, or delivery is complete.
+6. After the host skill finishes and imports its artifact, rerun `app-delivery control --goal auto ...` using the same host execution mode.
+7. Repeat until the framework reports a genuine blocking condition, `must_continue=false`, or delivery is complete.

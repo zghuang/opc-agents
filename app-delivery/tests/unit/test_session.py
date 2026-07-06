@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
-from delivery.session import RuntimeSession, _build_runtime_command, _extract_opencode_failure_metadata, execute_in_session, retire_session, save_current_session, session_context_for, start_task_session, touch_session
+import pytest
+
+from delivery.session import RuntimeErrorResponse, RuntimeSession, _build_runtime_command, _extract_opencode_failure_metadata, _run, execute_in_session, retire_session, save_current_session, session_context_for, start_task_session, touch_session
 from delivery.state import load_session_state, save_session_state
 
 
@@ -243,6 +246,22 @@ def test_extract_opencode_failure_metadata_reads_session_id_and_scope_violation(
 
     assert payload["session_id"] == "ses-op-42"
     assert payload["kind"] == "scope_violation"
+
+
+def test_run_classifies_signal_exit_as_runtime_interrupted(monkeypatch, tmp_path: Path) -> None:
+    command = ["python", "/tmp/oc-exec.py"]
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(command, -15, stdout='{"sessionID":"ses-op-99"}\npermission auth token text\n')
+
+    monkeypatch.setattr("delivery.session.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeErrorResponse) as exc_info:
+        _run(command, cwd=tmp_path)
+
+    assert exc_info.value.kind == "runtime_interrupted"
+    assert exc_info.value.session_id == "ses-op-99"
+    assert exc_info.value.returncode == -15
 
 
 def test_touch_session_updates_heartbeat_and_task_metadata(tmp_path: Path) -> None:

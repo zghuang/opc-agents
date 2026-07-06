@@ -143,7 +143,7 @@ def _waiting_host_input_ready(project_root: Path | str) -> bool:
     task_id = str(payload.get("task_id") or "").strip()
     if skill == "code-review" and task_id:
         request_path = code_review_request_path(project_dir, task_id)
-        if request_path.exists() and input_path.stat().st_mtime_ns <= request_path.stat().st_mtime_ns:
+        if request_path.exists():
             runtime_state = load_task_runtime_state(project_dir, task_id)
             completed_at = _parse_iso_datetime(runtime_state.get("completed_at"))
             if completed_at is None:

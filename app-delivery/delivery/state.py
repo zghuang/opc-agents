@@ -280,6 +280,24 @@ def read_lock_metadata(lock_path: Path | str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def lock_file_is_locked(lock_path: Path | str) -> bool:
+    path = Path(lock_path)
+    if not path.exists():
+        return False
+    try:
+        with path.open("a+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
+
+
 @contextlib.contextmanager
 def acquire_lock(project_root: Path | str, name: str = "ledger", timeout: int = 30, heartbeat_interval: float = 10.0) -> Iterator[Path]:
     paths = ensure_runtime_dirs(project_root)
@@ -321,6 +339,11 @@ def acquire_lock(project_root: Path | str, name: str = "ledger", timeout: int = 
             heartbeat_stop.set()
             if heartbeat_thread is not None:
                 heartbeat_thread.join(timeout=1)
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+            with contextlib.suppress(OSError):
+                os.fsync(handle.fileno())
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 

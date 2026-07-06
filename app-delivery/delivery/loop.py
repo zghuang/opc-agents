@@ -783,7 +783,7 @@ class DeliveryLoop:
                 try:
                     self._execute_session_prompt(task.id, session, recovery_prompt)
                 except RuntimeErrorResponse as exc:
-                    if exc.kind == "stalled_runtime":
+                    if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
                         return self._prepare_stalled_runtime_recovery(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
                 save_task_runtime_state(
@@ -801,7 +801,7 @@ class DeliveryLoop:
                 try:
                     self._execute_session_prompt(task.id, session, prompt)
                 except RuntimeErrorResponse as exc:
-                    if exc.kind == "stalled_runtime":
+                    if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
                         return self._prepare_stalled_runtime_recovery(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
                 if force_task_prompt:
@@ -874,7 +874,7 @@ class DeliveryLoop:
                 try:
                     self._execute_session_prompt(current.id, session, fix_prompt)
                 except RuntimeErrorResponse as exc:
-                    if exc.kind == "stalled_runtime":
+                    if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
                         return self._prepare_stalled_runtime_recovery(current, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
             tasks = all_tasks(self.project_root)

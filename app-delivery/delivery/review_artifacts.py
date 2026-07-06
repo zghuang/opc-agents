@@ -58,6 +58,7 @@ def write_request_if_changed(path: Path, content: str) -> None:
         except OSError:
             existing = None
         if existing == normalized:
+            path.touch()
             return
     path.write_text(normalized, encoding="utf-8")
 
@@ -205,6 +206,27 @@ def write_review_artifact(project_root: Path | str, task: Task, review_payload: 
             lines.extend(["", "## Machine Precondition Errors", ""])
             for error in errors:
                 lines.append(f"- {error}")
+    semantic_risk = review_payload.get("semantic_risk") if isinstance(review_payload.get("semantic_risk"), dict) else None
+    security_risk = review_payload.get("security_risk") if isinstance(review_payload.get("security_risk"), dict) else None
+    deferred_risk = semantic_risk or security_risk
+    if deferred_risk:
+        lines.extend(["", "## Deferred Semantic Risk", ""])
+        lines.append(f"- kind: {deferred_risk.get('kind', '-')}")
+        lines.append(f"- fingerprint: {deferred_risk.get('fingerprint', '-')}")
+        lines.append(f"- repeat_count: {deferred_risk.get('repeat_count', '-')}")
+        if deferred_risk.get("category"):
+            lines.append(f"- category: {deferred_risk.get('category', '-')}")
+        categories = deferred_risk.get("categories") if isinstance(deferred_risk.get("categories"), list) else []
+        if categories:
+            lines.append(f"- categories: {', '.join(str(value) for value in categories)}")
+        reason = str(deferred_risk.get("reason") or "").strip()
+        if reason:
+            lines.append(f"- reason: {reason}")
+        errors = deferred_risk.get("errors") if isinstance(deferred_risk.get("errors"), list) else []
+        if errors:
+            lines.append("- errors:")
+            for error in errors:
+                lines.append(f"  - {error}")
     if requirement_assessment:
         lines.extend(["", "## Requirement Assessment", ""])
         for row in requirement_assessment:

@@ -82,6 +82,12 @@ def _classify_runtime_error(text: str) -> str:
     return "task_failed"
 
 
+def _runtime_interrupted_by_signal(returncode: int | None) -> bool:
+    if returncode is None:
+        return False
+    return returncode < 0 or returncode in {130, 143}
+
+
 def _runtime_from_command(command: list[str]) -> str:
     if len(command) < 2:
         return ""
@@ -239,6 +245,8 @@ def _run(command: list[str], *, cwd: Path, input_text: str | None = None) -> str
             if runtime == "claude"
             else {"session_id": "", "kind": _classify_runtime_error(output)}
         )
+        if _runtime_interrupted_by_signal(completed.returncode):
+            metadata["kind"] = "runtime_interrupted"
         raise RuntimeErrorResponse(
             f"runtime command failed: {' '.join(command)}",
             output,

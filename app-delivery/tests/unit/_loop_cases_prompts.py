@@ -154,7 +154,7 @@ def test_review_payload_accepts_passing_technology_assessment_with_evidence() ->
 
     assert parsed["technology_assessment"] == payload["technology_assessment"]
 
-def test_write_code_review_request_preserves_timestamp_when_content_is_unchanged(tmp_path: Path) -> None:
+def test_write_code_review_request_refreshes_timestamp_when_content_is_unchanged(tmp_path: Path) -> None:
     from delivery.task import Task
 
     docs_dir = tmp_path / "docs"
@@ -169,7 +169,7 @@ def test_write_code_review_request_preserves_timestamp_when_content_is_unchanged
     after = request_path.stat().st_mtime_ns
 
     assert first == second
-    assert before == after
+    assert after >= before
 
 def test_status_reports_runtime_attention_for_long_read_only_run(tmp_path: Path) -> None:
     save_work_items(
@@ -1102,6 +1102,19 @@ def test_write_code_review_request_persists_prompt(tmp_path: Path) -> None:
     assert "task-scoped snapshot" in text
     assert "current working tree" not in text
     assert "Return raw JSON only" in text
+
+def test_write_code_review_request_touches_unchanged_prompt_for_new_round(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    task = Task("T002", "Login", "pending", ["REQ-001"], [], [], [], [])
+    write_code_review_request(tmp_path, task)
+    request_path = code_review_request_path(tmp_path, "T002")
+    old_time = 100.0
+    os.utime(request_path, (old_time, old_time))
+
+    write_code_review_request(tmp_path, task)
+
+    assert request_path.stat().st_mtime > old_time
 
 def test_build_code_review_prompt_frontend_acceptance_demands_browser_judgement(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"

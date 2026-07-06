@@ -26,6 +26,8 @@ SYNTHETIC_DATA_NAME_PATTERN = re.compile(r"(?:^|_)(?:default|demo|mock|sample|fa
 SERVICE_BACKED_PATTERN = re.compile(r"\b(await|session|db|repository|repo|service|client|gateway|producer|consumer|query|execute|fetch|select|commit|rollback)\b|\b(?:store|manager|registry|provider)\.[A-Za-z_]", re.IGNORECASE)
 FASTAPI_ROUTE_PATTERN = re.compile(r"@router\.(get|post|put|patch|delete)\(")
 AUTH_DEPENDENCY_PATTERN = re.compile(r"(?:Depends|Security)\((?:[A-Za-z_][A-Za-z0-9_]*\.)?(?:require_[A-Za-z0-9_]*|get_current_user|get_authenticated_user|get_user|current_user|auth[A-Za-z0-9_]*|require_role|require_permission)")
+PUBLIC_ENDPOINT_DEPENDENCY_NAMES = {"public_endpoint", "allow_anonymous", "allow_public_access", "anonymous_access"}
+PUBLIC_AUTH_ROUTE_NAMES = {"login", "signin", "sign_in", "token", "refresh", "logout"}
 PAGE_ROUTE_PATTERN = re.compile(r"\bpage\.route\s*\(")
 ROUTE_DECORATOR_METHODS = {"get", "post", "put", "patch", "delete"}
 NON_PRODUCTION_BACKEND_PARTS = {"__tests__", "fixtures", "mock", "mocks", "test", "tests"}
@@ -393,6 +395,31 @@ def _dependency_callable_exprs(node: ast.AST) -> list[ast.AST]:
     return result
 
 
+def _dependency_expr_name(expr: ast.AST, aliases: dict[str, str]) -> str:
+    name = _call_name(expr)
+    if isinstance(expr, ast.Name):
+        return aliases.get(expr.id, expr.id).split(".")[-1]
+    if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+        imported = aliases.get(expr.value.id, expr.value.id)
+        return f"{imported}.{expr.attr}".split(".")[-1]
+    return name.split(".")[-1]
+
+
+def _has_public_endpoint_marker(node: ast.AST, aliases: dict[str, str]) -> bool:
+    return any(_dependency_expr_name(expr, aliases) in PUBLIC_ENDPOINT_DEPENDENCY_NAMES for expr in _dependency_callable_exprs(node))
+
+
+def _route_function_is_public_auth_endpoint(fn: ast.FunctionDef | ast.AsyncFunctionDef, *, rel: str, aliases: dict[str, str]) -> bool:
+    if not _has_public_endpoint_marker(fn, aliases):
+        return False
+    route_path = str(_route_path(fn) or "").strip().casefold()
+    function_name = str(fn.name or "").strip().casefold()
+    rel_lower = str(rel or "").casefold()
+    if any(segment in {"auth", "auth_router"} for segment in Path(rel_lower).with_suffix("").parts):
+        return function_name in PUBLIC_AUTH_ROUTE_NAMES or any(f"/{name}" in route_path for name in PUBLIC_AUTH_ROUTE_NAMES)
+    return function_name in PUBLIC_AUTH_ROUTE_NAMES or any(f"/{name}" in route_path for name in PUBLIC_AUTH_ROUTE_NAMES)
+
+
 def _module_path_from_name(project_dir: Path, module_name: str) -> Path | None:
     normalized = str(module_name or "").strip()
     if not normalized:
@@ -689,6 +716,7 @@ def _scan_missing_route_auth(project_dir: Path) -> list[SemanticFinding]:
                 route_functions = [node for node in ast.walk(tree) if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and _route_path(node) is not None]
                 if route_functions and all(
                     _route_function_has_auth_dependency(fn, project_dir=project_dir, current_path=path, text=text, tree=tree, aliases=aliases)
+                    or _route_function_is_public_auth_endpoint(fn, rel=rel, aliases=aliases)
                     for fn in route_functions
                 ):
                     continue

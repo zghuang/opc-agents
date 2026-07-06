@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import os
@@ -35,6 +34,7 @@ from .loop_gitops import reapply_task_exception_patch
 from .state import (
     acquire_lock,
     latest_task_log_event,
+    lock_file_is_locked,
     load_active_task_records,
     load_task_runtime_state,
     load_json,
@@ -188,7 +188,7 @@ def _project_execution_guard(project_root: Path, *, already_locked: bool) -> Any
     except ValueError:
         timeout = EXECUTION_LOCK_TIMEOUT_SECONDS
     _prune_stale_execution_lock(project_root)
-    if timeout <= 0 and read_lock_metadata(lock_path):
+    if timeout <= 0 and lock_file_is_locked(lock_path):
         raise DeliveryError(
             code="project_busy",
             message=f"another app-delivery run is already active for {project_root}",
@@ -232,6 +232,185 @@ def cmd_status(args: argparse.Namespace) -> int:
     _refresh_project_summary_best_effort(project_root)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
+
+
+def _watch_status_record_kind(task: Any, *, kind: str, task_status: str | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = {
+        "kind": kind,
+        "task_id": str(getattr(task, "id", "") or "").strip() or None,
+        "task_title": str(getattr(task, "title", "") or "").strip() or None,
+        "task_status": task_status,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _watch_status_snapshot(project_root: Path) -> dict[str, Any]:
+    tasks = all_tasks(project_root)
+    task_by_id = {task.id: task for task in tasks}
+    active_records = sorted(
+        [row for row in load_active_task_records(project_root) if isinstance(row, dict)],
+        key=lambda row: str(row.get("updated_at") or ""),
+        reverse=True,
+    )
+    live_active_task_ids = {str(row.get("task_id") or "").strip() for row in active_records if str(row.get("task_id") or "").strip()}
+    exception_task_ids = [task.id for task in tasks if task.status == "exception"]
+    stale_active_ledger_task_ids = [task.id for task in tasks if task.status == "active" and task.id not in live_active_task_ids]
+
+    current: dict[str, Any]
+    lifecycle = "idle"
+
+    if (project_root / PAUSE_FILE).exists():
+        lifecycle = "paused"
+        current = {"kind": "none", "task_id": None, "task_title": None, "task_status": None}
+    elif active_records:
+        record = active_records[0]
+        task_id = str(record.get("task_id") or "").strip()
+        task = task_by_id.get(task_id)
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task_id)) if task_id else {}
+        runtime_status = str(runtime_state.get("status") or record.get("phase") or (getattr(task, "status", "") if task is not None else "active")).strip() or "active"
+        lifecycle = "active"
+        if task is not None:
+            current = _watch_status_record_kind(task, kind="active", task_status=runtime_status)
+        else:
+            current = {
+                "kind": "active",
+                "task_id": task_id or None,
+                "task_title": str(record.get("task_title") or "").strip() or None,
+                "task_status": runtime_status,
+            }
+    else:
+        review_pending = next((task for task in tasks if task.status == "review_pending"), None)
+        blocked = next((task for task in tasks if task.status in {"blocked", "exception"}), None)
+        pending = next(
+            (
+                task
+                for task in tasks
+                if task.id != FINAL_VERIFY_TASK_ID and task.status == "pending" and getattr(task, "task_kind", "feature") != "repair"
+            ),
+            None,
+        )
+        actionable = [
+            task
+            for task in tasks
+            if task.id != FINAL_VERIFY_TASK_ID and task.status != "cancelled" and getattr(task, "task_kind", "feature") != "repair"
+        ]
+        if review_pending is not None:
+            lifecycle = "review_pending"
+            current = _watch_status_record_kind(review_pending, kind="review_pending", task_status="review_pending")
+        elif blocked is not None:
+            lifecycle = "blocked"
+            current = _watch_status_record_kind(blocked, kind="blocked", task_status=blocked.status)
+        elif pending is not None:
+            lifecycle = "pending"
+            current = _watch_status_record_kind(pending, kind="next", task_status="pending")
+        elif actionable and all(task.status == "verified" for task in actionable):
+            lifecycle = "complete"
+            current = {"kind": "none", "task_id": None, "task_title": None, "task_status": None}
+        else:
+            current = {"kind": "none", "task_id": None, "task_title": None, "task_status": None}
+
+    handoff = load_json(project_root / HOST_HANDOFF_FILE, {})
+    handoff_payload = None
+    if isinstance(handoff, dict):
+        handoff_status = str(handoff.get("status") or "").strip()
+        handoff_skill = str(handoff.get("skill") or "").strip()
+        handoff_task_id = str(handoff.get("task_id") or "").strip()
+        if handoff_status or handoff_skill or handoff_task_id:
+            handoff_payload = {
+                "status": handoff_status or None,
+                "skill": handoff_skill or None,
+                "task_id": handoff_task_id or None,
+            }
+
+    return {
+        "project": str(project_root),
+        "control_status": lifecycle,
+        "current": current,
+        "exception_task_ids": exception_task_ids,
+        "stale_active_ledger_task_ids": stale_active_ledger_task_ids,
+        **({"host_handoff": handoff_payload} if handoff_payload is not None else {}),
+    }
+
+
+def _watch_status_event(
+    *,
+    checked_at: str,
+    snapshot: dict[str, Any],
+    reason: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    current = snapshot.get("current") if isinstance(snapshot.get("current"), dict) else {}
+    handoff = snapshot.get("host_handoff") if isinstance(snapshot.get("host_handoff"), dict) else {}
+    task_kind = str(current.get("kind") or "").strip() or None
+    if task_kind == "none":
+        task_kind = None
+    event = {
+        "reason": reason,
+        "checked_at": checked_at,
+        "project": Path(str(snapshot.get("project") or "")).name or str(snapshot.get("project") or ""),
+        "control_status": str(snapshot.get("control_status") or "").strip() or None,
+        "task_kind": task_kind,
+        "task_id": str(current.get("task_id") or "").strip() or None,
+        "task_title": str(current.get("task_title") or "").strip() or None,
+        "task_status": str(current.get("task_status") or "").strip() or None,
+        "exception_task_ids": snapshot.get("exception_task_ids") if isinstance(snapshot.get("exception_task_ids"), list) else [],
+        "stale_active_ledger_task_ids": snapshot.get("stale_active_ledger_task_ids") if isinstance(snapshot.get("stale_active_ledger_task_ids"), list) else [],
+    }
+    if handoff:
+        event["host_status"] = str(handoff.get("status") or "").strip() or None
+        event["host_skill"] = str(handoff.get("skill") or "").strip() or None
+        event["host_task_id"] = str(handoff.get("task_id") or "").strip() or None
+    if error:
+        compact_error = " ".join(str(error).split())
+        event["error"] = compact_error[:240]
+    return event
+
+
+def _watch_status_emit(event: dict[str, Any]) -> None:
+    print("APP_DELIVERY_STATUS_CHANGE " + json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def cmd_watch_status(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root(args.project)
+    interval_seconds = max(5, int(getattr(args, "interval_seconds", 30) or 30))
+    max_failures = max(1, int(getattr(args, "max_failures", 3) or 3))
+    previous_snapshot: dict[str, Any] | None = None
+    previous_signature = ""
+    failures = 0
+
+    while True:
+        try:
+            snapshot = _watch_status_snapshot(project_root)
+            signature = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+            checked_at = utc_now_iso()
+            if previous_snapshot is None:
+                _watch_status_emit(_watch_status_event(checked_at=checked_at, snapshot=snapshot, reason="initial"))
+            elif signature != previous_signature:
+                _watch_status_emit(_watch_status_event(checked_at=checked_at, snapshot=snapshot, reason="changed"))
+            previous_snapshot = snapshot
+            previous_signature = signature
+            failures = 0
+            if snapshot["control_status"] in {"complete", "paused"}:
+                return 0
+        except Exception as exc:
+            failures += 1
+            if failures >= max_failures:
+                _watch_status_emit(
+                    _watch_status_event(
+                        checked_at=utc_now_iso(),
+                        snapshot={
+                            "project": str(project_root),
+                            "control_status": "watch_error",
+                            "current": {"kind": "error", "task_id": None, "task_title": None, "task_status": None},
+                        },
+                        reason="watch_error",
+                        error=str(exc),
+                    )
+                )
+                return 1
+        time.sleep(interval_seconds)
 
 
 def cmd_summary(args: argparse.Namespace) -> int:
@@ -500,7 +679,7 @@ def _terminate_runtime_for_task(project_root: Path | str, task_id: str) -> None:
         lock_owner_pid = int((lock_details or {}).get("pid") or 0)
     except (TypeError, ValueError):
         lock_owner_pid = 0
-    if lock_owner_pid > 0 and lock_owner_pid not in seen_pids:
+    if lock_owner_pid > 0 and lock_owner_pid not in seen_pids and lock_file_is_locked(lock_path):
         _terminate_pid(lock_owner_pid)
 
 
@@ -534,32 +713,17 @@ def _prune_stale_execution_lock(project_root: Path | str) -> bool:
     project_dir = resolve_project_root(project_root)
     lock_path = project_dir / ".app-delivery-runtime" / "locks" / "execution.lock"
     lock_details = read_lock_metadata(lock_path)
+    if lock_details and not lock_file_is_locked(lock_path):
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
+        return True
     try:
         owner_pid = int((lock_details or {}).get("pid") or 0)
     except (TypeError, ValueError):
         owner_pid = 0
     if owner_pid <= 0 or _pid_is_running(owner_pid):
         return False
-    try:
-        with lock_path.open("a+", encoding="utf-8") as handle:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return False
-            try:
-                refreshed = read_lock_metadata(lock_path)
-                try:
-                    refreshed_pid = int((refreshed or {}).get("pid") or 0)
-                except (TypeError, ValueError):
-                    refreshed_pid = 0
-                if refreshed_pid > 0 and not _pid_is_running(refreshed_pid):
-                    lock_path.unlink(missing_ok=True)
-                    return True
-                return False
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except FileNotFoundError:
-        return False
+    return False
 
 
 def _run_stalled_recovery_once(
@@ -753,6 +917,42 @@ def _save_host_handoff(project_root: Path, next_step: dict[str, Any]) -> dict[st
 
 def _review_import_outcome(exit_code: int) -> str:
     return "accepted_pass" if exit_code == 0 else "accepted_changes_requested"
+
+
+def _host_handoff_imported_result(project_root: Path, *, skill: str, task_id: str | None, input_path: Path) -> dict[str, Any] | None:
+    handoff = load_json(_host_handoff_path(project_root), {})
+    if not isinstance(handoff, dict):
+        return None
+    if str(handoff.get("status") or "").strip() != "imported":
+        return None
+    if str(handoff.get("skill") or "").strip() != skill:
+        return None
+    expected_task_id = str(task_id or "").strip()
+    handoff_task_id = str(handoff.get("task_id") or "").strip()
+    if expected_task_id and handoff_task_id and handoff_task_id != expected_task_id:
+        return None
+    recorded_input = str(handoff.get("input_path") or "").strip()
+    if recorded_input:
+        try:
+            if Path(recorded_input).expanduser().resolve() != input_path.expanduser().resolve():
+                return None
+        except OSError:
+            if recorded_input != str(input_path):
+                return None
+    try:
+        exit_code = int(handoff.get("import_exit_code") or 0)
+    except (TypeError, ValueError):
+        exit_code = 0
+    result: dict[str, Any] = {
+        "status": "already_imported",
+        "skill": skill,
+        "input_path": str(input_path),
+        "exit_code": exit_code,
+        "import_outcome": _review_import_outcome(exit_code) if skill in {"code-review", "final-review"} else ("imported" if exit_code == 0 else "imported_nonzero"),
+    }
+    if expected_task_id or handoff_task_id:
+        result["task_id"] = expected_task_id or handoff_task_id
+    return result
 
 
 def _mark_host_handoff_imported(project_root: Path, *, skill: str, task_id: str | None, input_path: Path, exit_code: int) -> None:
@@ -1081,7 +1281,7 @@ def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path
     task_id = str(step.get("task_id") or "").strip()
     if skill == "code-review" and task_id:
         request_path = code_review_request_path(project_root, task_id)
-        if request_path.exists() and input_path.stat().st_mtime_ns <= request_path.stat().st_mtime_ns and not _review_input_matches_latest_runtime_attempt(project_root, task_id, input_path):
+        if request_path.exists() and not _review_input_matches_latest_runtime_attempt(project_root, task_id, input_path):
             return None
     if skill == "final-review":
         request_path = final_review_request_path(project_root)
@@ -1093,7 +1293,13 @@ def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path
             raise DeliveryError(code="control_review_task_missing", message="host review step is missing task_id", exit_code=2, details={"step": step})
         payload, loaded_input_path = load_stage_payload(project_root, "code-review", str(input_path), expected_type=dict)
         assert isinstance(payload, dict)
-        exit_code = import_task_review(project_root, task_id, payload, loaded_input_path)
+        try:
+            exit_code = import_task_review(project_root, task_id, payload, loaded_input_path)
+        except DeliveryError as exc:
+            already_imported = _host_handoff_imported_result(project_root, skill="code-review", task_id=task_id, input_path=loaded_input_path)
+            if exc.code == "review_task_not_pending" and already_imported is not None:
+                return already_imported
+            raise
     elif skill == "final-review":
         payload, loaded_input_path = load_stage_payload(project_root, "final-review", str(input_path), expected_type=dict)
         assert isinstance(payload, dict)
@@ -1476,15 +1682,25 @@ def cmd_task(args: argparse.Namespace) -> int:
 
 def cmd_code_review(args: argparse.Namespace) -> int:
     project_root = resolve_project_root(args.project)
+    import_status = "imported"
     with _project_execution_guard(project_root, already_locked=_command_locked(args)):
         payload, input_path = load_stage_payload(project_root, "code-review", args.input, expected_type=dict)
         assert isinstance(payload, dict)
-        import_exit_code = import_task_review(project_root, args.task_id, payload, input_path)
-        _mark_host_handoff_imported(project_root, skill="code-review", task_id=args.task_id, input_path=input_path, exit_code=import_exit_code)
+        try:
+            import_exit_code = import_task_review(project_root, args.task_id, payload, input_path)
+        except DeliveryError as exc:
+            already_imported = _host_handoff_imported_result(project_root, skill="code-review", task_id=args.task_id, input_path=input_path)
+            if exc.code == "review_task_not_pending" and already_imported is not None:
+                import_exit_code = int(already_imported.get("exit_code") or 0)
+                import_status = "already_imported"
+            else:
+                raise
+        else:
+            _mark_host_handoff_imported(project_root, skill="code-review", task_id=args.task_id, input_path=input_path, exit_code=import_exit_code)
         _refresh_project_summary_best_effort(project_root)
     if _watchdog_enabled_for(project_root):
         spawn_watchdog(project_root)
-    print(json.dumps({"status": "imported", "stage": "code-review", "task_id": args.task_id, "input_path": str(input_path), "import_exit_code": import_exit_code, "import_outcome": _review_import_outcome(import_exit_code)}, indent=2, ensure_ascii=False))
+    print(json.dumps({"status": import_status, "stage": "code-review", "task_id": args.task_id, "input_path": str(input_path), "import_exit_code": import_exit_code, "import_outcome": _review_import_outcome(import_exit_code)}, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -1955,6 +2171,12 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status")
     status.add_argument("--project", required=True)
     status.set_defaults(func=cmd_status)
+
+    watch_status = subparsers.add_parser("watch-status")
+    watch_status.add_argument("--project", required=True)
+    watch_status.add_argument("--interval-seconds", type=int, default=30)
+    watch_status.add_argument("--max-failures", type=int, default=3)
+    watch_status.set_defaults(func=cmd_watch_status)
 
     watchdog_run = subparsers.add_parser("watchdog-run")
     watchdog_run.add_argument("--project", required=True)

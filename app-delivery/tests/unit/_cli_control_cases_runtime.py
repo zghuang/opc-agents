@@ -922,6 +922,7 @@ def test_project_execution_guard_prunes_dead_pid_lock_before_zero_timeout_busy_c
 
     with cli._project_execution_guard(tmp_path, already_locked=False):
         metadata = cli.read_lock_metadata(lock_path)
+        assert metadata["pid"] == os.getpid()
 
-    assert metadata["pid"] == os.getpid()
+    assert cli.read_lock_metadata(lock_path) == {}
 

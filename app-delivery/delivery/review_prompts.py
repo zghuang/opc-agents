@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ REVIEW_PROMPT_NOISE_PREFIXES = (
 
 REVIEW_PROMPT_CHANGED_PATH_LIMIT = 12
 REVIEW_CONTRACT_PATH = Path(__file__).resolve().parents[1] / "skills" / "code-review" / "references" / "review-contract.md"
+SEMANTIC_RISK_REGISTER_PATH = "docs/reviews/semantic-risk-register.json"
 
 
 def _task_intent_fields(task: Task) -> tuple[str, str, list[str], list[str]]:
@@ -261,6 +263,25 @@ def build_final_review_request(
     if missing_test_types:
         for requirement_id, test_type in missing_test_types:
             lines.append(f"- {requirement_id}: missing {test_type}")
+    else:
+        lines.append("- none")
+    risk_path = Path(project_root).expanduser().resolve() / SEMANTIC_RISK_REGISTER_PATH
+    try:
+        risk_payload = json.loads(risk_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        risk_payload = {}
+    risks = risk_payload.get("risks") if isinstance(risk_payload, dict) and isinstance(risk_payload.get("risks"), list) else []
+    lines.extend(["", "Deferred semantic risks:"])
+    if risks:
+        for risk in risks:
+            if not isinstance(risk, dict):
+                continue
+            categories = risk.get("categories") if isinstance(risk.get("categories"), list) else []
+            category_text = ", ".join(str(value) for value in categories) or str(risk.get("category") or "semantic-risk")
+            lines.append(
+                f"- {risk.get('task_id', '-')}: {category_text}; repeat_count={risk.get('repeat_count', '-')}; review={risk.get('review_artifact', '-')}"
+            )
+        lines.append("These risks were deferred only to keep implementation moving; final release review must decide whether they block acceptance.")
     else:
         lines.append("- none")
     lines.extend(

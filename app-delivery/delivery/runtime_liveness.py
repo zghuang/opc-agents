@@ -8,7 +8,7 @@ from typing import Any
 
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from .stack_contracts import PYTHON_REACT_CONTRACT
-from .state import load_task_runtime_state, process_alive, utc_now_iso
+from .state import load_task_runtime_state, normalize_task_runtime_state, process_alive, utc_now_iso
 from .task import FINAL_VERIFY_TASK_ID, Task, all_tasks
 
 
@@ -237,7 +237,9 @@ def running_runtime_task_payload(project_root: Path | str, tasks: list[Task]) ->
     for task in tasks:
         if task.id == FINAL_VERIFY_TASK_ID:
             continue
-        state = load_task_runtime_state(project_root, task.id)
+        if task.status in {"verified", "cancelled", "exception"}:
+            continue
+        state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
         if str(state.get("status") or "").strip() != "running":
             continue
         updated_at = str(state.get("updated_at") or "")

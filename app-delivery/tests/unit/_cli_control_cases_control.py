@@ -1921,6 +1921,53 @@ def test_cmd_control_auto_defers_stale_host_review_input_until_new_review_arrive
     assert payload["executed_steps"][0]["action"] == "run_code_review"
     assert payload["executed_steps"][0]["deferred_to_host"] is True
 
+def test_cmd_control_auto_defers_review_input_older_than_latest_runtime_completion_even_if_newer_than_request(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(json.dumps({"status": "changes_requested", "summary": "old", "findings": []}), encoding="utf-8")
+    request_path = code_review_request_path(tmp_path, "T002")
+    request_path.write_text("same review request\n", encoding="utf-8")
+    os.utime(request_path, (100.0, 100.0))
+    os.utime(input_path, (200.0, 200.0))
+    save_task_runtime_state(tmp_path, "T002", {"task_id": "T002", "completed_at": "1970-01-01T00:05:00Z"})
+
+    snapshots = [
+        {
+            "control_status": "in_progress",
+            "must_continue": True,
+            "next_step": {
+                "owner": "host",
+                "action": "run_code_review",
+                "skill": "code-review",
+                "task_id": "T002",
+                "expected_input_path": str(input_path),
+            },
+        },
+    ]
+    imported: list[tuple[str, dict[str, object], Path]] = []
+
+    monkeypatch.setattr(cli, "run_control", lambda project_root, *, goal, requirements_path=None, repair_task_id=None: dict(snapshots.pop(0)))
+    monkeypatch.setattr(cli, "import_task_review", lambda project_root, task_id, payload, input_path_arg: imported.append((task_id, dict(payload), input_path_arg)) or 0)
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+
+    result = cli.cmd_control(
+        argparse.Namespace(
+            project=str(tmp_path),
+            goal="auto",
+            requirements=None,
+            task_id=None,
+            runtime=None,
+            max_auto_tasks=None,
+            max_control_steps=16,
+            _locked=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert imported == []
+    assert payload["executed_steps"][0]["deferred_to_host"] is True
+
 def test_cmd_control_auto_imports_review_when_input_is_newer_than_latest_runtime_completion_even_if_request_mtime_is_newer(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
     input_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3331,7 +3378,7 @@ def test_cmd_control_auto_defers_clarification_questions_to_outer_host(tmp_path:
     assert payload["next_step"]["action"] == "collect_clarification_answers"
     assert "executed_steps" not in payload
 
-def test_status_does_not_report_running_from_stale_session_pointer_only(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_status_does_not_report_running_from_stale_session_pointer_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     save_work_items(
         tmp_path,
         {
@@ -3360,13 +3407,88 @@ def test_status_does_not_report_running_from_stale_session_pointer_only(tmp_path
             "retired": [],
         },
     )
-    monkeypatch.setattr("delivery.loop_reporting.process_alive", lambda pid: False)
+    result = cli.cmd_status(argparse.Namespace(project=str(tmp_path)))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["active_task"] is None
+    assert payload["counts"].get("pending") == 1
+
+def test_status_does_not_treat_released_execution_lock_metadata_as_running(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "active", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"]},
+            ],
+        },
+    )
+    save_session_state(
+        tmp_path,
+        {
+            "active": {
+                "id": "session-1",
+                "runtime": "opencode",
+                "task_count": 3,
+                "created_at": "2026-06-24T00:00:00Z",
+                "status": "active",
+                "title": "Feature",
+                "current_task_id": "T002",
+                "last_heartbeat": "2026-06-24T00:05:00Z",
+            },
+            "retired": [],
+        },
+    )
+    lock_dir = tmp_path / ".app-delivery-runtime" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    (lock_dir / "execution.lock").write_text(json.dumps({"pid": os.getpid(), "heartbeat_at": "2026-06-24T00:00:00Z"}) + "\n", encoding="utf-8")
 
     result = cli.cmd_status(argparse.Namespace(project=str(tmp_path)))
 
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
     assert payload["active_task"] is None
+    assert payload["counts"].get("pending") == 1
+    assert payload["stale_active_ledger_tasks"][0]["id"] == "T002"
+    assert payload["stale_active_ledger_tasks"][0]["display_status"] == "pending"
+
+def test_status_does_not_report_verified_task_from_stale_running_runtime_state(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T001", "title": "Foundation", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": [], "completed_at": "2026-06-24T00:10:00Z"},
+                {"id": "T002", "title": "Feature", "status": "pending", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": [], "output_paths": ["backend/src/feature/"]},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T001",
+        {
+            "task_id": "T001",
+            "status": "running",
+            "runtime_pid": 0,
+            "wrapper_pid": 0,
+            "updated_at": "2026-06-24T00:10:00Z",
+        },
+    )
+
+    result = cli.cmd_status(argparse.Namespace(project=str(tmp_path)))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["active_task"] is None
+    assert payload["next_task"]["id"] == "T002"
+    assert payload["counts"].get("verified") == 1
     assert payload["counts"].get("pending") == 1
 
 def test_cmd_start_rejects_concurrent_execution(tmp_path: Path, monkeypatch) -> None:

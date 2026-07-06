@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from delivery.loop import DeliveryLoop
 from delivery.loop import recover
@@ -1373,6 +1374,99 @@ def test_production_semantic_scan_accepts_route_parameter_security_dependency(tm
 
     assert not [finding for finding in findings if finding.category == "security-access-control"]
 
+def test_production_semantic_scan_accepts_explicit_public_login_endpoint(tmp_path: Path) -> None:
+    from delivery.production_semantics import scan_production_semantics
+
+    auth_path = tmp_path / "backend" / "app" / "core" / "auth.py"
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(
+        "def public_endpoint():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    route_path = tmp_path / "backend" / "app" / "domains" / "master_data" / "auth_router.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text(
+        "from fastapi import APIRouter, Depends, HTTPException, status\n"
+        "from app.core.auth import public_endpoint\n\n"
+        "router = APIRouter(prefix='/api/v1/auth', tags=['auth'])\n\n"
+        "@router.post('/login')\n"
+        "async def login(payload: dict, _public = Depends(public_endpoint)) -> dict:\n"
+        "    if not payload.get('username'):\n"
+        "        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='invalid')\n"
+        "    return await auth_service.login(payload)\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_production_semantics(tmp_path)
+
+    assert not [finding for finding in findings if finding.category == "security-access-control"]
+
+def test_review_preconditions_ignore_missing_changed_paths(tmp_path: Path, monkeypatch) -> None:
+    from delivery import loop_review
+    from delivery.loop_review import import_task_review
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Auth",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_auth.py"],
+                    "output_paths": ["backend/app/domains/master_data/"],
+                }
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "pending_scope_report": {
+                "changed_paths": ["backend/app/domains/master_data/auth_router.py"],
+                "staged_paths": [],
+                "out_of_scope": [],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        loop_review,
+        "scan_production_semantics",
+        lambda project_root: [
+            SimpleNamespace(
+                category="security-access-control",
+                path="backend/app/domains/master_data/auth_router.py",
+                message="missing auth",
+            )
+        ],
+    )
+    monkeypatch.setattr(loop_review, "git_commit_task", lambda *args, **kwargs: "commit-ok")
+    monkeypatch.setattr(loop_review, "git_commit_explicit_paths", lambda *args, **kwargs: "commit-ok")
+
+    result = import_task_review(
+        tmp_path,
+        "T002",
+        {
+            "status": "pass",
+            "summary": "Looks good.",
+            "findings": [],
+            "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+            "acceptance_assessment": [],
+        },
+        tmp_path / "review-input.json",
+    )
+
+    assert result == 0
+
 def test_import_task_review_repeated_machine_precondition_blocks_without_consuming_review_limit(tmp_path: Path, monkeypatch) -> None:
     from delivery import loop_review
     from delivery.loop_review import import_task_review
@@ -1430,6 +1524,140 @@ def test_import_task_review_repeated_machine_precondition_blocks_without_consumi
     assert second_state["machine_precondition_repeat_count"] == 1
     assert second_state["escalation"]["kind"] == "repeated_machine_precondition"
     assert second_state.get("review_repair_limit_reached") is not True
+
+def test_import_task_review_third_auth_machine_precondition_passes_with_semantic_risk(tmp_path: Path, monkeypatch) -> None:
+    from delivery import loop_review
+    from delivery.loop_review import import_task_review
+    from delivery.task import all_tasks, mark_task, save_tasks
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Auth and RBAC foundation",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": ["AS-001"],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/core/test_auth.py"],
+                    "output_paths": ["backend/app/core/auth.py", "backend/app/core/models/rbac.py"],
+                    "status_session_id": "ses-1",
+                    "intent": {
+                        "objective": "Implement login, RBAC, and access-control foundation",
+                    },
+                }
+            ],
+        },
+    )
+    error = (
+        "production semantic finding in task-changed path: security-access-control "
+        "backend/app/domains/master_data/auth_router.py: FastAPI route module exposes non-health routes without visible authentication or access-control dependency."
+    )
+    monkeypatch.setattr(loop_review, "_review_pass_precondition_errors", lambda project_root, task: [error])
+    monkeypatch.setattr(loop_review, "git_commit_task", lambda *args, **kwargs: "commit-ok")
+    monkeypatch.setattr(loop_review, "git_commit_explicit_paths", lambda *args, **kwargs: "commit-ok")
+    review_payload = {
+        "status": "pass",
+        "summary": "External review accepts the implementation.",
+        "findings": [],
+        "requirement_assessment": [{"id": "REQ-001", "status": "pass", "notes": "ok"}],
+        "acceptance_assessment": [{"id": "AS-001", "status": "pass", "notes": "ok"}],
+        "intent_assessment": {"status": "pass", "notes": "ok"},
+    }
+
+    first_result = import_task_review(tmp_path, "T002", review_payload, tmp_path / "review-1.json")
+    first_state = load_task_runtime_state(tmp_path, "T002")
+    first_item = all_tasks(tmp_path)[0]
+    assert first_result == 2
+    assert first_item.status == "pending"
+    assert first_state["machine_precondition_repeat_count"] == 0
+
+    save_tasks(tmp_path, mark_task(all_tasks(tmp_path), "T002", "review_pending", status_session_id="ses-2"))
+    second_result = import_task_review(tmp_path, "T002", review_payload, tmp_path / "review-2.json")
+    second_state = load_task_runtime_state(tmp_path, "T002")
+    second_item = all_tasks(tmp_path)[0]
+    assert second_result == 2
+    assert second_item.status == "pending"
+    assert second_state["machine_precondition_repeat_count"] == 1
+    assert second_state["focused_repair"]["kind"] == "repeated_machine_precondition_family"
+
+    save_tasks(tmp_path, mark_task(all_tasks(tmp_path), "T002", "review_pending", status_session_id="ses-3"))
+    third_result = import_task_review(tmp_path, "T002", review_payload, tmp_path / "review-3.json")
+    third_state = load_task_runtime_state(tmp_path, "T002")
+    third_item = all_tasks(tmp_path)[0]
+    assert third_result == 0
+    assert third_item.status == "verified"
+    assert third_item.review_status == "pass"
+    assert third_state["semantic_review_deferred_for_progress"] is True
+    assert third_state["machine_precondition_repeat_count"] == 2
+
+    review_text = (tmp_path / "docs" / "reviews" / "code-review-T002.md").read_text(encoding="utf-8")
+    assert "status: pass" in review_text
+    assert "## Deferred Semantic Risk" in review_text
+    risk_register = json.loads((tmp_path / "docs" / "reviews" / "semantic-risk-register.json").read_text(encoding="utf-8"))
+    assert risk_register["risks"][0]["kind"] == "semantic_review_deferred_for_progress"
+    assert risk_register["risks"][0]["task_id"] == "T002"
+
+def test_import_task_review_third_production_stub_machine_precondition_passes_with_semantic_risk(tmp_path: Path, monkeypatch) -> None:
+    from delivery import loop_review
+    from delivery.loop_review import import_task_review
+    from delivery.task import all_tasks, mark_task, save_tasks
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T008",
+                    "title": "Reporting workflow",
+                    "status": "review_pending",
+                    "requirements": ["REQ-008"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_reporting.py"],
+                    "output_paths": ["backend/app/domains/reporting/router.py"],
+                    "status_session_id": "ses-1",
+                }
+            ],
+        },
+    )
+    error = (
+        "production semantic finding in task-changed path: production-stub "
+        "backend/app/domains/reporting/router.py: Production route `summary` returns static literal/default data without visible service backing."
+    )
+    monkeypatch.setattr(loop_review, "_review_pass_precondition_errors", lambda project_root, task: [error])
+    monkeypatch.setattr(loop_review, "git_commit_task", lambda *args, **kwargs: "commit-ok")
+    monkeypatch.setattr(loop_review, "git_commit_explicit_paths", lambda *args, **kwargs: "commit-ok")
+    review_payload = {
+        "status": "pass",
+        "summary": "External review accepts the implementation.",
+        "findings": [],
+        "requirement_assessment": [{"id": "REQ-008", "status": "pass", "notes": "ok"}],
+        "acceptance_assessment": [],
+    }
+
+    assert import_task_review(tmp_path, "T008", review_payload, tmp_path / "review-1.json") == 2
+    save_tasks(tmp_path, mark_task(all_tasks(tmp_path), "T008", "review_pending", status_session_id="ses-2"))
+    assert import_task_review(tmp_path, "T008", review_payload, tmp_path / "review-2.json") == 2
+    save_tasks(tmp_path, mark_task(all_tasks(tmp_path), "T008", "review_pending", status_session_id="ses-3"))
+    assert import_task_review(tmp_path, "T008", review_payload, tmp_path / "review-3.json") == 0
+
+    state = load_task_runtime_state(tmp_path, "T008")
+    item = all_tasks(tmp_path)[0]
+    assert item.status == "verified"
+    assert state["semantic_review_deferred_for_progress"] is True
+    risk_register = json.loads((tmp_path / "docs" / "reviews" / "semantic-risk-register.json").read_text(encoding="utf-8"))
+    assert risk_register["risks"][0]["categories"] == ["production-stub"]
 
 def test_import_task_review_pass_accepts_route_fetch_passthrough_e2e(tmp_path: Path, monkeypatch) -> None:
     from delivery.loop_review import import_task_review
@@ -1680,6 +1908,49 @@ def test_execute_task_blocks_and_retires_session_on_runtime_failure(tmp_path: Pa
     assert item["blocked_reason"] == "boom"
     session_payload = load_session_state(tmp_path)
     assert session_payload["active"]["id"] == "session-1"
+
+def test_execute_task_runtime_interrupted_uses_recovery_path(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import Task
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Login", "status": "pending", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_login.py"], "output_paths": ["backend/src/login/"]},
+            ],
+        },
+    )
+    loop = DeliveryLoop(tmp_path)
+
+    class DummySession:
+        id = "session-1"
+        runtime = "opencode"
+        task_count = 0
+        created_at = "2026-06-24T00:00:00Z"
+        status = "active"
+        title = "Login"
+        current_task_id = "T002"
+        last_heartbeat = "2026-06-24T00:05:00Z"
+
+    monkeypatch.setattr(loop, "_session_for_task", lambda task: DummySession())
+    monkeypatch.setattr(
+        "delivery.loop.execute_in_session",
+        lambda project_root, session, prompt: (_ for _ in ()).throw(RuntimeErrorResponse("runtime command interrupted", "terminated", kind="runtime_interrupted", returncode=-15)),
+    )
+
+    success, state = loop._execute_task(Task("T002", "Login", "pending", ["REQ-001"], [], [], ["backend/tests/test_login.py"], ["backend/src/login/"]))
+
+    assert success is False
+    assert state == "stalled_recovery"
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "pending"
+    runtime_state = load_task_runtime_state(tmp_path, "T002")
+    assert runtime_state["status"] == "interrupted"
+    assert runtime_state["recovery_reason"] == "stalled_runtime"
 
 def test_execute_task_converts_unexpected_local_exception_into_task_exception(tmp_path: Path, monkeypatch) -> None:
     from delivery.task import Task

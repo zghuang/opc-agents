@@ -42,6 +42,10 @@ from .task_contract_repair import TaskContractRepairBlocked, TaskContractRepairE
 
 MAX_CODE_REVIEW_REPAIR_ATTEMPTS = 4
 MAX_FINAL_REPAIR_ITERATIONS = 3
+MACHINE_PRECONDITION_PROGRESS_REPEAT_THRESHOLD = 2
+SEMANTIC_RISK_REGISTER_PATH = "docs/reviews/semantic-risk-register.json"
+SECURITY_RISK_REGISTER_PATH = SEMANTIC_RISK_REGISTER_PATH
+DEFERABLE_MACHINE_PRECONDITION_CATEGORIES = {"real-backend-e2e", "production-stub", "production-fake-data"}
 FINAL_VERIFICATION_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
 
@@ -157,13 +161,14 @@ def _path_overlaps(scope: str, candidate: str) -> bool:
 
 
 def _production_semantic_precondition_errors(project_root: Path | str, task: Task) -> list[str]:
+    project_dir = resolve_project_root(project_root)
     runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
     scope_report = runtime_state.get("pending_scope_report") if isinstance(runtime_state.get("pending_scope_report"), dict) else {}
     changed_paths = [
         str(path).strip()
         for key in ("changed_paths", "staged_paths", "out_of_scope")
         for path in scope_report.get(key, [])
-        if str(path).strip()
+        if str(path).strip() and (project_dir / str(path).strip().lstrip("./")).exists()
     ]
     if not changed_paths:
         return []
@@ -302,16 +307,143 @@ def _precondition_failure_review_payload(task: Task, parsed: dict[str, Any], err
     }
 
 
+def _machine_precondition_errors(review_payload: dict[str, Any]) -> list[str]:
+    return [str(error).strip() for error in review_payload.get("machine_precondition_errors", []) if str(error).strip()]
+
+
+def _machine_precondition_error_family(error: str) -> dict[str, str]:
+    text = str(error or "").strip()
+    lowered = text.casefold()
+    if "security-access-control" in lowered:
+        return {"category": "security-access-control", "family": "missing-visible-route-auth"}
+    if "real-backend-e2e" in lowered:
+        return {"category": "real-backend-e2e", "family": "mock-only-proof"}
+    if "production-stub" in lowered:
+        return {"category": "production-stub", "family": "static-route-response"}
+    if "production-fake-data" in lowered:
+        return {"category": "production-fake-data", "family": "synthetic-data"}
+    if "unsupported top-level frontend paths" in lowered:
+        return {"category": "unsupported-frontend-root", "family": "wrong-root"}
+    return {"category": "unknown", "family": re.sub(r"\s+", " ", lowered)[:240]}
+
+
+def _machine_precondition_error_families(review_payload: dict[str, Any]) -> list[dict[str, str]]:
+    return sorted((_machine_precondition_error_family(error) for error in _machine_precondition_errors(review_payload)), key=lambda row: (row["category"], row["family"]))
+
+
 def _machine_precondition_fingerprint(review_payload: dict[str, Any]) -> str:
     if str(review_payload.get("review_type") or "").strip() != "machine-precondition":
         return ""
     if str(review_payload.get("external_review_status") or "").strip().casefold() != "pass":
         return ""
-    errors = [str(error).strip() for error in review_payload.get("machine_precondition_errors", []) if str(error).strip()]
-    if not errors:
+    families = _machine_precondition_error_families(review_payload)
+    if not families:
         return ""
-    payload = json.dumps(errors, ensure_ascii=False, sort_keys=True)
+    payload = json.dumps(families, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _machine_precondition_is_security_access_control(review_payload: dict[str, Any]) -> bool:
+    families = _machine_precondition_error_families(review_payload)
+    return bool(families) and all(row.get("category") == "security-access-control" for row in families)
+
+
+def _machine_precondition_deferable_families(task: Task, review_payload: dict[str, Any]) -> list[dict[str, str]]:
+    families = _machine_precondition_error_families(review_payload)
+    if not families:
+        return []
+    for row in families:
+        category = row.get("category")
+        if category == "security-access-control":
+            if not _task_owns_auth_or_rbac_surface(task):
+                return []
+            continue
+        if category not in DEFERABLE_MACHINE_PRECONDITION_CATEGORIES:
+            return []
+    return families
+
+
+def _task_owns_auth_or_rbac_surface(task: Task) -> bool:
+    intent_text = json.dumps(task.intent or {}, ensure_ascii=False).casefold()
+    technology_text = json.dumps(task.technology_constraints or [], ensure_ascii=False).casefold()
+    haystack = "\n".join(
+        [
+            str(task.title or ""),
+            intent_text,
+            technology_text,
+            *task.output_paths,
+            *task.output_tests,
+        ]
+    ).casefold()
+    markers = ("auth", "rbac", "access-control", "access control", "permission", "role", "login", "tenant")
+    return any(marker in haystack for marker in markers)
+
+
+def _machine_precondition_can_defer_for_progress(task: Task, review_payload: dict[str, Any], repeat_count: int) -> bool:
+    return (
+        repeat_count >= MACHINE_PRECONDITION_PROGRESS_REPEAT_THRESHOLD
+        and bool(_machine_precondition_deferable_families(task, review_payload))
+    )
+
+
+def _machine_precondition_progress_pass_payload(task: Task, review_payload: dict[str, Any], *, fingerprint: str, repeat_count: int) -> dict[str, Any]:
+    errors = _machine_precondition_errors(review_payload)
+    families = _machine_precondition_deferable_families(task, review_payload)
+    categories = sorted({row["category"] for row in families})
+    risk = {
+        "kind": "semantic_review_deferred_for_progress",
+        "fingerprint": fingerprint,
+        "repeat_count": repeat_count,
+        "categories": categories,
+        "families": families,
+        "reason": "repeated deferable machine-precondition after external review pass; allow dependent tasks to continue and require final human release review",
+        "errors": errors,
+    }
+    return {
+        **review_payload,
+        "status": "pass",
+        "review_type": "machine-precondition",
+        "machine_precondition_status": "deferred_for_progress",
+        "summary": (
+            "Repeated machine-precondition deferred for progress after focused repair attempts. "
+            "Task tests and external review passed; final human release review remains required."
+        ),
+        "semantic_risk": risk,
+        "task_contract_assessment": {
+            "status": "pass",
+            "issue_type": "semantic_review_deferred_for_progress",
+            "recommended_action": "final_human_release_review",
+            "operations": [],
+            "affected_requirement_ids": list(task.requirements),
+            "affected_acceptance_ids": list(task.acceptance_scenarios),
+            "notes": risk["reason"],
+        },
+    }
+
+
+def _write_semantic_risk_register(project_root: Path, *, task: Task, review_artifact: str, risk: dict[str, Any], reviewed_at: str) -> str:
+    path = project_root / SEMANTIC_RISK_REGISTER_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {"schema_version": "1", "risks": []}
+    if not isinstance(payload, dict):
+        payload = {"schema_version": "1", "risks": []}
+    risks = payload.get("risks") if isinstance(payload.get("risks"), list) else []
+    row = {
+        "task_id": task.id,
+        "task_title": task.title,
+        "review_artifact": review_artifact,
+        "registered_at": reviewed_at,
+        **risk,
+    }
+    risks = [existing for existing in risks if not (isinstance(existing, dict) and existing.get("task_id") == task.id and existing.get("fingerprint") == risk.get("fingerprint"))]
+    risks.append(row)
+    payload["schema_version"] = "1"
+    payload["risks"] = risks
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return SEMANTIC_RISK_REGISTER_PATH
 
 
 def write_code_review_request(
@@ -520,11 +652,24 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         for path in pending_scope_report.get("staged_paths", [])
         if str(path).strip()
     ]
+    machine_fingerprint = _machine_precondition_fingerprint(parsed)
+    same_machine_fingerprint = bool(machine_fingerprint and str(runtime_state.get("machine_precondition_fingerprint") or "") == machine_fingerprint)
+    machine_repeat_count = int(runtime_state.get("machine_precondition_repeat_count") or 0) + 1 if same_machine_fingerprint else 0
+    deferred_semantic_risk_path: str | None = None
+    if same_machine_fingerprint and _machine_precondition_can_defer_for_progress(task, parsed, machine_repeat_count):
+        parsed = _machine_precondition_progress_pass_payload(task, parsed, fingerprint=machine_fingerprint, repeat_count=machine_repeat_count)
+        review_status = "pass"
+        review_artifact = _write_review_artifact(project_dir, task, parsed)
+        risk = parsed.get("semantic_risk") if isinstance(parsed.get("semantic_risk"), dict) else {}
+        deferred_semantic_risk_path = _write_semantic_risk_register(project_dir, task=task, review_artifact=review_artifact, risk=risk, reviewed_at=reviewed_at)
     if review_status.casefold() == "pass":
+        pass_extra_paths = [*accepted_scope_paths, review_artifact]
+        if deferred_semantic_risk_path:
+            pass_extra_paths.append(deferred_semantic_risk_path)
         if staged_scope_paths:
             commit_sha = git_commit_explicit_paths(
                 project_dir,
-                [*staged_scope_paths, *accepted_scope_paths, review_artifact],
+                [*staged_scope_paths, *pass_extra_paths],
                 f"feat({task.id}): {task.title}",
             )
         else:
@@ -532,7 +677,7 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
                 project_dir,
                 task,
                 f"feat({task.id}): {task.title}",
-                extra_paths=[*accepted_scope_paths, review_artifact],
+                extra_paths=pass_extra_paths,
             )
         tasks = mark_task(
             all_tasks(project_dir),
@@ -557,6 +702,18 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
                 "pending_scope_report": None,
                 "review_changes_requested_count": 0,
                 "review_repair_limit_reached": False,
+                **(
+                    {
+                        "machine_precondition_fingerprint": machine_fingerprint,
+                        "machine_precondition_repeat_count": machine_repeat_count,
+                        "machine_precondition_errors": _machine_precondition_errors(parsed),
+                        "semantic_review_deferred_for_progress": True,
+                        "semantic_risk_register": deferred_semantic_risk_path,
+                        "semantic_risk": parsed.get("semantic_risk"),
+                    }
+                    if deferred_semantic_risk_path
+                    else {}
+                ),
             },
         )
         active_session = current_session(project_dir)
@@ -567,9 +724,48 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         refresh_gates(project_dir)
         return 0
 
-    machine_fingerprint = _machine_precondition_fingerprint(parsed)
-    if machine_fingerprint and str(runtime_state.get("machine_precondition_fingerprint") or "") == machine_fingerprint:
-        machine_repeat_count = int(runtime_state.get("machine_precondition_repeat_count") or 0) + 1
+    if same_machine_fingerprint:
+        deferable_families = _machine_precondition_deferable_families(task, parsed)
+        if deferable_families:
+            review_changes_requested_count = int(runtime_state.get("review_changes_requested_count") or 0) + 1
+            review_repair_state = {
+                "review_changes_requested_count": review_changes_requested_count,
+                "review_repair_limit": MAX_CODE_REVIEW_REPAIR_ATTEMPTS,
+                "last_changes_requested_review_artifact": review_artifact,
+                "last_changes_requested_reviewed_at": reviewed_at,
+                "machine_precondition_fingerprint": machine_fingerprint,
+                "machine_precondition_repeat_count": machine_repeat_count,
+                "machine_precondition_errors": list(parsed.get("machine_precondition_errors", [])),
+                "machine_precondition_families": deferable_families,
+                "focused_repair": {
+                    "kind": "repeated_machine_precondition_family",
+                    "reason": "same deferable machine-precondition family repeated; run one focused repair before deferring to final release review",
+                    "repeat_count": machine_repeat_count,
+                    "next_repeat_action": "defer_for_progress" if machine_repeat_count + 1 >= MACHINE_PRECONDITION_PROGRESS_REPEAT_THRESHOLD else "focused_repair",
+                },
+            }
+            tasks = mark_task(
+                all_tasks(project_dir),
+                task.id,
+                "pending",
+                git_commit=None,
+                status_session_id=task.status_session_id,
+                started_at=None,
+                completed_at=None,
+                review_status=review_status,
+                review_artifact=review_artifact,
+                reviewed_at=reviewed_at,
+                verified_at=None,
+                blocked_reason=str(parsed.get("summary") or "repeated security-access-control machine-precondition requires focused repair"),
+                attempts=max(task.attempts, 1),
+            )
+            save_tasks(project_dir, tasks)
+            active_session = current_session(project_dir)
+            if active_session is not None and active_session.id == task.status_session_id:
+                retire_session(project_dir, active_session)
+            save_task_runtime_state(project_dir, task_id, {**review_repair_state, "pending_scope_report": None})
+            refresh_gates(project_dir)
+            return 2
         blocked_reason = (
             "repeated machine-precondition finding after external review pass; "
             f"host escalation required instead of another automatic repair loop; see {review_artifact}"
@@ -629,7 +825,7 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         review_repair_state.update(
             {
                 "machine_precondition_fingerprint": machine_fingerprint,
-                "machine_precondition_repeat_count": 0,
+                "machine_precondition_repeat_count": machine_repeat_count,
                 "machine_precondition_errors": list(parsed.get("machine_precondition_errors", [])),
             }
         )

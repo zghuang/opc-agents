@@ -24,4 +24,5 @@ _load_case_modules(
     "_cli_control_cases_review_verify.py",
     "_cli_control_cases_control.py",
     "_cli_control_cases_runtime.py",
+    "_cli_control_cases_status_watch.py",
 )

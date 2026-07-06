@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 from delivery.loop import DeliveryLoop
@@ -12,6 +13,28 @@ from delivery.loop_review import _parse_review_payload, _validate_pass_review_ma
 from delivery.loop_task_prompt import build_fix_prompt, build_stalled_recovery_prompt, build_task_prompt
 from delivery.session import RuntimeErrorResponse, RuntimeSession, save_current_session
 from delivery.state import load_session_state, load_task_runtime_state, save_session_state, save_task_runtime_state, save_test_results, save_work_items
+
+
+def test_git_retries_transient_index_lock(monkeypatch, tmp_path: Path) -> None:
+    import delivery.loop_gitops as loop_gitops
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(command, 128, stdout="fatal: Unable to create '.git/index.lock': File exists.\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(loop_gitops.subprocess, "run", fake_run)
+    monkeypatch.setattr(loop_gitops.time, "sleep", lambda seconds: None)
+    monkeypatch.setenv("APP_DELIVERY_GIT_INDEX_LOCK_RETRY_SECONDS", "1")
+
+    result = loop_gitops.git(["status"], cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert result.stdout == "ok\n"
+    assert len(calls) == 2
 
 
 def test_git_stage_task_snapshot_ignores_preserved_out_of_scope_paths(tmp_path: Path) -> None:

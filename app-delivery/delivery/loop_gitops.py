@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import json
+import time
 from pathlib import Path, PurePosixPath
 
 from .runtime_config import load_project_runtime
@@ -74,19 +75,40 @@ RUNTIME_LOCAL_ONLY_PREFIXES = (
 )
 
 EXCEPTION_PATCHES_DIR = Path(".app-delivery-runtime") / "exception-patches"
+GIT_INDEX_LOCK_RETRY_SECONDS = 10.0
+GIT_INDEX_LOCK_RETRY_INTERVAL_SECONDS = 0.5
+
+
+def _git_index_lock_error(output: str) -> bool:
+    lowered = str(output or "").casefold()
+    return ".git/index.lock" in lowered or ("index.lock" in lowered and "file exists" in lowered)
+
+
+def _git_index_lock_retry_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("APP_DELIVERY_GIT_INDEX_LOCK_RETRY_SECONDS") or GIT_INDEX_LOCK_RETRY_SECONDS))
+    except ValueError:
+        return GIT_INDEX_LOCK_RETRY_SECONDS
 
 
 def git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    deadline = time.monotonic() + _git_index_lock_retry_seconds()
+    while True:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode == 0 or not _git_index_lock_error(completed.stdout):
+            return completed
+        if time.monotonic() >= deadline:
+            return completed
+        time.sleep(GIT_INDEX_LOCK_RETRY_INTERVAL_SECONDS)
 
 
 def git_head_sha(project_root: Path | str) -> str:

@@ -122,6 +122,56 @@ def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch)
     assert metrics["T002"]["completed_at"] is not None
     assert spawned == [str(tmp_path)]
 
+def test_cmd_code_review_duplicate_import_for_imported_handoff_is_idempotent(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "verified",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/src/feature.py"],
+                    "review_status": "pass",
+                    "completed_at": "2026-06-24T01:00:00Z",
+                    "attempts": 1,
+                }
+            ],
+        },
+    )
+    input_path = tmp_path / "code-review.json"
+    input_path.write_text(json.dumps({"status": "pass", "summary": "Looks good.", "findings": []}), encoding="utf-8")
+    handoff_path = tmp_path / ".app-delivery-runtime" / "host-handoff.json"
+    handoff_path.parent.mkdir(parents=True, exist_ok=True)
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "status": "imported",
+                "skill": "code-review",
+                "task_id": "T002",
+                "input_path": str(input_path),
+                "import_exit_code": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_watchdog_enabled_for", lambda project_root: False)
+
+    result = cli.cmd_code_review(argparse.Namespace(project=str(tmp_path), task_id="T002", input=str(input_path)))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["status"] == "already_imported"
+    assert payload["import_outcome"] == "accepted_pass"
+
 def test_cmd_code_review_task_contract_repair_moves_acceptance_to_later_task(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)

@@ -12,7 +12,7 @@ from .runtime_liveness import running_runtime_task_payload, runtime_attention_pa
 from .runtime_config import resolve_project_root
 from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
 from .session import current_session
-from .state import latest_task_log_event, load_active_task_records, load_stale_active_task_records, load_task_runtime_state, load_test_results, normalize_task_runtime_state, process_alive, prune_stale_active_task_records, read_lock_metadata, save_task_runtime_state, utc_now_iso
+from .state import latest_task_log_event, lock_file_is_locked, load_active_task_records, load_stale_active_task_records, load_task_runtime_state, load_test_results, normalize_task_runtime_state, prune_stale_active_task_records, save_task_runtime_state, utc_now_iso
 from .task import FINAL_VERIFY_TASK_ID, Task, all_tasks, load_requirement_ids, next_generated_task_id, pick_next_task, save_tasks
 from .token_usage import execution_token_records_for_project, execution_token_records_for_task, extract_opencode_usage, safe_int
 
@@ -784,12 +784,50 @@ def _reconcile_final_repair_runtime_state(project_root: Path, tasks: list[Any]) 
 
 def _execution_lock_live(project_root: Path) -> bool:
     lock_path = project_root / ".app-delivery-runtime" / "locks" / "execution.lock"
-    metadata = read_lock_metadata(lock_path)
-    try:
-        pid = int(metadata.get("pid") or 0)
-    except (TypeError, ValueError):
-        return False
-    return process_alive(pid)
+    return lock_file_is_locked(lock_path)
+
+
+def _trim_status_text(value: Any, *, limit: int = 500) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _task_attention_payload(task: Any) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "status": task.status,
+        "blocked_reason": _trim_status_text(getattr(task, "blocked_reason", None)),
+        "review_artifact": getattr(task, "review_artifact", None),
+        "status_session_id": getattr(task, "status_session_id", None),
+    }
+
+
+def _stale_active_ledger_tasks(project_root: Path, ledger_tasks: list[Any], display_tasks: list[Any]) -> list[dict[str, Any]]:
+    display_by_id = {task.id: task for task in display_tasks}
+    stale: list[dict[str, Any]] = []
+    for task in ledger_tasks:
+        if task.status != "active":
+            continue
+        display_task = display_by_id.get(task.id)
+        if display_task is None or display_task.status == "active":
+            continue
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
+        stale.append(
+            {
+                **_task_attention_payload(task),
+                "display_status": display_task.status,
+                "runtime_status": str(runtime_state.get("status") or "").strip() or None,
+                "runtime_pid": runtime_state.get("runtime_pid"),
+                "wrapper_pid": runtime_state.get("wrapper_pid"),
+                "last_output_at": str(runtime_state.get("last_output_at") or "").strip() or None,
+            }
+        )
+    return stale
 
 
 def _requirements_source_archived(project_root: Path) -> bool:
@@ -818,6 +856,10 @@ def _display_tasks(project_root: Path, tasks: list[Any]) -> list[Any]:
             continue
         session_match = bool(execution_live and active and str(active.id or "").strip() and active.current_task_id == task.id)
         if task.id in live_task_ids or session_match:
+            display.append(task)
+            continue
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
+        if str(runtime_state.get("status") or "").strip() in {"completed", "failed", "interrupted"}:
             display.append(task)
             continue
         data = task.to_dict()
@@ -858,6 +900,16 @@ def _active_task_payload(project_root: Path, tasks: list[Any]) -> dict[str, Any]
     if live_active_tasks:
         task = live_active_tasks[0]
         if not execution_live:
+            runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, task.id))
+            if str(runtime_state.get("status") or "").strip() in {"completed", "failed", "interrupted"}:
+                payload = task.to_dict()
+                payload["phase"] = runtime_state.get("phase") or "implementation"
+                payload["runtime_pid"] = runtime_state.get("runtime_pid")
+                payload["updated_at"] = runtime_state.get("updated_at")
+                payload["log_file"] = runtime_state.get("log_file")
+                payload["session_id"] = runtime_state.get("session_id")
+                payload["runtime_state"] = runtime_state
+                return payload
             return running_runtime_task_payload(project_root, tasks)
         payload = task.to_dict()
         payload["phase"] = "implementation"
@@ -1117,6 +1169,8 @@ def status(project_root: Path | str) -> dict[str, Any]:
         "review_pending_task": review_payload,
         "active_task": active_payload,
         "runtime_attention": runtime_attention,
+        "exception_tasks": [_task_attention_payload(task) for task in display_tasks if task.status == "exception"],
+        "stale_active_ledger_tasks": _stale_active_ledger_tasks(project_dir, tasks, display_tasks),
         "orphan_active_tasks": _orphan_active_task_records(project_dir, display_tasks),
         "stale_active_tasks": load_stale_active_task_records(project_dir),
         "paused": (project_dir / PAUSE_FILE).exists(),
