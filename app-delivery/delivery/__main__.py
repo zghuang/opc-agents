@@ -767,16 +767,12 @@ def _prune_stale_execution_lock(project_root: Path | str) -> bool:
     project_dir = resolve_project_root(project_root)
     lock_path = project_dir / ".app-delivery-runtime" / "locks" / "execution.lock"
     lock_details = read_lock_metadata(lock_path)
-    if lock_details and not lock_file_is_locked(lock_path):
+    if lock_file_is_locked(lock_path):
+        return False
+    if lock_details:
         with contextlib.suppress(OSError):
             lock_path.unlink()
         return True
-    try:
-        owner_pid = int((lock_details or {}).get("pid") or 0)
-    except (TypeError, ValueError):
-        owner_pid = 0
-    if owner_pid <= 0 or _pid_is_running(owner_pid):
-        return False
     return False
 
 
@@ -1091,6 +1087,41 @@ def _mark_host_handoff_review_runner_failed(project_root: Path, fallback_state: 
             "review_runner_last_activity_at": str(fallback_state.get("last_activity_at") or "").strip() or None,
             "review_runner_idle_seconds": fallback_state.get("idle_seconds"),
             "message": "Review runner failed before importing a fresh code-review artifact; retry may run automatically if attempts remain.",
+        }
+    )
+    write_json(path, body)
+
+
+def _mark_host_handoff_review_import_failed(project_root: Path, step: dict[str, Any], input_path: Path, exc: DeliveryError) -> None:
+    path = _host_handoff_path(project_root)
+    existing = load_json(path, {})
+    if not isinstance(existing, dict):
+        return
+    existing_input = str(existing.get("expected_input_path") or "").strip()
+    step_input = str(step.get("expected_input_path") or "").strip()
+    if existing_input and Path(existing_input).expanduser().resolve() != input_path:
+        return
+    if step_input and Path(step_input).expanduser().resolve() != input_path:
+        return
+    existing_status = str(existing.get("status") or "").strip()
+    if existing_status not in {HANDOFF_REVIEW_RUNNING_STATUS, "waiting_for_host", HANDOFF_REVIEW_RUNNER_FAILED_STATUS}:
+        return
+    body = dict(existing)
+    review_error_payload = exc.to_payload()
+    body.update(
+        {
+            "schema_version": "1",
+            "status": HANDOFF_REVIEW_RUNNER_FAILED_STATUS,
+            "project": str(project_root),
+            "updated_at": utc_now_iso(),
+            "handler": "review_runner",
+            "review_runner_status": "failed",
+            "review_runner_reason": f"review_import_failed:{exc.code}",
+            "review_runner_completed_at": utc_now_iso(),
+            "review_runner_input_path": str(input_path),
+            "review_runner_error_class": str(review_error_payload.get("error_class") or ""),
+            "review_runner_error_message": exc.message,
+            "message": "Review runner produced an artifact, but framework import rejected it; inspect the import error and retry with a corrected artifact.",
         }
     )
     write_json(path, body)
@@ -1541,6 +1572,7 @@ def _execute_host_control_step_if_ready(step: dict[str, Any], project_root: Path
             already_imported = _host_handoff_imported_result(project_root, skill="code-review", task_id=task_id, input_path=loaded_input_path)
             if exc.code == "review_task_not_pending" and already_imported is not None:
                 return already_imported
+            _mark_host_handoff_review_import_failed(project_root, step, loaded_input_path, exc)
             raise
     elif skill == "final-review":
         payload, loaded_input_path = load_stage_payload(project_root, "final-review", str(input_path), expected_type=dict)

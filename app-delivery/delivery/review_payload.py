@@ -49,8 +49,14 @@ ALLOWED_ASSESSMENT_STATUSES = {"pass", "changes_requested"}
 ALLOWED_FINDING_SEVERITIES = {"blocking", "non_blocking"}
 FINDING_SEVERITY_ALIASES = {
     "advisory": "non_blocking",
+    "info": "non_blocking",
+    "informational": "non_blocking",
+    "minor": "non_blocking",
+    "note": "non_blocking",
     "non-blocking": "non_blocking",
     "nonblocking": "non_blocking",
+    "suggestion": "non_blocking",
+    "warning": "non_blocking",
 }
 TASK_CONTRACT_REPAIR_ACTION = "task_contract_repair"
 TASK_CONTRACT_DECOMPOSE_FALLBACK_ACTION = "repair_task_decompose"
@@ -231,7 +237,13 @@ def _normalize_technology_assessment(value: Any, task: Task) -> list[dict[str, A
             continue
         name = str(row.get("name") or "").strip()
         status = str(row.get("status") or "").strip().casefold()
-        evidence = [str(item).strip() for item in row.get("evidence", []) if str(item).strip()] if isinstance(row.get("evidence"), list) else []
+        raw_evidence = row.get("evidence", [])
+        if isinstance(raw_evidence, list):
+            evidence = [str(item).strip() for item in raw_evidence if str(item).strip()]
+        elif str(raw_evidence or "").strip():
+            evidence = [str(raw_evidence).strip()]
+        else:
+            evidence = []
         notes = str(row.get("notes") or "").strip()
         if name not in allowed_names:
             errors.append(f"technology_assessment contains unknown technology constraint: {name or '<empty>'}")

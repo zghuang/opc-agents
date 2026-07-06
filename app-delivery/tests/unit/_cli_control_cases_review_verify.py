@@ -61,6 +61,104 @@ def test_review_payload_supports_pass_all_except_requirement_assessment() -> Non
     assert by_id["REQ-003"]["status"] == "pass"
 
 
+def test_review_payload_normalizes_suggestion_and_string_technology_evidence() -> None:
+    from delivery.review_payload import validate_pass_review_matrix
+
+    task = Task.from_dict(
+        {
+            "id": "T019",
+            "title": "Validation",
+            "status": "review_pending",
+            "task_kind": "validation",
+            "requirements": [],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": [],
+            "output_paths": [],
+            "technology_constraints": [
+                {"name": "PostgreSQL 16 + asyncpg", "requirement": "must_use"},
+            ],
+        }
+    )
+
+    parsed = validate_pass_review_matrix(
+        task,
+        {
+            "status": "pass",
+            "summary": "Looks good.",
+            "findings": [{"severity": "suggestion", "description": "Optional depth improvement."}],
+            "requirement_assessment": [],
+            "acceptance_assessment": [],
+            "technology_assessment": [
+                {
+                    "name": "PostgreSQL 16 + asyncpg",
+                    "status": "pass",
+                    "evidence": "backend/app/core/database.py uses asyncpg.create_pool",
+                    "notes": "Production database access is asyncpg-backed.",
+                }
+            ],
+        },
+    )
+
+    assert parsed["findings"] == [
+        {
+            "severity": "non_blocking",
+            "requirement_ids": [],
+            "acceptance_ids": [],
+            "message": "Optional depth improvement.",
+        }
+    ]
+    assert parsed["technology_assessment"][0]["evidence"] == ["backend/app/core/database.py uses asyncpg.create_pool"]
+
+
+def test_ready_review_artifact_import_failure_marks_handoff_failed(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "review_pending",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": [],
+                    "output_paths": ["backend/src/feature.py"],
+                }
+            ],
+        },
+    )
+    input_path = tmp_path / ".app-delivery-runtime" / "review-inputs" / "code-review-T002.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(
+        json.dumps({"status": "pass", "summary": "bad", "findings": [{"severity": "weird", "description": "invalid"}], "requirement_assessment": [], "acceptance_assessment": []}),
+        encoding="utf-8",
+    )
+    handoff_path = tmp_path / ".app-delivery-runtime" / "host-handoff.json"
+    handoff_path.parent.mkdir(parents=True, exist_ok=True)
+    step = {"skill": "code-review", "task_id": "T002", "expected_input_path": str(input_path)}
+    handoff_path.write_text(
+        json.dumps({"schema_version": "1", "status": "review_running", "handoff_id": "h1", **step}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as excinfo:
+        cli._execute_host_control_step_if_ready(step, tmp_path)
+
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    assert excinfo.value.code == "review_assessment_invalid"
+    assert handoff["status"] == "review_runner_failed"
+    assert handoff["review_runner_status"] == "failed"
+    assert handoff["review_runner_reason"] == "review_import_failed:review_assessment_invalid"
+    assert handoff["review_runner_input_path"] == str(input_path)
+    assert "findings[0].severity" in handoff["review_runner_error_message"]
+
+
 def test_cmd_code_review_import_marks_task_verified(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
         tmp_path,
