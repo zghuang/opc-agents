@@ -1,126 +1,125 @@
-# app-delivery
+# app-delivery Agent Notes
+
+Keep this file synchronized with its counterpart guidance file. Both files describe the current app-delivery framework for implementation and review agents.
 
 ## Project Identity
 
-app-delivery is the first agent in the opc-agents family. It takes a software project's requirements document and runs a 24/7 delivery pipeline until all requirements are implemented, tested, and verified by independent code review.
+app-delivery is a domain-agnostic OPC delivery agent. It turns project requirements into normalized planning artifacts, then drives scaffold, implementation, validation, review, repair, and final verification.
 
-The core idea: a thin Python CLI (`delivery/` package) manages task state and AI sessions. Hermes skills provide operator entry points and cron monitoring. The actual implementation is done by Claude Code / OpenCode sessions.
+The framework does not encode one specific project, department, company, or business domain. Domain behavior comes from each project's requirements, architecture, module docs, UI docs, and test plan. app-delivery owns delivery mechanics: ledgers, runtime execution, test evidence, review routing, watchdogs, exception recovery, and gates.
 
-## Directory Structure
+## Current Architecture
 
-```
-opc-agents/app-delivery/
-├── delivery/                    ← Python CLI package (python3 -m delivery ...)
-│   ├── __init__.py
-│   ├── __main__.py              ← CLI entrypoint
-│   ├── state.py                 ← work-items.json + test-results.json management
-│   ├── loop.py                  ← delivery loop core
-│   ├── session.py               ← AI session (CC/OC) lifecycle
-│   ├── task.py                  ← task model, decomposition
-│   ├── verify.py                ← test runner, weak command detection
-│   └── scaffold.py              ← T000 scaffold generator
-│   ├── scripts/                 ← setup/new-project/doctor shell entrypoints
-│   ├── skills/                   ← canonical operator skill + stage/review skills
-│   │   ├── app-delivery/
-│   │   ├── spec-review/
-│   │   ├── arch-design/
-│   │   ├── ui-design/
-│   │   ├── project-context-sync/
-│   │   ├── task-decompose/
-│   │   ├── code-review/
-│   │   └── final-review/
-│   ├── tests/                    ← 框架自测
-│   │   ├── smoke/                ← 冒烟测试（继承 m-opc 的 opc-smoke-test.py）
-│   │   └── unit/                 ← 单元测试
-│   ├── project_temp/             ← 项目脚手架模板目录
-├── project_temp/                ← project scaffold assets for `new-project.sh`
-│   ├── stacks/python-react/     ← default tech stack template
-│   └── test-skeleton/           ← optional generic test scaffold assets
-├── mock-server/                 ← mock server template (inherited from m-opc)
-└── docs/design/
-    ├── v1/                      ← original architect's design (archived)
-    └── v2/                      ← current design
-```
+The Python package under `delivery/` is the source of truth. Hermes skills and operator commands are thin entry points over the control plane. Implementation work is done by Claude Code or OpenCode sessions. Review is framework-managed through independent review artifacts and imports.
 
-## Code Conventions
+Important modules:
 
-**Module boundaries** (read `docs/design/v2/01-ARCHITECTURE.md` for full detail):
+| Module | Responsibility |
+| --- | --- |
+| `__main__.py` | CLI entrypoint, locks, control actions, pause/resume/fix, stage imports |
+| `control_plane.py` | Deterministic routing from project state to the next step |
+| `loop.py` | Implementation loop, task execution, test repair, exception handling |
+| `loop_task_prompt.py` | Runtime prompts for task, repair, validation, stalled recovery |
+| `loop_review.py` | Review imports, machine preconditions, semantic-risk deferral |
+| `loop_gitops.py` | Task-scoped staging, exception patches, dirty-worktree safety |
+| `loop_reporting.py` | Status, project summary, release evidence |
+| `runtime_liveness.py` | Runtime activity and stall detection inputs |
+| `scaffold.py` | T000 scaffold generation from stack templates and Module Architecture |
+| `stage_harness.py` | Stage payload validation/import for spec, architecture, context, tasks |
+| `task.py` | Task model, dependency graph, task-decompose normalization and validation |
+| `gates.py` | Complexity normalization, validation gates, gate refresh |
+| `production_semantics.py` | Static semantic scans for stubs, fake data, auth gaps |
+| `review_payload.py` | Review payload normalization and assessment validation |
+| `review_artifacts.py` | Markdown review artifacts and deferred risk records |
 
-| Module | Responsibility | Core functions |
-|--------|---------------|----------------|
-| `state.py` | JSON ledger R/W + atomic write + file locks | `load_work_items`, `save_work_items`, `load_test_results`, `save_test_results`, `acquire_lock` |
-| `task.py` | Task model, ID management, dependency resolution | `load_task_ledger`, `pick_next_task`, `mark_task`, `check_requirements_coverage` |
-| `session.py` | AI session create/reuse/rotate | `create_session`, `get_or_create_session`, `execute_in_session`, `should_rotate` |
-| `verify.py` | Run tests, collect results, weak command detection | `run_tests`, `run_full_suite`, `collect_failures`, `weak_command_reason` |
-| `loop.py` | Delivery loop orchestration | `DeliveryLoop.run()`, `_execute_task`, `_build_task_prompt`, `recover` |
-| `scaffold.py` | T000 scaffold generation | Generate file structure from architecture + requirements |
+## Delivery Flow
 
-**State files** (read `docs/design/v2/04-STATE-MODEL.md` for full schema):
-- `docs/work-items.json` — task state (pending/active/done/verified/blocked/cancelled)
-- `docs/test-results.json` — test run evidence
-- `docs/test-plan.json` — requirement-to-test mapping (planning only, not execution)
-- `docs/work-items.md` — auto-generated human-readable view
+1. `spec-review` imports normalized requirements and acceptance scenarios.
+2. `arch-design` imports architecture, module docs, ADRs, and metadata.
+3. `ui-design` imports UI contracts when `ui_required=true`.
+4. `project-context-sync` imports runtime context and test plan.
+5. `task-decompose` imports executable work items and validation gates.
+6. T000 creates scaffold and project structure.
+7. T001 creates only shared foundation required before feature slices.
+8. Feature and validation tasks run through implementation, tests, review, and repair.
+9. Framework-managed audit/production gates run before final verification.
+10. T-FINAL produces release evidence and final review artifacts.
 
-**Key design decisions** (read `docs/design/v2/06-KEY-DECISIONS.md`):
-- No per-task worktree isolation. Single main branch, continuous AI session.
-- Tasks are full-stack vertical slices, not split by frontend/backend.
-- Tests are written by the same AI session that wrote the code — normal practice.
-- Independent code-review via separate Hermes sub-agent (no implementation context).
-- Core/shared separation: `core/` (framework infra, don't touch), `shared/` (project reusable, free to modify).
-- Two-layer verification: deterministic test execution (pytest exit code) + AI code review (fresh perspective).
+## Planning And Scaffold Rules
 
-**Inherited from m-opc** (reusable modules):
-- `opc_ledger_state.py` → atomic JSON write, fcntl lock, JSON load/save patterns
-- `opc_requirements.py` → REQ-ID regex extraction, range expansion, markdown parsing
-- `opc_completion_contract.py` → weak command detection (echo/true/ls/python3 -c)
-- `opc_exec_common.py` → subprocess environment isolation, failure signature normalization, pyproject.toml parsing
-- `cc-exec.py` / `oc-exec.py` → runtime adapter (CLI wrapper for CC/OC)
+- `docs/architecture.md` `Module Architecture` is the T000 scaffold contract. It is a structural skeleton, not a full source-file inventory.
+- The scaffold parser accepts connector trees, consistently indented trees, arbitrary fenced languages, markdown-list trees, and either a wrapper root or direct repository roots.
+- Module Architecture may contain limited source anchors, but implementation-file inventory is capped by `MAX_MODULE_TREE_IMPLEMENTATION_FILE_ENTRIES` in `stage_harness.py` (currently 50). Scaffold/config files are exempt.
+- Task decomposition has no fixed hard cap on generated task count. Use semantic coherence, dependency quality, coverage, path/test size, and `intent.split_justification` instead of forcing a number.
+- `delivery_complexity.tier` uses S/M/L/XL with `S = small`. Do not use `S` as a highest-complexity label. Rich signals such as requirements, acceptance scenarios, integrations, agent types, UI pages, and state machines must be consistent with the tier.
+- `intent.done_when` and `intent.non_goals` must be arrays of complete strings. The framework guards against string values being expanded into character lists.
 
-**Not inherited** (removed from m-opc):
-- `opc_task_contract.py` (987 lines) — not needed, task contract is 8 JSON fields
-- `opc_context_pack.py` — not needed, AI reads full code directly
-- All 5 control-plane modules (6,433 lines total) — replaced by thin CLI
-- Per-task worktree, framework recovery, dispatch, graph, complexity gate
+## Runtime And Review Rules
 
-## Design Docs
+- The implementation phase is framework-owned. The watchdog/control loop drives task execution and code review. Hermes main sessions are operator consoles, not implementation drivers.
+- `app-delivery control --goal auto` is the canonical operator routing surface.
+- `app-delivery watch-status` is optional read-only visibility. It must not drive correctness decisions.
+- Normal tasks stop at `review_pending` after tests pass. Review import decides whether a task becomes `verified`, returns to `pending`, or escalates.
+- Machine precondition findings are represented as `review_type: machine-precondition` while preserving `external_review_status`.
+- Repeated deferable machine preconditions may become `verified` with a deferred semantic-risk report. `security-access-control` can defer only when the current task or a later unfinished feature task owns auth/RBAC/access-control work.
+- Manual `fix` and `task --action reset-repair` must refuse cross-task repairs while another unfinished task has task-scoped dirty changes. Do not auto-restore or auto-park another task's changes.
 
-All detailed design decisions are in `docs/design/v2/`. Read these before making architectural changes:
+## Exception Handling
 
-1. `00-OVERVIEW.md` — Core principles, what changed from m-opc
-2. `01-ARCHITECTURE.md` — Component model, Phase flow, core/shared rules, T001 design
-3. `02-TASK-MODEL.md` — Task decomposition, built-in tasks, requirement mapping, blocked handling
-4. `03-DELIVERY-LOOP.md` — Loop algorithm, session management, Hermes vs standalone
-5. `04-STATE-MODEL.md` — State schemas, Git management, test types
-6. `05-BUILD-PLAN.md` — Implementation roadmap (pilot project first)
-7. `06-KEY-DECISIONS.md` — Key design decisions and their rationale
-8. `07-SKILLS.md` — Hermes skill design for each entry point
+- When a task becomes `exception`, task-scoped dirty changes are parked under `.app-delivery-runtime/exception-patches/<TASK_ID>.patch` and restored from the worktree.
+- `fix` and `reset-repair` try to reapply that patch before the next repair attempt.
+- If the patch conflicts, the framework preserves the patch, writes `.app-delivery-runtime/exception-conflicts/<TASK_ID>.md`, sets `force_task_prompt_reason=exception_patch_conflict`, and lets the implementation runtime migrate the patch intent into current code.
+- Exception patch conflict resolution belongs to the implementation runtime session, not the review runner.
 
-## Testing the Framework
+## Canonical Artifacts
 
-The delivery package tests itself at two levels:
+- `docs/work-items.json` is the task ledger.
+- `docs/work-items.md` is the operator-readable rendering.
+- `docs/test-results.json` is the test-evidence ledger.
+- `.app-delivery-runtime/task-runtime/*.json` stores wrapper/runtime state.
+- `.app-delivery-runtime/host-handoff.json` stores importable host planning/review handoffs.
+- `.app-delivery-runtime/review-inputs/*.json` stores imported review payloads.
+- `docs/reviews/*.md` stores code-review, final-review, exception, gate, and validation artifacts.
 
-**Unit tests** (`tests/unit/`): Pure logic tests for `state.py`, `task.py`, `verify.py`. No AI runtime dependency. Run with:
+Runtime implementations must not self-certify by writing framework-owned review artifacts as proof of review.
+
+## Development Rules
+
+- Preserve task scope and root-cause behavior. Do not add broad refactors while fixing a narrow framework issue.
+- Do not patch Hermes core. Use app-delivery skills, prompts, config, hooks, or the Python framework.
+- Live project investigations are read-only by default. Do not run `control`, `fix`, `resume`, setup, deploy, or other state-changing commands unless explicitly asked.
+- Use `apply_patch` for source edits.
+- Do not revert user/project changes unless explicitly instructed.
+- Keep `AGENTS.md` and `CLAUDE.md` synchronized.
+
+## Commands
+
+Use the repository environment explicitly:
 
 ```bash
-python3 -m pytest tests/unit/
+cd /path/to/opc-agents/app-delivery
+PYTHONPATH="$PWD" pipenv run pytest tests/unit/test_loop.py
+PYTHONPATH="$PWD" pipenv run pytest tests/unit/test_cli_control.py
+PYTHONPATH="$PWD" pipenv run pytest tests/unit/test_task.py -k "decompose_tasks or task_decompose"
 ```
 
-**Smoke test** (`tests/smoke/`): Inherited from m-opc's `opc-smoke-test.py`. Creates an isolated temp project directory, runs the full delivery pipeline (scaffold → loop → verify) against a sample requirements file, and checks that outputs are correct:
+Install locally:
 
 ```bash
-python3 -m pytest tests/smoke/
+scripts/setup-opc.sh --runtime opencode --opc-home "$HOME/opc" --framework-root "$PWD"
 ```
 
-Run all tests:
+Remote deployment is environment-specific. Do not commit real hosts, usernames, IP addresses, or internal paths. Keep private inventory outside the repository and use placeholders in shared documentation:
+
 ```bash
-python3 -m pytest tests/
+rsync -az --delete --exclude '.git/' --exclude '.pytest_cache/' --exclude '**/__pycache__/' --exclude '*.pyc' ./ deploy-user@example.com:/opt/app-delivery-deploy-src/
+ssh deploy-user@example.com 'cd /opt/app-delivery-deploy-src && scripts/setup-opc.sh --runtime opencode --opc-home /opt/opc --framework-root /opt/app-delivery-deploy-src'
 ```
 
-For integration: create a temp project and run `python3 -m delivery start --project /tmp/test-project --requirements <path>`, verify output.
+Useful live-project checks:
 
-## Objective Judgment Rule
-
-- Do not implement features because they "might be useful." Every feature must solve a known problem from a real project.
-- If a change makes the framework more complex without corresponding delivery improvement, argue against it.
-- Prefer evidence from running code, test output, and real project delivery over theoretical elegance.
-- If the user proposes something that contradicts the design docs, evaluate the trade-off honestly.
+```bash
+$HOME/opc/bin/app-delivery control --goal status --project /path/to/project
+$HOME/opc/bin/app-delivery pause --project /path/to/project
+$HOME/opc/bin/app-delivery resume --project /path/to/project --runtime opencode
+```

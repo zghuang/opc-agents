@@ -110,7 +110,7 @@ def test_review_payload_requires_technology_assessment_for_constraints() -> None
             "acceptance_scenarios": [],
             "dependencies": [],
             "output_tests": [],
-            "output_paths": ["backend/otif/workflows/incident_workflow.py"],
+            "output_paths": ["backend/demo_domain/workflows/incident_workflow.py"],
             "technology_constraints": [{"name": "LangGraph", "ecosystem": "backend", "requirement": "must_use"}],
         }
     )
@@ -137,7 +137,7 @@ def test_review_payload_accepts_passing_technology_assessment_with_evidence() ->
             "acceptance_scenarios": [],
             "dependencies": [],
             "output_tests": [],
-            "output_paths": ["backend/otif/workflows/incident_workflow.py"],
+            "output_paths": ["backend/demo_domain/workflows/incident_workflow.py"],
             "technology_constraints": [{"name": "LangGraph", "ecosystem": "backend", "requirement": "must_use"}],
         }
     )
@@ -736,10 +736,10 @@ def test_build_fix_prompt_tightens_real_backend_validation_gate_guidance(tmp_pat
 def test_build_task_prompt_includes_browser_e2e_backend_env_prefix(tmp_path: Path) -> None:
     from delivery.task import Task
 
-    (tmp_path / "backend" / "otif").mkdir(parents=True)
+    (tmp_path / "backend" / "demo_domain").mkdir(parents=True)
     (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
-    (tmp_path / "backend" / "otif" / "__init__.py").write_text("", encoding="utf-8")
-    (tmp_path / "backend" / "otif" / "main.py").write_text("app = object()\n", encoding="utf-8")
+    (tmp_path / "backend" / "demo_domain" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "demo_domain" / "main.py").write_text("app = object()\n", encoding="utf-8")
 
     prompt = build_task_prompt(
         tmp_path,
@@ -757,7 +757,7 @@ def test_build_task_prompt_includes_browser_e2e_backend_env_prefix(tmp_path: Pat
 
     assert "Browser/e2e validation" in prompt
     assert "E2E_BACKEND_CMD=" in prompt
-    assert "uv run uvicorn otif.main:app --host 127.0.0.1 --port 8000" in prompt
+    assert "uv run uvicorn demo_domain.main:app --host 127.0.0.1 --port 8000" in prompt
 
 def test_build_stalled_recovery_prompt_focuses_on_existing_work_and_stall_evidence(tmp_path: Path) -> None:
     from delivery.task import Task
@@ -793,13 +793,13 @@ def test_task_prompts_keep_current_file_and_append_history(tmp_path: Path, monke
     monkeypatch.setattr(prompt_module, "_prompt_history_timestamp", lambda: next(timestamps))
     task = Task(
         "T007",
-        "OTIF Calculation",
+        "Domain Metric Calculation",
         "pending",
         ["REQ-001"],
         [],
         [],
-        ["backend/tests/monitoring/test_otif_calc.py"],
-        ["backend/app/monitoring/otif_engine.py"],
+        ["backend/tests/monitoring/test_domain_metric_calc.py"],
+        ["backend/app/monitoring/domain_metric_engine.py"],
     )
 
     initial_prompt = build_task_prompt(tmp_path, task)
@@ -937,10 +937,10 @@ def test_build_stalled_recovery_prompt_filters_raw_runtime_jsonl_noise(tmp_path:
 def test_build_stalled_recovery_prompt_includes_browser_e2e_backend_env_prefix(tmp_path: Path) -> None:
     from delivery.task import Task
 
-    (tmp_path / "backend" / "otif").mkdir(parents=True)
+    (tmp_path / "backend" / "demo_domain").mkdir(parents=True)
     (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
-    (tmp_path / "backend" / "otif" / "__init__.py").write_text("", encoding="utf-8")
-    (tmp_path / "backend" / "otif" / "main.py").write_text("app = object()\n", encoding="utf-8")
+    (tmp_path / "backend" / "demo_domain" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "demo_domain" / "main.py").write_text("app = object()\n", encoding="utf-8")
 
     prompt = build_stalled_recovery_prompt(
         tmp_path,
@@ -952,7 +952,7 @@ def test_build_stalled_recovery_prompt_includes_browser_e2e_backend_env_prefix(t
             [],
             [],
             ["backend/tests/test_api/test_incidents.py", "frontend/e2e/incidents.spec.ts"],
-            ["backend/otif/api/incidents.py", "frontend/src/routes/incidents.tsx"],
+            ["backend/demo_domain/api/incidents.py", "frontend/src/routes/incidents.tsx"],
         ),
         runtime_state={"session_id": "ses-op-stall", "started_at": "2026-06-24T00:00:00Z"},
         runtime_attention={"kind": "silent_stall", "message": "Runtime is still alive but has not produced progress."},
@@ -960,7 +960,7 @@ def test_build_stalled_recovery_prompt_includes_browser_e2e_backend_env_prefix(t
 
     assert "Browser/e2e validation" in prompt
     assert "E2E_BACKEND_CMD=" in prompt
-    assert "uv run uvicorn otif.main:app --host 127.0.0.1 --port 8000" in prompt
+    assert "uv run uvicorn demo_domain.main:app --host 127.0.0.1 --port 8000" in prompt
 
 def test_build_stalled_recovery_prompt_tightens_real_backend_validation_gate_guidance(tmp_path: Path) -> None:
     from delivery.task import Task

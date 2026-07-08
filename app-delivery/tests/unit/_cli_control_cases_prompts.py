@@ -200,7 +200,7 @@ test('dashboard', async ({ page }) => {
             "last_updated_commit": "",
             "items": [
                 {"id": "T005", "title": "Dashboard", "status": "verified", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/dashboard.spec.ts"], "output_paths": ["frontend/src/routes/dashboard.tsx"], "review_status": "pass", "review_artifact": "docs/reviews/code-review-T005.md", "git_commit": "abc"},
-                {"id": "T010", "title": "Approval workflow", "status": "pending", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T005"], "output_tests": ["backend/tests/test_approvals.py"], "output_paths": ["backend/otif/api/approvals.py"]},
+                {"id": "T010", "title": "Approval workflow", "status": "pending", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T005"], "output_tests": ["backend/tests/test_approvals.py"], "output_paths": ["backend/demo_domain/api/approvals.py"]},
             ],
         },
     )
@@ -226,7 +226,7 @@ test('dashboard', async ({ page }) => {
             "acceptance_scenarios": [],
             "dependencies": ["T005"],
             "output_tests": ["backend/tests/test_approvals.py"],
-            "output_paths": ["backend/otif/api/approvals.py"],
+            "output_paths": ["backend/demo_domain/api/approvals.py"],
         }
     )
     repair_prompt = build_task_prompt(tmp_path, repair_task)
@@ -359,7 +359,7 @@ def test_resolve_project_root_rejects_absolute_path_outside_opc_projects_when_st
     monkeypatch.setenv("APP_DELIVERY_ENFORCE_OPC_PROJECT_ROOT", "1")
 
     with pytest.raises(DeliveryError) as exc_info:
-        resolve_project_root("/Users/hzg/apps/agents/m-opc")
+        resolve_project_root("/path/to/legacy-opc-runtime")
 
     assert exc_info.value.code == "project_root_outside_opc_projects"
 
@@ -477,7 +477,7 @@ def test_cmd_decompose_requires_ui_route_mapping_coverage(tmp_path: Path) -> Non
         "## Route Mapping\n\n"
         "| Page / Route | Source Requirements | Primary Roles | Required Regions / Components | States | Suggested Output Paths | Suggested Browser Tests |\n"
         "|--------------|---------------------|---------------|--------------------------------|--------|------------------------|-------------------------|\n"
-        "| Control Tower | REQ-055 | OTIF Commander | KPI cards, heatmap | loading, empty, error | frontend/src/pages/ControlTower/ | frontend/e2e/control-tower.spec.ts |\n",
+        "| Control Tower | REQ-055 | Domain Metric Commander | KPI cards, heatmap | loading, empty, error | frontend/src/pages/ControlTower/ | frontend/e2e/control-tower.spec.ts |\n",
         encoding="utf-8",
     )
     input_path = tmp_path / "decompose.json"
@@ -509,7 +509,7 @@ def test_cmd_decompose_rejects_uncovered_ui_route_mapping(tmp_path: Path) -> Non
         "## Route Mapping\n\n"
         "| Page / Route | Source Requirements | Primary Roles | Required Regions / Components | States | Suggested Output Paths | Suggested Browser Tests |\n"
         "|--------------|---------------------|---------------|--------------------------------|--------|------------------------|-------------------------|\n"
-        "| Control Tower | REQ-055 | OTIF Commander | KPI cards, heatmap | loading, empty, error | frontend/src/pages/ControlTower/ | frontend/e2e/control-tower.spec.ts |\n",
+        "| Control Tower | REQ-055 | Domain Metric Commander | KPI cards, heatmap | loading, empty, error | frontend/src/pages/ControlTower/ | frontend/e2e/control-tower.spec.ts |\n",
         encoding="utf-8",
     )
     input_path = tmp_path / "decompose.json"

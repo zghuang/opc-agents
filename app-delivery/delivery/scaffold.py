@@ -33,6 +33,10 @@ IGNORED_STRUCTURE_DIR_NAMES = {
     "test-results",
 }
 IGNORED_STRUCTURE_FILE_SUFFIXES = {".pyc", ".pyo", ".log"}
+DATABASE_LOCALHOST_PORT_RE = re.compile(
+    r"^(?P<prefix>DATABASE_URL=(?:postgresql(?:\+[A-Za-z0-9_]+)?|postgres)://[^\n]*?localhost:)5432(?P<suffix>(?:/|\?|$)[^\n]*)$",
+    re.MULTILINE,
+)
 MAX_PROJECT_STRUCTURE_DEPTH = 4
 MAX_PROJECT_STRUCTURE_CHILDREN = 40
 MODULE_ARCHITECTURE_HEADING_RE = re.compile(r"^##+\s+(?:\d+\.\s*)?(?:Module Architecture|模块架构)\s*$", re.IGNORECASE | re.MULTILINE)
@@ -107,8 +111,9 @@ def _configure_project_ports(project_root: Path) -> None:
     if backend_env.exists():
         values: dict[str, str] = {}
         text = backend_env.read_text(encoding="utf-8")
-        if "@localhost:5432/" in text:
-            values["DATABASE_URL"] = f"postgresql+asyncpg://opc_user:password@localhost:{ports['POSTGRES_HOST_PORT']}/app_db"
+        database_url_match = DATABASE_LOCALHOST_PORT_RE.search(text)
+        if database_url_match:
+            values["DATABASE_URL"] = f"{database_url_match.group('prefix')}{ports['POSTGRES_HOST_PORT']}{database_url_match.group('suffix')}"
         if "EXTERNAL_API_BASE_URL=http://localhost:8888" in text:
             values["EXTERNAL_API_BASE_URL"] = f"http://localhost:{ports['MOCK_SERVER_HOST_PORT']}"
         if values:

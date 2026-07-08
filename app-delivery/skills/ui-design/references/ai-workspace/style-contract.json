@@ -2,11 +2,11 @@
   "schema_version": 1,
   "template_id": "ai-workspace",
   "design_system_required_hexes": [
-    "#503291",
-    "#0F69AF",
-    "#149B5F",
-    "#FFC832",
-    "#E61E50"
+    "#1D4E89",
+    "#0F766E",
+    "#2E7D32",
+    "#F59E0B",
+    "#C62828"
   ],
   "design_system_required_phrases": [
     "Use solid colors only",
@@ -17,12 +17,12 @@
     "#1677ff"
   ],
   "theme_required_tokens": {
-    "colorPrimary": "#503291",
-    "colorInfo": "#0F69AF",
-    "colorSuccess": "#149B5F",
-    "colorWarning": "#FFC832",
-    "colorError": "#E61E50",
-    "colorLink": "#0F69AF"
+    "colorPrimary": "#1D4E89",
+    "colorInfo": "#0F766E",
+    "colorSuccess": "#2E7D32",
+    "colorWarning": "#F59E0B",
+    "colorError": "#C62828",
+    "colorLink": "#0F766E"
   },
   "theme_forbidden_token_values": {
     "colorPrimary": [

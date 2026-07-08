@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: app_db
       POSTGRES_USER: opc_user
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-app_dev_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:

@@ -4,7 +4,7 @@ Supported formats: `.png`, `.jpg`, `.jpeg`, `.webp`.
 
 ## image1.png
 
-AppCopilot Console marketplace screen:
+OPC Agent Console marketplace screen:
 
 - Solid blue top navigation with logo, product title, icon+text menu items, active tab state, and user identity.
 - Light gray app background with a centered white workspace panel.

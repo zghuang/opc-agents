@@ -524,11 +524,11 @@ def test_import_task_review_pass_ignores_unrelated_later_task_changes(tmp_path: 
     from delivery.task import all_tasks
 
     ensure_git_repo(tmp_path)
-    t005_file = tmp_path / "backend" / "src" / "otif" / "engine.py"
+    t005_file = tmp_path / "backend" / "src" / "demo_domain" / "engine.py"
     t007_file = tmp_path / "backend" / "src" / "ai_infra" / "gateway.py"
     t005_file.parent.mkdir(parents=True, exist_ok=True)
     t007_file.parent.mkdir(parents=True, exist_ok=True)
-    t005_file.write_text("print('base otif')\n", encoding="utf-8")
+    t005_file.write_text("print('base demo_domain')\n", encoding="utf-8")
     t007_file.write_text("print('base gateway')\n", encoding="utf-8")
     git(["add", "--", "."], cwd=tmp_path)
     git(["commit", "-m", "init"], cwd=tmp_path)
@@ -546,13 +546,13 @@ def test_import_task_review_pass_ignores_unrelated_later_task_changes(tmp_path: 
             "items": [
                 {
                     "id": "T005",
-                    "title": "OTIF",
+                    "title": "Domain Metric",
                     "status": "review_pending",
                     "requirements": ["REQ-001"],
                     "acceptance_scenarios": [],
                     "dependencies": [],
-                    "output_tests": ["backend/tests/test_otif/test_engine.py"],
-                    "output_paths": ["backend/src/otif/"],
+                    "output_tests": ["backend/tests/test_demo_domain/test_engine.py"],
+                    "output_paths": ["backend/src/demo_domain/"],
                     "status_session_id": "ses-op-5",
                 }
             ],
@@ -565,10 +565,10 @@ def test_import_task_review_pass_ignores_unrelated_later_task_changes(tmp_path: 
             "status": "completed",
             "pending_scope_report": {
                 "changed_paths": [
-                    "backend/src/otif/engine.py",
+                    "backend/src/demo_domain/engine.py",
                     "backend/src/ai_infra/gateway.py",
                 ],
-                "staged_paths": ["backend/src/otif/engine.py"],
+                "staged_paths": ["backend/src/demo_domain/engine.py"],
                 "out_of_scope": [],
                 "preserved_paths": [],
             },
@@ -584,7 +584,7 @@ def test_import_task_review_pass_ignores_unrelated_later_task_changes(tmp_path: 
             "summary": "Looks good.",
             "findings": [],
             "requirement_assessment": [
-                {"id": "REQ-001", "status": "pass", "notes": "The declared OTIF behavior is complete for this task."}
+                {"id": "REQ-001", "status": "pass", "notes": "The declared Domain Metric behavior is complete for this task."}
             ],
             "acceptance_assessment": [],
         },
@@ -595,7 +595,7 @@ def test_import_task_review_pass_ignores_unrelated_later_task_changes(tmp_path: 
     tasks = all_tasks(tmp_path)
     assert tasks[0].status == "verified"
     committed = git(["show", "--stat", "--name-only", "HEAD"], cwd=tmp_path).stdout
-    assert "backend/src/otif/engine.py" in committed
+    assert "backend/src/demo_domain/engine.py" in committed
     assert "backend/src/ai_infra/gateway.py" not in committed
 
 def test_import_task_review_changes_requested_retires_matching_active_session(tmp_path: Path) -> None:
@@ -788,7 +788,7 @@ def test_import_task_review_pass_rejects_mock_only_browser_e2e(tmp_path: Path) -
 def test_production_semantic_scan_detects_static_backend_package_routes(tmp_path: Path) -> None:
     from delivery.production_semantics import scan_production_semantics
 
-    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path = tmp_path / "backend" / "demo_domain" / "api" / "routes" / "reporting.py"
     route_path.parent.mkdir(parents=True, exist_ok=True)
     route_path.write_text(
         "from fastapi import APIRouter\n\n"
@@ -803,7 +803,7 @@ def test_production_semantic_scan_detects_static_backend_package_routes(tmp_path
 
     assert any(
         finding.category == "production-stub"
-        and finding.path == "backend/otif/api/routes/reporting.py"
+        and finding.path == "backend/demo_domain/api/routes/reporting.py"
         and "static literal" in finding.message
         for finding in findings
     )
@@ -903,7 +903,7 @@ def test_production_semantic_scan_detects_synthetic_data_helpers(tmp_path: Path)
 def test_production_semantic_scan_ignores_backend_test_api_mocks(tmp_path: Path) -> None:
     from delivery.production_semantics import scan_production_semantics
 
-    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path = tmp_path / "backend" / "demo_domain" / "api" / "routes" / "reporting.py"
     route_path.parent.mkdir(parents=True, exist_ok=True)
     route_path.write_text(
         "from fastapi import APIRouter, Depends\n\n"
@@ -937,7 +937,7 @@ def test_production_semantic_scan_ignores_backend_test_api_mocks(tmp_path: Path)
 def test_production_semantic_scan_accepts_app_level_router_auth_dependency(tmp_path: Path) -> None:
     from delivery.production_semantics import scan_production_semantics
 
-    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "orders.py"
+    route_path = tmp_path / "backend" / "demo_domain" / "api" / "routes" / "orders.py"
     route_path.parent.mkdir(parents=True, exist_ok=True)
     route_path.write_text(
         "from fastapi import APIRouter\n\n"
@@ -947,11 +947,11 @@ def test_production_semantic_scan_accepts_app_level_router_auth_dependency(tmp_p
         "    return await order_service.fetch_order(order_id)\n",
         encoding="utf-8",
     )
-    main_path = tmp_path / "backend" / "otif" / "main.py"
+    main_path = tmp_path / "backend" / "demo_domain" / "main.py"
     main_path.parent.mkdir(parents=True, exist_ok=True)
     main_path.write_text(
         "from fastapi import Depends, FastAPI\n"
-        "from otif.api.routes import orders\n\n"
+        "from demo_domain.api.routes import orders\n\n"
         "def get_current_user():\n"
         "    return {'id': 'u1'}\n\n"
         "app = FastAPI()\n"
@@ -961,13 +961,13 @@ def test_production_semantic_scan_accepts_app_level_router_auth_dependency(tmp_p
 
     findings = scan_production_semantics(tmp_path)
 
-    assert not any(finding.category == "security-access-control" and finding.path == "backend/otif/api/routes/orders.py" for finding in findings)
+    assert not any(finding.category == "security-access-control" and finding.path == "backend/demo_domain/api/routes/orders.py" for finding in findings)
 
 
 def test_production_semantic_scan_accepts_fastapi_global_auth_dependency(tmp_path: Path) -> None:
     from delivery.production_semantics import scan_production_semantics
 
-    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "orders.py"
+    route_path = tmp_path / "backend" / "demo_domain" / "api" / "routes" / "orders.py"
     route_path.parent.mkdir(parents=True, exist_ok=True)
     route_path.write_text(
         "from fastapi import APIRouter\n\n"
@@ -977,7 +977,7 @@ def test_production_semantic_scan_accepts_fastapi_global_auth_dependency(tmp_pat
         "    return await order_service.fetch_order(order_id)\n",
         encoding="utf-8",
     )
-    main_path = tmp_path / "backend" / "otif" / "main.py"
+    main_path = tmp_path / "backend" / "demo_domain" / "main.py"
     main_path.parent.mkdir(parents=True, exist_ok=True)
     main_path.write_text(
         "from fastapi import Depends, FastAPI\n\n"
@@ -995,7 +995,7 @@ def test_production_semantic_scan_accepts_fastapi_global_auth_dependency(tmp_pat
 def test_production_semantic_scan_applies_exact_path_waiver(tmp_path: Path) -> None:
     from delivery.production_semantics import scan_production_semantics, write_semantic_scan_report
 
-    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path = tmp_path / "backend" / "demo_domain" / "api" / "routes" / "reporting.py"
     route_path.parent.mkdir(parents=True, exist_ok=True)
     route_path.write_text(
         "from fastapi import APIRouter\n\n"
@@ -1013,7 +1013,7 @@ def test_production_semantic_scan_applies_exact_path_waiver(tmp_path: Path) -> N
                 "waivers": [
                     {
                         "category": "production-stub",
-                        "path": "backend/otif/api/routes/reporting.py",
+                        "path": "backend/demo_domain/api/routes/reporting.py",
                         "reason": "Known false positive accepted by human escalation.",
                         "expires_at": "2999-01-01",
                     }
@@ -1026,15 +1026,15 @@ def test_production_semantic_scan_applies_exact_path_waiver(tmp_path: Path) -> N
     findings = scan_production_semantics(tmp_path)
     report = write_semantic_scan_report(tmp_path, findings)
 
-    assert not any(finding.category == "production-stub" and finding.path == "backend/otif/api/routes/reporting.py" for finding in findings)
-    assert any(finding.category == "security-access-control" and finding.path == "backend/otif/api/routes/reporting.py" for finding in findings)
+    assert not any(finding.category == "production-stub" and finding.path == "backend/demo_domain/api/routes/reporting.py" for finding in findings)
+    assert any(finding.category == "security-access-control" and finding.path == "backend/demo_domain/api/routes/reporting.py" for finding in findings)
     assert "## Active Waivers" in (tmp_path / report).read_text(encoding="utf-8")
 
 
 def test_import_task_review_pass_rejects_changed_production_stub_route(tmp_path: Path) -> None:
     from delivery.loop_review import import_task_review
 
-    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path = tmp_path / "backend" / "demo_domain" / "api" / "routes" / "reporting.py"
     route_path.parent.mkdir(parents=True, exist_ok=True)
     route_path.write_text(
         "from fastapi import APIRouter\n\n"
@@ -1060,7 +1060,7 @@ def test_import_task_review_pass_rejects_changed_production_stub_route(tmp_path:
                     "acceptance_scenarios": [],
                     "dependencies": [],
                     "output_tests": ["backend/tests/test_reporting.py"],
-                    "output_paths": ["backend/otif/api/routes/reporting.py"],
+                    "output_paths": ["backend/demo_domain/api/routes/reporting.py"],
                 }
             ],
         },
@@ -1070,8 +1070,8 @@ def test_import_task_review_pass_rejects_changed_production_stub_route(tmp_path:
         "T002",
         {
             "pending_scope_report": {
-                "changed_paths": ["backend/otif/api/routes/reporting.py"],
-                "staged_paths": ["backend/otif/api/routes/reporting.py"],
+                "changed_paths": ["backend/demo_domain/api/routes/reporting.py"],
+                "staged_paths": ["backend/demo_domain/api/routes/reporting.py"],
                 "out_of_scope": [],
             }
         },
@@ -1169,7 +1169,7 @@ def test_import_task_review_pass_lists_all_changed_static_routes(tmp_path: Path)
 def test_import_production_gate_review_pass_rejects_project_production_stubs(tmp_path: Path) -> None:
     from delivery.loop_review import import_task_review
 
-    route_path = tmp_path / "backend" / "otif" / "api" / "routes" / "reporting.py"
+    route_path = tmp_path / "backend" / "demo_domain" / "api" / "routes" / "reporting.py"
     route_path.parent.mkdir(parents=True, exist_ok=True)
     route_path.write_text(
         "from fastapi import APIRouter\n\n"

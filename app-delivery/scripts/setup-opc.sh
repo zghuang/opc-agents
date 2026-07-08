@@ -25,6 +25,9 @@ Prepares an app-delivery runtime under OPC_HOME:
 - deploys Hermes skills into ~/.hermes/skills/opc-agents
 - creates wrapper commands under OPC_HOME/bin
 
+When using --channel telegram, set APP_DELIVERY_TELEGRAM_TOPIC to the target
+watchdog channel value before running setup.
+
 EOF
 }
 
@@ -256,7 +259,9 @@ ok "Hermes skills deployed to $SKILLS_DST"
 
 printf '%s\n' "$RUNTIME" > "$STATE_DIR/active-runtime"
 if [[ "$CHANNEL" == "telegram" ]]; then
-  printf '%s\n' 'telegram:-1003960076129:486' > "$WATCHDOG_FILE"
+  TELEGRAM_TOPIC="${APP_DELIVERY_TELEGRAM_TOPIC:-}"
+  [[ -n "$TELEGRAM_TOPIC" ]] || die "--channel telegram requires APP_DELIVERY_TELEGRAM_TOPIC"
+  printf '%s\n' "$TELEGRAM_TOPIC" > "$WATCHDOG_FILE"
 else
   printf '%s\n' 'local' > "$WATCHDOG_FILE"
 fi

@@ -7,7 +7,8 @@ Use this skill for normal app-delivery operation.
 Rules:
 
 - Only use the delivery CLI.
-- Treat `{project}` and `{requirements_path}` as authoritative absolute paths.
+- Treat `{project}` as the authoritative project identifier. A single bare project name resolves through the CLI to `${OPC_HOME:-$HOME/opc}/projects/<name>`; an explicit path is used as-is.
+- Treat `{requirements_path}` as the local requirements source file path. If the source is a URL or shared document, ask the operator to save or export it to a local file first.
 - For `/app-delivery <project> <requirements-file>`, treat the first positional argument as `{project}` and the second positional argument as `{requirements_path}`.
 - Never replace `{project}` with the parent directory of `{requirements_path}` when the user already supplied a first positional project argument.
 - If `{requirements_path}` is invalid or missing, keep `{project}` unchanged and report the requirements-path error instead of inferring a different project.

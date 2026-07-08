@@ -24,7 +24,7 @@ def test_scaffold_project_preserves_existing_files(tmp_path: Path) -> None:
 def test_scaffold_project_copies_backend_env_from_example(tmp_path: Path) -> None:
     template_root = tmp_path / "template"
     (template_root / "backend").mkdir(parents=True)
-    (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql+asyncpg://opc_user:password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n", encoding="utf-8")
+    (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql+asyncpg://opc_user:app_dev_password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n", encoding="utf-8")
     project_root = tmp_path / "project"
 
     scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
@@ -51,8 +51,8 @@ def test_scaffold_project_keeps_existing_backend_env(tmp_path: Path) -> None:
 def test_scaffold_project_writes_deterministic_host_ports(tmp_path: Path) -> None:
     template_root = tmp_path / "template"
     (template_root / "backend").mkdir(parents=True)
-    (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql+asyncpg://opc_user:password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n", encoding="utf-8")
-    (template_root / ".env").write_text("DB_PASSWORD=password\n", encoding="utf-8")
+    (template_root / "backend" / ".env.example").write_text("DATABASE_URL=postgresql+asyncpg://opc_user:app_dev_password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n", encoding="utf-8")
+    (template_root / ".env").write_text("DB_PASSWORD=app_dev_password\n", encoding="utf-8")
     (template_root / "docker-compose.yml").write_text(
         'services:\n  postgres:\n    ports:\n      - "${POSTGRES_HOST_PORT:-15432}:5432"\n',
         encoding="utf-8",
@@ -75,10 +75,10 @@ def test_scaffold_project_generates_project_specific_host_ports(tmp_path: Path) 
     template_root = tmp_path / "template"
     (template_root / "backend").mkdir(parents=True)
     (template_root / "backend" / ".env.example").write_text(
-        "DATABASE_URL=postgresql+asyncpg://opc_user:password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n",
+        "DATABASE_URL=postgresql+asyncpg://opc_user:app_dev_password@localhost:5432/app_db\nEXTERNAL_API_BASE_URL=http://localhost:8888\n",
         encoding="utf-8",
     )
-    (template_root / ".env").write_text("DB_PASSWORD=password\n", encoding="utf-8")
+    (template_root / ".env").write_text("DB_PASSWORD=app_dev_password\n", encoding="utf-8")
     project_root = tmp_path / "ma-02"
 
     scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
@@ -87,8 +87,24 @@ def test_scaffold_project_generates_project_specific_host_ports(tmp_path: Path) 
     root_env = (project_root / ".env").read_text(encoding="utf-8")
     backend_env = (project_root / "backend" / ".env").read_text(encoding="utf-8")
     assert f"POSTGRES_HOST_PORT={15432 + seed}" in root_env
-    assert f"DATABASE_URL=postgresql+asyncpg://opc_user:password@localhost:{15432 + seed}/app_db" in backend_env
+    assert f"DATABASE_URL=postgresql+asyncpg://opc_user:app_dev_password@localhost:{15432 + seed}/app_db" in backend_env
     assert f"EXTERNAL_API_BASE_URL=http://localhost:{18888 + seed}" in backend_env
+
+
+def test_scaffold_project_preserves_database_url_parts_when_rewriting_port(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    (template_root / "backend").mkdir(parents=True)
+    (template_root / "backend" / ".env.example").write_text(
+        "DATABASE_URL=postgresql://sample_user:sample_pass@localhost:5432/custom_db?sslmode=disable\n",
+        encoding="utf-8",
+    )
+    project_root = tmp_path / "ma-02"
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    seed = sum((index + 1) * ord(char) for index, char in enumerate(project_root.name)) % 1000
+    backend_env = (project_root / "backend" / ".env").read_text(encoding="utf-8")
+    assert f"DATABASE_URL=postgresql://sample_user:sample_pass@localhost:{15432 + seed}/custom_db?sslmode=disable" in backend_env
 
 
 def test_scaffold_skips_command_style_output_tests(tmp_path: Path) -> None:
@@ -182,7 +198,7 @@ def test_scaffold_project_creates_directory_skeleton_from_module_architecture(tm
     (template_root / "backend").mkdir(parents=True)
     (project_root / "docs").mkdir(parents=True, exist_ok=True)
     (project_root / "docs" / "architecture.md").write_text(
-        "# Architecture\n\n## 3. Module Architecture\n\n```text\notif-control-tower/\n├── backend/\n│   ├── src/\n│   │   ├── agents/\n│   │   │   └── __init__.py\n│   │   └── shared/\n├── frontend/\n│   └── src/\n│       └── features/\n│           └── .gitkeep\n└── docs/\n    └── modules/\n        └── .gitkeep\n```\n",
+        "# Architecture\n\n## 3. Module Architecture\n\n```text\nsample-control-tower/\n├── backend/\n│   ├── src/\n│   │   ├── agents/\n│   │   │   └── __init__.py\n│   │   └── shared/\n├── frontend/\n│   └── src/\n│       └── features/\n│           └── .gitkeep\n└── docs/\n    └── modules/\n        └── .gitkeep\n```\n",
         encoding="utf-8",
     )
 
@@ -276,7 +292,7 @@ def test_scaffold_project_parses_ascii_tree_without_literal_tree_marker_dirs(tmp
     template_root.mkdir(parents=True)
     (project_root / "docs").mkdir(parents=True, exist_ok=True)
     (project_root / "docs" / "architecture.md").write_text(
-        "# Architecture\n\n## Module Architecture\n\n```text\notif-01/\n|-- backend/\n|   |-- app/\n|   |   |-- services/\n|   |   |   |-- sync/\n|   |   |-- __init__.py\n|-- frontend/\n|   |-- src/\n|   |   |-- pages/\n|-- mock-server/\n|   |-- routers/\n```\n",
+        "# Architecture\n\n## Module Architecture\n\n```text\nsample-01/\n|-- backend/\n|   |-- app/\n|   |   |-- services/\n|   |   |   |-- sync/\n|   |   |-- __init__.py\n|-- frontend/\n|   |-- src/\n|   |   |-- pages/\n|-- mock-server/\n|   |-- routers/\n```\n",
         encoding="utf-8",
     )
 

@@ -67,7 +67,7 @@ def test_task_preserves_structured_technology_constraints() -> None:
             "acceptance_scenarios": [],
             "dependencies": [],
             "output_tests": [],
-            "output_paths": ["backend/otif/workflows/incident_workflow.py"],
+            "output_paths": ["backend/demo_domain/workflows/incident_workflow.py"],
             "technology_constraints": [
                 {
                     "name": "LangGraph",

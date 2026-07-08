@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use OPC Agents or app-delivery in a public project, article, demo, or derived framework, please cite it."
+title: "OPC Agents"
+type: software
+authors:
+  - name: "OPC Agents contributors"
+repository-code: "https://github.com/zghuang/opc-agents"
+license: "Apache-2.0"
+date-released: "2026-07-08"

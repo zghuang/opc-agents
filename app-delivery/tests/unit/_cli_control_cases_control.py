@@ -52,7 +52,7 @@ def test_cmd_spec_review_rejects_domain_specific_canonical_requirement_ids(tmp_p
     input_path.write_text(
         json.dumps(
             {
-                "requirements": [{"id": "OTIF-001", "title": "OTIF", "summary": "Domain-labeled ID should not be canonical."}],
+                "requirements": [{"id": "DOMAIN-001", "title": "Domain Metric", "summary": "Domain-labeled ID should not be canonical."}],
                 "acceptance_scenarios": [],
                 "clarifications": [],
             }
@@ -65,7 +65,7 @@ def test_cmd_spec_review_rejects_domain_specific_canonical_requirement_ids(tmp_p
 
     assert exc_info.value.code == "input_invalid_shape"
     assert "REQ-###/NFR-###" in exc_info.value.message
-    assert exc_info.value.details["invalid_requirement_ids"] == ["OTIF-001"]
+    assert exc_info.value.details["invalid_requirement_ids"] == ["DOMAIN-001"]
 
 def test_cmd_spec_review_archives_source_requirements_when_payload_includes_path(tmp_path: Path) -> None:
     requirements = tmp_path / "raw-req.md"
@@ -2563,7 +2563,7 @@ def test_cmd_control_status_prefers_review_pending_task_over_runnable_next_task(
             },
             "review_pending_task": {
                 "id": "T005",
-                "title": "OTIF Calculation Engine & Risk Scoring",
+                "title": "Domain Metric Calculation Engine & Risk Scoring",
                 "status": "review_pending",
                 "task_kind": "feature",
             },

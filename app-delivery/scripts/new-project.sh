@@ -210,7 +210,7 @@ mkdir -p "$OPC_HOME/projects"
 
 if [[ -f "$LEGACY_WATCHDOG_SCRIPT" ]]; then
   warn "Found existing Hermes watchdog script for the same project name: $LEGACY_WATCHDOG_SCRIPT"
-  warn "This can conflict with app-delivery runs and may report stale runtime/framework state (for example old m-opc Claude watchdogs against a new OpenCode project)."
+  warn "This can conflict with app-delivery runs and may report stale runtime/framework state (for example an old Claude watchdog against a new OpenCode project)."
   warn "Recommended: remove or disable the old watchdog before using this project name again."
 fi
 

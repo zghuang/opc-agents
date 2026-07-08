@@ -263,7 +263,7 @@ def test_infer_test_types_marks_backend_unit_suites_as_unit() -> None:
 
 def test_infer_test_types_marks_backend_core_and_src_tests_as_unit() -> None:
     assert infer_test_types(["backend/tests/core/test_database.py"]) == ["unit"]
-    assert infer_test_types(["backend/tests/test_core/test_otif_engine.py"]) == ["unit"]
+    assert infer_test_types(["backend/tests/test_core/test_domain_metric_engine.py"]) == ["unit"]
     assert infer_test_types(["backend/src/tests/test_health.py"]) == ["unit"]
 
 
@@ -562,15 +562,15 @@ def test_command_for_frontend_e2e_spec_discovers_readiness_health_path_without_p
 def test_command_for_frontend_e2e_spec_auto_wires_package_backend_entrypoint(tmp_path: Path) -> None:
     (tmp_path / "frontend").mkdir(parents=True)
     (tmp_path / "frontend" / "package-lock.json").write_text("{}\n", encoding="utf-8")
-    (tmp_path / "backend" / "otif").mkdir(parents=True)
+    (tmp_path / "backend" / "demo_domain").mkdir(parents=True)
     (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
-    (tmp_path / "backend" / "otif" / "__init__.py").write_text("", encoding="utf-8")
-    (tmp_path / "backend" / "otif" / "main.py").write_text("app = object()\n", encoding="utf-8")
+    (tmp_path / "backend" / "demo_domain" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "demo_domain" / "main.py").write_text("app = object()\n", encoding="utf-8")
 
     command = _command_for_test_spec(tmp_path, "frontend/e2e/app-shell.spec.ts")
 
     assert "E2E_BACKEND_CMD=" in command[2]
-    assert "uvicorn otif.main:app --host 127.0.0.1 --port 8000" in command[2]
+    assert "uvicorn demo_domain.main:app --host 127.0.0.1 --port 8000" in command[2]
 
 
 def test_command_for_frontend_e2e_spec_discovers_nested_package_backend_entrypoint(tmp_path: Path) -> None:

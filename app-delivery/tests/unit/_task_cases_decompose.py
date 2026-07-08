@@ -881,7 +881,7 @@ def test_decompose_tasks_normalizes_shortened_title_dependencies(tmp_path: Path)
         tmp_path,
         [
             {"title": "T005 — Data Import Pipeline (Orders, Production, Inventory, Logistics)", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["tests/test_import.py"], "output_paths": ["backend/src/import/"]},
-            {"title": "T006 — Event Platform & OTIF Risk Engine", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T005 — Data Import Pipeline"], "output_tests": ["tests/test_event.py"], "output_paths": ["backend/src/events/"]},
+            {"title": "T006 — Event Platform & Domain Metric Risk Engine", "requirements": ["REQ-002"], "acceptance_scenarios": [], "dependencies": ["T005 — Data Import Pipeline"], "output_tests": ["tests/test_event.py"], "output_paths": ["backend/src/events/"]},
         ],
         include_shared_foundation=False,
     )
