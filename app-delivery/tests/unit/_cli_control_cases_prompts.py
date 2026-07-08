@@ -788,6 +788,53 @@ def test_cmd_arch_design_normalizes_design_paths(tmp_path: Path) -> None:
     persisted = json.loads((tmp_path / ".app-delivery-runtime" / "stage-inputs" / "arch-design.json").read_text(encoding="utf-8"))
     assert persisted["ui_required"] is True
 
+
+def test_cmd_arch_design_accepts_dynamic_module_architecture_tree_formats(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    input_path = tmp_path / "arch.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "architecture_md": "# Architecture\n\n## Module Architecture\n\n```tree\nbackend/\n  app/\n    models/\nfrontend/\n  src/\n    pages/\n```\n",
+                "shared_components_md": "shared\n",
+                "ui_required": True,
+                "modules": [],
+                "adrs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert result == 0
+    assert (docs_dir / "architecture.md").exists()
+
+
+def test_cmd_arch_design_accepts_unfenced_markdown_module_architecture_tree(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    input_path = tmp_path / "arch.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "architecture_md": "# Architecture\n\n## Module Architecture\n\n- project/\n  - backend/\n    - app/\n  - frontend/\n    - src/\n\n## Data Model\n\nNo scaffold paths here.\n",
+                "shared_components_md": "shared\n",
+                "ui_required": True,
+                "modules": [],
+                "adrs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert result == 0
+    assert (docs_dir / "architecture.md").exists()
+
+
 def test_cmd_arch_design_rejects_missing_dependency_hints(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -993,8 +1040,28 @@ def test_cmd_arch_design_ignores_backend_root_examples_outside_module_tree(tmp_p
 
     assert result == 0
 
+def test_cmd_arch_design_allows_limited_implementation_file_anchors(tmp_path: Path) -> None:
+    file_rows = "\n".join(f"│       ├── anchor_{idx}.py" for idx in range(50))
+    input_path = tmp_path / "arch.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "architecture_md": f"# Architecture\n\n## Module Architecture\n\n```text\nproject/\n├── backend/\n│   └── src/\n{file_rows}\n└── frontend/\n```\n",
+                "shared_components_md": "shared\n",
+                "ui_required": True,
+                "modules": [],
+                "adrs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert result == 0
+
 def test_cmd_arch_design_rejects_implementation_file_inventory(tmp_path: Path) -> None:
-    file_rows = "\n".join(f"│       ├── generated_{idx}.py" for idx in range(25))
+    file_rows = "\n".join(f"│       ├── generated_{idx}.py" for idx in range(55))
     input_path = tmp_path / "arch.json"
     input_path.write_text(
         json.dumps(
@@ -1014,8 +1081,8 @@ def test_cmd_arch_design_rejects_implementation_file_inventory(tmp_path: Path) -
 
     assert exc_info.value.code == "input_invalid_shape"
     assert "scaffold skeleton" in exc_info.value.message
-    assert exc_info.value.details["max_implementation_file_entries"] == 20
-    assert exc_info.value.details["implementation_file_entry_count"] == 25
+    assert exc_info.value.details["max_implementation_file_entries"] == 50
+    assert exc_info.value.details["implementation_file_entry_count"] == 55
     assert "generated_0.py" in exc_info.value.details["implementation_file_examples"]
 
 def test_cmd_arch_design_allows_many_scaffold_config_files_in_module_tree(tmp_path: Path) -> None:

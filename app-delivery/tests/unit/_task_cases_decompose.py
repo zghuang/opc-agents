@@ -107,6 +107,40 @@ def test_decompose_tasks_preserves_normalized_task_intent(tmp_path: Path) -> Non
         "non_goals": ["Do not build unrelated dashboards"],
     }
 
+def test_decompose_tasks_keeps_string_intent_lists_as_single_items(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Case workspace",
+                "requirements": ["REQ-001"],
+                "output_tests": ["backend/tests/test_case.py"],
+                "output_paths": ["backend/src/case/"],
+                "intent": {
+                    "done_when": "All pages render within the shell.",
+                    "non_goals": "Do not build reporting.",
+                },
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    by_id = {item["id"]: item for item in payload["items"]}
+    assert by_id["T002"]["intent"]["done_when"] == ["All pages render within the shell."]
+    assert by_id["T002"]["intent"]["non_goals"] == ["Do not build reporting."]
+
 def test_decompose_tasks_ignores_replayed_builtin_items(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -406,6 +440,53 @@ def test_normalize_complexity_override_rejects_understated_tier() -> None:
         )
 
     assert "minimum expected tier is L" in str(exc_info.value)
+
+def test_normalize_complexity_override_rejects_understated_rich_signals() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        normalize_complexity_override(
+            {
+                "tier": "S",
+                "rationale": "Incorrectly using S as highest complexity.",
+                "signals": {
+                    "unique_agent_types": 6,
+                    "state_machine_count": 5,
+                    "integration_mode_types": 2,
+                    "total_acceptance_scenarios": 25,
+                    "frontend_page_archetypes": 7,
+                    "external_system_integrations": 7,
+                    "total_requirements": 159,
+                    "rbac_roles": 11,
+                    "memory_system_types": 3,
+                },
+            }
+        )
+
+    message = str(exc_info.value)
+    assert "minimum expected tier is L" in message
+    assert "total_requirements=159 >= 80" in message
+    assert "total_acceptance_scenarios=25 >= 15" in message
+    assert "external_system_integrations=7 >= 5" in message
+
+def test_normalize_complexity_override_accepts_large_tier_with_rich_signals() -> None:
+    payload = normalize_complexity_override(
+        {
+            "tier": "L",
+            "rationale": "Large multi-agent system.",
+            "signals": {
+                "unique_agent_types": 6,
+                "state_machine_count": 5,
+                "total_acceptance_scenarios": 25,
+                "frontend_page_archetypes": 7,
+                "external_system_integrations": 7,
+                "total_requirements": 159,
+                "rbac_roles": 11,
+                "memory_system_types": 3,
+            },
+        }
+    )
+
+    assert payload["tier"] == "L"
+    assert payload["source"] == "task-decompose"
 
 def test_normalize_stage_gates_keeps_simple_task_decompose_gate_shape() -> None:
     gates = normalize_stage_gates(
@@ -1008,7 +1089,7 @@ def test_task_shape_size_guard_ignores_framework_production_gates() -> None:
         ]
     )
 
-def test_decompose_tasks_rejects_more_than_twenty_non_builtin_tasks(tmp_path: Path) -> None:
+def test_decompose_tasks_allows_more_than_twenty_coherent_non_builtin_tasks(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     requirements = [{"id": f"REQ-{idx:03d}", "title": f"Req {idx}", "summary": "One"} for idx in range(1, 22)]
@@ -1025,14 +1106,11 @@ def test_decompose_tasks_rejects_more_than_twenty_non_builtin_tasks(tmp_path: Pa
         for idx in range(1, 22)
     ]
 
-    try:
-        decompose_tasks(tmp_path, items, include_shared_foundation=False)
-    except ValueError as exc:
-        message = str(exc)
-        assert "non-built-in tasks (>20)" in message
-        assert "reassess whether this count is appropriate" in message
-    else:
-        raise AssertionError("expected task graph count guard to reject more than 20 non-built-in tasks")
+    payload = decompose_tasks(tmp_path, items, include_shared_foundation=False)
+
+    generated = [item for item in payload["items"] if str(item.get("title") or "").startswith("Feature ")]
+    assert len(generated) == 21
+    assert sorted(requirement for item in generated for requirement in item["requirements"]) == [f"REQ-{idx:03d}" for idx in range(1, 22)]
 
 def test_check_test_type_coverage_uses_test_plan_bindings(tmp_path: Path) -> None:
     from delivery.state import save_test_results, save_work_items

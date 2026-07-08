@@ -14,8 +14,8 @@ Constraints:
 - Keep module boundaries explicit.
 - `modules` must contain module design docs only: responsibilities, public interfaces, data ownership, integration points, and tests. Do not put ADRs in `modules`.
 - `adrs` must contain decision records only: context, decision, consequences, and alternatives.
-- `architecture_md` must include `Module Architecture`: a fenced repository tree plus concise responsibilities for major code areas.
-- The fenced tree is the T000 scaffold contract. List directories, durable empty-directory placeholders, and minimal scaffold/config files only. Do not inventory implementation source files; keep concrete source files to rare entrypoints that T000 must create.
+- `architecture_md` must include `Module Architecture`: a parseable repository tree plus concise responsibilities for major code areas. A fenced tree block is preferred, but connector trees, consistently indented trees, and markdown-list trees are all acceptable.
+- The Module Architecture tree is the T000 scaffold contract. It may start with a project-name wrapper root or directly with real repository roots, but it must not mix prose bullets into the tree. List directories, durable empty-directory placeholders, and minimal scaffold/config files only. Do not inventory implementation source files; keep concrete source files to rare entrypoints that T000 must create.
 - Follow the selected stack guidance below. When the stack does not prescribe a backend package layout, choose one in `Module Architecture` instead of inheriting a template directory by default.
 - Keep the skeleton project-specific and minimal. T000 owns this structural skeleton; T001 should only implement true shared foundation code that multiple feature slices need, not compensate for missing architecture structure.
 - If a UI is required, make that clear in the architecture and set ui_required=true.

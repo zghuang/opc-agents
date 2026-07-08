@@ -12,7 +12,8 @@ from .test_env import frontend_e2e_env_prefix
 from .builtin_task_prompts import render_frontend_api_audit_prompt, render_prefinal_audit_prompt
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, SHARED_FOUNDATION_TASK_ID
 from .loop_gitops import repair_invalid_verified_tasks
-from .task import Task, all_tasks, lint_task_contract
+from .scaffold import _extract_module_architecture_tree
+from .task import Task, all_tasks, lint_task_contract, normalize_intent_list
 
 
 FINAL_REPAIR_REPORT_PATH = "docs/reviews/final-repair-report.md"
@@ -311,8 +312,8 @@ def _append_task_intent_section(lines: list[str], task: Task) -> None:
     intent = task.intent if isinstance(task.intent, dict) else {}
     objective = str(intent.get("objective") or "").strip()
     journey = str(intent.get("journey") or "").strip()
-    done_when = [str(value).strip() for value in intent.get("done_when", []) if str(value).strip()]
-    non_goals = [str(value).strip() for value in intent.get("non_goals", []) if str(value).strip()]
+    done_when = normalize_intent_list(intent.get("done_when"))
+    non_goals = normalize_intent_list(intent.get("non_goals"))
     if not any([objective, journey, done_when, non_goals]):
         return
     lines.append("Task intent:")
@@ -448,6 +449,23 @@ def _append_execution_loop_gate_guidance(lines: list[str]) -> None:
     lines.append("- Scan only those declared process boundaries, including state transitions, side effects, auditability, authorization, idempotency, and external-system handoff when they exist.")
     lines.append("- Validate the declared unhappy paths as well as the happy path, such as rejection, retry, timeout, cancellation, rollback, or manual override where applicable.")
     lines.append("- Treat in-memory happy-path-only evidence, missing side-effect verification, or reports that do not trace to executable boundary tests as blocking findings.")
+    lines.append("")
+
+
+def _append_architecture_layout_context(lines: list[str], project_root: Path | str) -> None:
+    project_dir = Path(project_root).expanduser().resolve()
+    architecture_path = project_dir / "docs" / "architecture.md"
+    if not architecture_path.exists():
+        return
+    try:
+        tree_body = _extract_module_architecture_tree(architecture_path.read_text(encoding="utf-8"))
+    except OSError:
+        return
+    if not tree_body.strip():
+        return
+    lines.append("Architecture layout:")
+    lines.append("- Before creating or moving directories, check `docs/architecture.md` Module Architecture.")
+    lines.append("- Keep changes under declared Paths; do not create parallel roots for existing modules.")
     lines.append("")
 
 
@@ -654,6 +672,7 @@ def build_task_prompt(project_root: Path | str, task: Task) -> str:
     if task.output_tests:
         lines.append(f"Tests: {', '.join(task.output_tests)}")
         lines.append("")
+    _append_architecture_layout_context(lines, project_root)
     if contract_lint["warnings"]:
         lines.append("Task contract warnings:")
         for warning in contract_lint["warnings"]:
@@ -765,6 +784,7 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
     if task.output_tests:
         lines.append(f"Tests: {', '.join(task.output_tests)}")
         lines.append("")
+    _append_architecture_layout_context(lines, project_root)
     if contract_lint["warnings"]:
         lines.append("Task contract warnings:")
         for warning in contract_lint["warnings"]:

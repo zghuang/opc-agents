@@ -311,6 +311,47 @@ def test_build_task_prompt_includes_requirement_and_acceptance_details(tmp_path:
     assert "cd backend && uv run pytest" in prompt
     assert "frontend/package.json" not in prompt
 
+
+def test_build_task_prompt_includes_architecture_layout_context(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "architecture.md").write_text(
+        "# Architecture\n\n## Module Architecture\n\n```tree\nbackend/\n  app/\n    models/\nfrontend/\n  src/\n    pages/\n```\n",
+        encoding="utf-8",
+    )
+    (docs_dir / "project-structure.md").write_text("# Project Structure\n\n- backend/\n- frontend/\n", encoding="utf-8")
+    from delivery.task import Task
+
+    prompt = build_task_prompt(tmp_path, Task("T002", "Models", "pending", [], [], [], ["backend/tests/test_models.py"], ["backend/app/models/"]))
+
+    assert "Architecture layout:" in prompt
+    assert "check `docs/architecture.md` Module Architecture" in prompt
+    assert "Keep changes under declared Paths" in prompt
+    assert "frontend/" not in prompt
+
+def test_build_task_prompt_does_not_render_done_when_character_lists(tmp_path: Path) -> None:
+    from delivery.task import Task
+
+    prompt = build_task_prompt(
+        tmp_path,
+        Task.from_dict(
+            {
+                "id": "T002",
+                "title": "Shell",
+                "status": "pending",
+                "requirements": [],
+                "acceptance_scenarios": [],
+                "dependencies": [],
+                "output_tests": ["frontend/src/App.test.tsx"],
+                "output_paths": ["frontend/src/App.tsx"],
+                "intent": {"done_when": list("Allpagesrender")},
+            }
+        ),
+    )
+
+    assert "  - A\n  - l\n" not in prompt
+    assert "- Allpagesrender" in prompt
+
 def test_build_task_prompt_includes_task_intent(tmp_path: Path) -> None:
     from delivery.task import Task
 

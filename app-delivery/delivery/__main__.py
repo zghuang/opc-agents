@@ -30,7 +30,7 @@ from .scaffold import write_project_structure_snapshot
 from .session import RuntimeSession, current_session, retire_session, save_current_session
 from .watchdog import process_alive, save_watchdog_state, should_watchdog_resume, spawn_watchdog
 from .stage_harness import import_arch_design, import_context_sync, import_decompose, import_spec_review, import_ui_design, load_stage_payload, stage_import_command, stage_input_path, stage_missing_error
-from .loop_gitops import try_reapply_task_exception_patch
+from .loop_gitops import task_scoped_changed_paths, try_reapply_task_exception_patch
 from .state import (
     acquire_lock,
     latest_task_log_event,
@@ -70,6 +70,48 @@ def _runtime_state_for_exception_patch_reapply(reapply_result: dict[str, Any]) -
             }
         )
     return state
+
+
+def _other_task_dirty_change_blockers(project_root: Path | str, target_task_id: str) -> list[dict[str, Any]]:
+    project_dir = resolve_project_root(project_root)
+    target = str(target_task_id or "").strip()
+    blockers: list[dict[str, Any]] = []
+    for task in all_tasks(project_dir):
+        if task.id == target:
+            continue
+        if task.status not in {"active", "review_pending", "pending"}:
+            continue
+        scoped_paths = task_scoped_changed_paths(project_dir, task)
+        if not scoped_paths:
+            continue
+        blockers.append(
+            {
+                "task_id": task.id,
+                "title": task.title,
+                "status": task.status,
+                "review_status": task.review_status,
+                "changed_paths": scoped_paths[:20],
+                "changed_path_count": len(scoped_paths),
+            }
+        )
+    return blockers
+
+
+def _guard_no_other_task_dirty_changes(project_root: Path | str, target_task_id: str) -> None:
+    blockers = _other_task_dirty_change_blockers(project_root, target_task_id)
+    if not blockers:
+        return
+    task_labels = ", ".join(str(blocker["task_id"]) for blocker in blockers[:5])
+    raise DeliveryError(
+        code="dirty_worktree_other_task",
+        message=(
+            f"cannot repair {target_task_id} while other unfinished task-scoped changes exist: {task_labels}. "
+            "Finish or settle those tasks before starting a different repair."
+        ),
+        exit_code=2,
+        details={"target_task_id": target_task_id, "blocking_tasks": blockers},
+        suggested_action="Continue/review the listed task(s), or explicitly park/clear their changes before repairing another task.",
+    )
 HOST_HANDOFF_MAX_RETRY_ATTEMPTS = 1
 HOST_FALLBACK_FILE = Path(".app-delivery-runtime") / "host-fallback.json"
 HOST_FALLBACK_LOCK_FILE = Path(".app-delivery-runtime") / "host-fallback-lock.json"
@@ -634,6 +676,7 @@ def _run_fix_once(
                 details={"task_id": task_id, "status": current.status, "task_kind": current.task_kind},
             )
         _guard_final_repair_limit_not_reopened(resolved, current)
+        _guard_no_other_task_dirty_changes(resolved, task_id)
         _terminate_runtime_for_task(resolved, task_id)
         updated = reset_task(tasks, task_id)
         save_tasks(resolved, updated)
@@ -1924,6 +1967,7 @@ def cmd_task(args: argparse.Namespace) -> int:
                     details={"task_id": task_id, "status": task.status, "task_kind": task.task_kind},
                 )
             _guard_final_repair_limit_not_reopened(project_root, task)
+            _guard_no_other_task_dirty_changes(project_root, task_id)
             tasks = reset_task(tasks, task_id, blocked_reason=f"manual repair reset: {reason}")
             save_tasks(project_root, tasks)
             save_task_runtime_state(

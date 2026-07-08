@@ -8,7 +8,7 @@ from typing import Any
 from .bootstrap import archive_requirements_source, save_project_dependency_hints
 from .errors import DeliveryError
 from .runtime_config import load_project_metadata, load_project_runtime, root_context_filename
-from .scaffold import write_project_structure_snapshot
+from .scaffold import _extract_module_architecture_tree, _parse_module_architecture_lines, write_project_structure_snapshot
 from .gates import sync_gates
 from .stack_contracts import PYTHON_REACT_CONTRACT
 from .state import ensure_runtime_dirs, load_architecture_meta, project_paths, save_architecture_meta, save_test_plan, save_work_items, utc_now_iso
@@ -107,7 +107,7 @@ IMPLEMENTATION_TREE_FILE_RE = re.compile(
     r"\.(?:py|pyi|ipynb|ts|tsx|js|jsx|mjs|cjs|java|kt|kts|scala|go|rs|cs|fs|vb|cpp|cc|cxx|c|h|hpp|swift|rb|php|dart|sql|graphql|proto)$",
     re.IGNORECASE,
 )
-MAX_MODULE_TREE_IMPLEMENTATION_FILE_ENTRIES = 20
+MAX_MODULE_TREE_IMPLEMENTATION_FILE_ENTRIES = 50
 CANONICAL_REQUIREMENT_ID_RE = re.compile(r"^(?:REQ|NFR)-\d{3,}$")
 ACCEPTANCE_ID_RE = re.compile(r"^AS-\d{3,}$")
 ROUTE_MAPPING_HEADING_RE = re.compile(r"^##+\s+Route Mapping\s*$", re.IGNORECASE)
@@ -275,15 +275,14 @@ def _validate_architecture_markdown(input_path: Path, architecture_md: str) -> N
             input_path,
             "arch-design architecture_md must include a 'Module Architecture' section with the intended repository/module structure",
         )
-    section = text[match.end() :]
-    fenced = FENCED_BLOCK_RE.search(section)
-    if not fenced:
+    tree_body = _extract_module_architecture_tree(text)
+    parsed_tree = _parse_module_architecture_lines(tree_body) if tree_body else []
+    if not parsed_tree:
         raise _shape_error(
             "arch-design",
             input_path,
-            "arch-design Module Architecture section must include a fenced code block showing the repository/module tree",
+            "arch-design Module Architecture section must include a parseable repository/module tree; a fenced tree block is preferred",
         )
-    tree_body = str(fenced.group("body") or "")
     invalid_backend_paths = sorted(set(NON_CANONICAL_BACKEND_PACKAGE_RE.findall(tree_body))) if NON_CANONICAL_BACKEND_PACKAGE_RE else []
     invalid_backend_tree_children = NON_CANONICAL_BACKEND_TREE_CHILD_RE.findall(tree_body) if NON_CANONICAL_BACKEND_TREE_CHILD_RE else []
     if invalid_backend_paths or invalid_backend_tree_children:
@@ -299,8 +298,8 @@ def _validate_architecture_markdown(input_path: Path, architecture_md: str) -> N
             f"{PYTHON_REACT_CONTRACT.id} architecture must use the selected stack's canonical service roots; found an unsupported extra service root in the Module Architecture tree",
         )
     implementation_files = []
-    for match in TREE_FILE_ENTRY_RE.finditer(tree_body):
-        name = match.group("name").rstrip("/")
+    for _depth, content, _has_connector in parsed_tree:
+        name = str(content or "").rstrip("/")
         if name in ALLOWED_TREE_PLACEHOLDER_FILES or name in ALLOWED_SCAFFOLD_TREE_FILES:
             continue
         if IMPLEMENTATION_TREE_FILE_RE.search(name):

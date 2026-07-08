@@ -231,6 +231,71 @@ def test_cmd_fix_refuses_to_reopen_verified_feature_task(tmp_path: Path) -> None
     assert review_path.exists()
 
 
+def test_cmd_fix_refuses_when_other_unfinished_task_has_dirty_changes(tmp_path: Path) -> None:
+    ensure_git_repo(tmp_path)
+    feature_path = tmp_path / "backend" / "src" / "feature" / "handler.py"
+    exception_path = tmp_path / "backend" / "src" / "exception" / "handler.py"
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    exception_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_path.write_text("print('base feature')\n", encoding="utf-8")
+    exception_path.write_text("print('base exception')\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+    feature_path.write_text("print('pending review repair')\n", encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T018", "title": "Exception task", "status": "exception", "requirements": ["REQ-018"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/exception/"]},
+                {"id": "T029", "title": "Pending review repair", "status": "review_pending", "requirements": ["REQ-029"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"], "review_status": "changes_requested", "review_artifact": "docs/reviews/code-review-T029.md"},
+            ],
+        },
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_fix(argparse.Namespace(project=str(tmp_path), task_id="T018", no_start=True, runtime="claude"))
+
+    assert exc_info.value.code == "dirty_worktree_other_task"
+    assert exc_info.value.details["target_task_id"] == "T018"
+    assert exc_info.value.details["blocking_tasks"][0]["task_id"] == "T029"
+    assert exc_info.value.details["blocking_tasks"][0]["changed_paths"] == ["backend/src/feature/handler.py"]
+    assert feature_path.read_text(encoding="utf-8") == "print('pending review repair')\n"
+    task = next(row for row in json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))["items"] if row["id"] == "T018")
+    assert task["status"] == "exception"
+
+
+def test_cmd_fix_allows_other_unfinished_task_without_dirty_changes(tmp_path: Path) -> None:
+    ensure_git_repo(tmp_path)
+    exception_path = tmp_path / "backend" / "src" / "exception" / "handler.py"
+    exception_path.parent.mkdir(parents=True, exist_ok=True)
+    exception_path.write_text("print('base exception')\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T018", "title": "Exception task", "status": "exception", "requirements": ["REQ-018"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/exception/"]},
+                {"id": "T029", "title": "Pending review repair", "status": "review_pending", "requirements": ["REQ-029"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"], "review_status": "changes_requested"},
+            ],
+        },
+    )
+
+    result = cli.cmd_fix(argparse.Namespace(project=str(tmp_path), task_id="T018", no_start=True, runtime="claude"))
+
+    assert result == 0
+    task = next(row for row in json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))["items"] if row["id"] == "T018")
+    assert task["status"] == "pending"
+
+
 
 def test_cmd_fix_refuses_final_repair_after_iteration_limit(tmp_path: Path) -> None:
     save_work_items(

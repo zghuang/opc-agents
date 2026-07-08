@@ -48,6 +48,67 @@ SECURITY_RISK_REGISTER_PATH = SEMANTIC_RISK_REGISTER_PATH
 DEFERABLE_MACHINE_PRECONDITION_CATEGORIES = {"real-backend-e2e", "production-stub", "production-fake-data"}
 FINAL_VERIFICATION_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
+ACCESS_CONTROL_SURFACE_MARKERS = {
+    "2fa",
+    "abac",
+    "accesscontrol",
+    "acl",
+    "attributebasedaccesscontrol",
+    "auth",
+    "authn",
+    "authz",
+    "authenticate",
+    "authenticated",
+    "authentication",
+    "authorize",
+    "authorized",
+    "authorization",
+    "bearer",
+    "casbin",
+    "cedar",
+    "claim",
+    "claimbasedaccesscontrol",
+    "cognito",
+    "credential",
+    "entitlement",
+    "guard",
+    "iam",
+    "identity",
+    "idp",
+    "jwt",
+    "jwks",
+    "keycloak",
+    "ldap",
+    "login",
+    "mfa",
+    "middleware",
+    "oauth",
+    "oauth2",
+    "oidc",
+    "openid",
+    "opa",
+    "permission",
+    "policy",
+    "policybasedaccesscontrol",
+    "principal",
+    "privilege",
+    "privileged",
+    "rbac",
+    "rls",
+    "role",
+    "rolebasedaccesscontrol",
+    "rowlevelsecurity",
+    "saml",
+    "scim",
+    "scope",
+    "security",
+    "session",
+    "sso",
+    "tenant",
+    "tenantisolation",
+    "tenancy",
+    "token",
+}
 
 
 def _latest_task_test_result(project_root: Path | str, task_id: str) -> dict[str, Any] | None:
@@ -348,19 +409,43 @@ def _machine_precondition_is_security_access_control(review_payload: dict[str, A
     return bool(families) and all(row.get("category") == "security-access-control" for row in families)
 
 
-def _machine_precondition_deferable_families(task: Task, review_payload: dict[str, Any]) -> list[dict[str, str]]:
+def _machine_precondition_deferable_families(task: Task, review_payload: dict[str, Any], project_tasks: list[Task] | None = None) -> list[dict[str, str]]:
     families = _machine_precondition_error_families(review_payload)
     if not families:
         return []
     for row in families:
         category = row.get("category")
         if category == "security-access-control":
-            if not _task_owns_auth_or_rbac_surface(task):
+            if not (_task_owns_auth_or_rbac_surface(task) or _later_task_owns_auth_or_rbac_surface(task, project_tasks or [])):
                 return []
             continue
         if category not in DEFERABLE_MACHINE_PRECONDITION_CATEGORIES:
             return []
     return families
+
+
+def _normalize_auth_surface_token(token: str) -> str:
+    normalized = str(token or "").strip().casefold()
+    if len(normalized) > 4 and normalized.endswith("ies"):
+        return normalized[:-3] + "y"
+    if len(normalized) > 3 and normalized.endswith("es"):
+        return normalized[:-2]
+    if len(normalized) > 3 and normalized.endswith("s"):
+        return normalized[:-1]
+    return normalized
+
+
+def _auth_surface_tokens(text: str) -> set[str]:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(text or "").casefold())
+    words = [_normalize_auth_surface_token(token) for token in normalized.split() if token]
+    tokens = set(words)
+    for ngram_size in range(2, 5):
+        for index in range(0, max(len(words) - ngram_size + 1, 0)):
+            tokens.add("".join(words[index : index + ngram_size]))
+    compact = re.sub(r"[^a-z0-9]+", "", str(text or "").casefold())
+    if compact:
+        tokens.add(compact)
+    return tokens
 
 
 def _task_owns_auth_or_rbac_surface(task: Task) -> bool:
@@ -374,21 +459,36 @@ def _task_owns_auth_or_rbac_surface(task: Task) -> bool:
             *task.output_paths,
             *task.output_tests,
         ]
-    ).casefold()
-    markers = ("auth", "rbac", "access-control", "access control", "permission", "role", "login", "tenant")
-    return any(marker in haystack for marker in markers)
+    )
+    tokens = _auth_surface_tokens(haystack)
+    return any(token in ACCESS_CONTROL_SURFACE_MARKERS or token.startswith("auth") for token in tokens)
 
 
-def _machine_precondition_can_defer_for_progress(task: Task, review_payload: dict[str, Any], repeat_count: int) -> bool:
+def _later_task_owns_auth_or_rbac_surface(task: Task, project_tasks: list[Task]) -> bool:
+    current_index = next((index for index, candidate in enumerate(project_tasks) if candidate.id == task.id), -1)
+    if current_index < 0:
+        return False
+    terminal_statuses = {"verified", "cancelled"}
+    for candidate in project_tasks[current_index + 1 :]:
+        if str(candidate.task_kind or "feature").strip().casefold() != "feature":
+            continue
+        if str(candidate.status or "").strip().casefold() in terminal_statuses:
+            continue
+        if _task_owns_auth_or_rbac_surface(candidate):
+            return True
+    return False
+
+
+def _machine_precondition_can_defer_for_progress(task: Task, review_payload: dict[str, Any], repeat_count: int, project_tasks: list[Task] | None = None) -> bool:
     return (
         repeat_count >= MACHINE_PRECONDITION_PROGRESS_REPEAT_THRESHOLD
-        and bool(_machine_precondition_deferable_families(task, review_payload))
+        and bool(_machine_precondition_deferable_families(task, review_payload, project_tasks))
     )
 
 
-def _machine_precondition_progress_pass_payload(task: Task, review_payload: dict[str, Any], *, fingerprint: str, repeat_count: int) -> dict[str, Any]:
+def _machine_precondition_progress_pass_payload(task: Task, review_payload: dict[str, Any], *, fingerprint: str, repeat_count: int, project_tasks: list[Task] | None = None) -> dict[str, Any]:
     errors = _machine_precondition_errors(review_payload)
-    families = _machine_precondition_deferable_families(task, review_payload)
+    families = _machine_precondition_deferable_families(task, review_payload, project_tasks)
     categories = sorted({row["category"] for row in families})
     risk = {
         "kind": "semantic_review_deferred_for_progress",
@@ -656,8 +756,9 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
     same_machine_fingerprint = bool(machine_fingerprint and str(runtime_state.get("machine_precondition_fingerprint") or "") == machine_fingerprint)
     machine_repeat_count = int(runtime_state.get("machine_precondition_repeat_count") or 0) + 1 if same_machine_fingerprint else 0
     deferred_semantic_risk_path: str | None = None
-    if same_machine_fingerprint and _machine_precondition_can_defer_for_progress(task, parsed, machine_repeat_count):
-        parsed = _machine_precondition_progress_pass_payload(task, parsed, fingerprint=machine_fingerprint, repeat_count=machine_repeat_count)
+    project_tasks = all_tasks(project_dir)
+    if same_machine_fingerprint and _machine_precondition_can_defer_for_progress(task, parsed, machine_repeat_count, project_tasks):
+        parsed = _machine_precondition_progress_pass_payload(task, parsed, fingerprint=machine_fingerprint, repeat_count=machine_repeat_count, project_tasks=project_tasks)
         review_status = "pass"
         review_artifact = _write_review_artifact(project_dir, task, parsed)
         risk = parsed.get("semantic_risk") if isinstance(parsed.get("semantic_risk"), dict) else {}
@@ -725,7 +826,7 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
         return 0
 
     if same_machine_fingerprint:
-        deferable_families = _machine_precondition_deferable_families(task, parsed)
+        deferable_families = _machine_precondition_deferable_families(task, parsed, project_tasks)
         if deferable_families:
             review_changes_requested_count = int(runtime_state.get("review_changes_requested_count") or 0) + 1
             review_repair_state = {

@@ -38,7 +38,7 @@ Intent rules:
 - If a task has more than 12 requirements, more than 5 acceptance scenarios, or more than 8 output tests, and two or more of those are true, reassess the boundary. Decide whether it is one coherent independently testable capability or should be split into vertical slices. Record the decision in `intent.split_justification`.
 - Reassess task boundaries when a task mixes multiple independently testable capability surfaces. Split by workflow, sub-capability, or bounded context unless the task is a single coherent vertical slice and `intent.split_justification` explains why.
 - Every `done_when` item should map to task-owned `output_tests` or an explicit validation task dependency. If coverage is partial, refine the task boundary or add focused tests.
-- If the graph has more than 20 non-built-in delivery tasks, reassess whether the count is appropriate for the project size and module boundaries. Keep tasks separate when each is a coherent independently testable slice; merge only when the merged task remains focused. Record the decision in `intent.split_justification` for intentionally retained count-heavy boundaries.
+- If the graph has many non-built-in delivery tasks, reassess whether the count is appropriate for the project size and module boundaries. Keep tasks separate when each is a coherent independently testable slice; merge only when the merged task remains focused. Record the decision in `intent.split_justification` for intentionally retained count-heavy boundaries.
 
 `technology_constraints` must use this shape on every task. Use an empty array only when no project technology choice is specifically owned or required by that task:
 
@@ -118,7 +118,12 @@ Use this `delivery_complexity` shape:
 	"signals": {
 		"estimated_loc": 80000,
 		"estimated_modules": 6,
-		"estimated_tasks": 18
+		"estimated_tasks": 18,
+		"total_requirements": 120,
+		"total_acceptance_scenarios": 18,
+		"external_system_integrations": 5,
+		"unique_agent_types": 4,
+		"frontend_page_archetypes": 6
 	}
 }
 ```

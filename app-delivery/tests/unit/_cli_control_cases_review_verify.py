@@ -1176,6 +1176,42 @@ def test_cmd_task_reset_repair_clears_repair_limit_and_returns_pending(tmp_path:
     assert runtime_state["failure_count"] == 0
 
 
+def test_cmd_task_reset_repair_refuses_when_other_unfinished_task_has_dirty_changes(tmp_path: Path) -> None:
+    ensure_git_repo(tmp_path)
+    dirty_path = tmp_path / "backend" / "src" / "feature" / "handler.py"
+    repair_path = tmp_path / "backend" / "src" / "workflow.py"
+    dirty_path.parent.mkdir(parents=True, exist_ok=True)
+    repair_path.parent.mkdir(parents=True, exist_ok=True)
+    dirty_path.write_text("print('base feature')\n", encoding="utf-8")
+    repair_path.write_text("print('base workflow')\n", encoding="utf-8")
+    git(["add", "--", "."], cwd=tmp_path)
+    git(["commit", "-m", "init"], cwd=tmp_path)
+    dirty_path.write_text("print('pending review repair')\n", encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T010", "title": "Workflow", "status": "exception", "requirements": ["REQ-010"], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": ["backend/tests/test_workflow.py"], "output_paths": ["backend/src/workflow.py"], "blocked_reason": "review repair limit", "attempts": 4},
+                {"id": "T029", "title": "Pending review repair", "status": "pending", "requirements": ["REQ-029"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": ["backend/src/feature/"], "review_status": "changes_requested"},
+            ],
+        },
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_task(argparse.Namespace(project=str(tmp_path), task_id="T010", action="reset-repair", reason="Try again."))
+
+    assert exc_info.value.code == "dirty_worktree_other_task"
+    assert exc_info.value.details["blocking_tasks"][0]["task_id"] == "T029"
+    assert dirty_path.read_text(encoding="utf-8") == "print('pending review repair')\n"
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    item = next(row for row in payload["items"] if row["id"] == "T010")
+    assert item["status"] == "exception"
+
+
 def test_cmd_task_reset_repair_refuses_verified_feature_task(tmp_path: Path) -> None:
     save_work_items(
         tmp_path,

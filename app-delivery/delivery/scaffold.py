@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+from math import gcd
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +36,11 @@ IGNORED_STRUCTURE_FILE_SUFFIXES = {".pyc", ".pyo", ".log"}
 MAX_PROJECT_STRUCTURE_DEPTH = 4
 MAX_PROJECT_STRUCTURE_CHILDREN = 40
 MODULE_ARCHITECTURE_HEADING_RE = re.compile(r"^##+\s+(?:\d+\.\s*)?(?:Module Architecture|模块架构)\s*$", re.IGNORECASE | re.MULTILINE)
-FENCED_BLOCK_RE = re.compile(r"```(?:text|plaintext|txt)?\n(?P<body>.*?)\n```", re.DOTALL | re.IGNORECASE)
-TREE_LINE_RE = re.compile(r"^(?P<prefix>(?:│   |    )*)(?:(?:├── |└── ))?(?P<content>.+?)\s*$")
-TREE_CONNECTOR_RE = re.compile(r"^(?P<prefix>.*?)(?:├── |└── |\|-- )(?P<content>.+?)\s*$")
+FENCED_BLOCK_RE = re.compile(r"```[^\n]*\n(?P<body>.*?)\n```", re.DOTALL | re.IGNORECASE)
+NEXT_HEADING_RE = re.compile(r"^##+\s+", re.MULTILINE)
+TREE_CONNECTOR_RE = re.compile(r"^(?P<prefix>.*?)(?:├── |└── |\|-- |\+-- |`-- |\\-- )(?P<content>.+?)\s*$")
+MARKDOWN_BULLET_RE = re.compile(r"^(?:[-*+]\s+)(?P<content>.+?)\s*$")
+PATH_LIKE_ENTRY_RE = re.compile(r"(?:/|\\|\.\w{1,8}$|^__init__\.py$|^\.gitkeep$)")
 
 
 def _copy_tree(src: Path, dst: Path) -> None:
@@ -166,9 +169,13 @@ def _extract_module_architecture_tree(architecture_text: str) -> str:
     if not match:
         return ""
     section = str(architecture_text or "")[match.end() :]
+    next_heading = NEXT_HEADING_RE.search(section)
+    if next_heading:
+        section = section[: next_heading.start()]
     fenced = FENCED_BLOCK_RE.search(section)
     if not fenced:
-        return ""
+        tree_lines = [line for line in section.splitlines() if _looks_like_architecture_tree_source_line(line)]
+        return "\n".join(tree_lines).strip()
     return str(fenced.group("body") or "").strip()
 
 
@@ -177,26 +184,144 @@ def _tree_prefix_depth(prefix: str) -> int:
     return max(visible_depth, len(prefix) // 4)
 
 
-def _parse_architecture_tree_line(raw_line: str) -> tuple[int, str] | None:
-    line = raw_line.rstrip()
+def _strip_tree_entry_content(content: str) -> str:
+    text = re.split(r"\s+#", str(content or ""), maxsplit=1)[0].strip()
+    return text
+
+
+def _looks_like_architecture_tree_source_line(raw_line: str) -> bool:
+    line = str(raw_line or "").expandtabs(4).rstrip()
+    if not line.strip():
+        return False
+    connector_match = TREE_CONNECTOR_RE.match(line)
+    if connector_match:
+        content = str(connector_match.group("content") or "")
+    else:
+        stripped = line.lstrip(" ")
+        if stripped.startswith(("|", "│", "├", "└")):
+            return True
+        bullet_match = MARKDOWN_BULLET_RE.match(stripped)
+        content = str(bullet_match.group("content") if bullet_match else stripped)
+    return bool(PATH_LIKE_ENTRY_RE.search(_strip_tree_entry_content(content)))
+
+
+def _detect_plain_tree_indent_unit(tree_body: str) -> int:
+    unit = 0
+    for raw_line in str(tree_body or "").splitlines():
+        line = raw_line.expandtabs(4).rstrip()
+        if not line.strip() or TREE_CONNECTOR_RE.match(line):
+            continue
+        stripped = line.lstrip(" ")
+        if not stripped or stripped.startswith(("|", "│", "├", "└")):
+            continue
+        leading_spaces = len(line) - len(stripped)
+        if leading_spaces <= 0:
+            continue
+        unit = leading_spaces if unit == 0 else gcd(unit, leading_spaces)
+    return max(unit, 1) if unit else 4
+
+
+def _parse_architecture_tree_line(raw_line: str, *, plain_indent_unit: int = 4) -> tuple[int, str, bool] | None:
+    line = raw_line.expandtabs(4).rstrip()
     if not line.strip():
         return None
     connector_match = TREE_CONNECTOR_RE.match(line)
     if connector_match:
         depth = _tree_prefix_depth(str(connector_match.group("prefix") or ""))
         content = str(connector_match.group("content") or "")
+        has_connector = True
     else:
-        if line.lstrip().startswith(("|", "│")):
+        stripped = line.lstrip(" ")
+        if stripped.startswith(("|", "│", "├", "└")):
             return None
-        match = TREE_LINE_RE.match(line)
-        if not match:
-            return None
-        depth = _tree_prefix_depth(str(match.group("prefix") or ""))
-        content = str(match.group("content") or "")
-    content = re.split(r"\s+#", content, maxsplit=1)[0].strip()
+        leading_spaces = len(line) - len(stripped)
+        bullet_match = MARKDOWN_BULLET_RE.match(stripped)
+        depth = leading_spaces // max(plain_indent_unit, 1)
+        content = str(bullet_match.group("content") if bullet_match else stripped)
+        has_connector = False
+    content = _strip_tree_entry_content(content)
     if not content or content.startswith(("|", "│", "├", "└")):
         return None
-    return depth, content
+    return depth, content, has_connector
+
+
+def _parse_module_architecture_lines(tree_body: str) -> list[tuple[int, str, bool]]:
+    plain_indent_unit = _detect_plain_tree_indent_unit(tree_body)
+    parsed_lines = [
+        parsed
+        for raw_line in tree_body.splitlines()
+        if (parsed := _parse_architecture_tree_line(raw_line, plain_indent_unit=plain_indent_unit)) is not None
+    ]
+    if parsed_lines and not parsed_lines[0][2] and any(has_connector for _depth, _content, has_connector in parsed_lines[1:]):
+        return [(depth + 1 if has_connector else depth, content, has_connector) for depth, content, has_connector in parsed_lines]
+    return parsed_lines
+
+
+def _architecture_relative_paths(parsed_lines: list[tuple[int, str, bool]], *, skip_first: bool = False) -> list[Path]:
+    paths: list[Path] = []
+    stack: list[str] = []
+    depth_offset = _skipped_root_depth_offset(parsed_lines) if skip_first else 0
+    for index, parsed in enumerate(parsed_lines):
+        raw_depth, content, _has_connector = parsed
+        if index == 0 and skip_first:
+            stack = []
+            continue
+        depth = max(raw_depth - depth_offset, 0)
+        while len(stack) > depth:
+            stack.pop()
+        name = content.rstrip("/")
+        if not name:
+            continue
+        parent = stack[: min(depth, len(stack))]
+        paths.append(Path(*parent, name))
+        if content.endswith("/"):
+            stack = [*parent, name]
+    return paths
+
+
+def _skipped_root_depth_offset(parsed_lines: list[tuple[int, str, bool]]) -> int:
+    remaining_depths = [depth for depth, _content, _has_connector in parsed_lines[1:]]
+    return min(remaining_depths) if remaining_depths else 0
+
+
+def _relative_path_roots(paths: list[Path]) -> set[str]:
+    return {path.parts[0] for path in paths if path.parts}
+
+
+def _existing_root_score(project_root: Path, paths: list[Path]) -> int:
+    return sum(1 for root in _relative_path_roots(paths) if (project_root / root).exists())
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").casefold()).strip("-")
+
+
+def _should_skip_first_architecture_node(project_root: Path, parsed_lines: list[tuple[int, str, bool]]) -> bool:
+    if len(parsed_lines) < 2:
+        return False
+    first_depth, first_content, _first_has_connector = parsed_lines[0]
+    if first_depth != 0 or not first_content.endswith("/"):
+        return False
+
+    keep_paths = _architecture_relative_paths(parsed_lines, skip_first=False)
+    skip_paths = _architecture_relative_paths(parsed_lines, skip_first=True)
+    if not skip_paths:
+        return False
+
+    first_name = first_content.rstrip("/")
+    if _slug(first_name) == _slug(project_root.name):
+        return True
+
+    keep_existing = _existing_root_score(project_root, keep_paths)
+    skip_existing = _existing_root_score(project_root, skip_paths)
+    if skip_existing != keep_existing:
+        return skip_existing > keep_existing
+
+    keep_roots = _relative_path_roots(keep_paths)
+    skip_roots = _relative_path_roots(skip_paths)
+    if len(keep_roots) == 1 and len(skip_roots) > 1 and not (project_root / first_name).exists():
+        return True
+    return False
 
 
 def _create_scaffold_from_module_architecture(project_root: Path) -> None:
@@ -207,28 +332,32 @@ def _create_scaffold_from_module_architecture(project_root: Path) -> None:
     if not tree_body:
         return
 
+    parsed_lines = _parse_module_architecture_lines(tree_body)
+    if not parsed_lines:
+        return
+
+    skip_first_tree_root = _should_skip_first_architecture_node(project_root, parsed_lines)
+
     stack: list[str] = []
-    saw_tree_root = False
-    for raw_line in tree_body.splitlines():
-        parsed = _parse_architecture_tree_line(raw_line)
-        if parsed is None:
-            continue
-        depth, content = parsed
-        if content.endswith("/") and depth == 0 and not saw_tree_root:
-            saw_tree_root = True
+    depth_offset = _skipped_root_depth_offset(parsed_lines) if skip_first_tree_root else 0
+    for index, parsed in enumerate(parsed_lines):
+        raw_depth, content, _has_connector = parsed
+        if index == 0 and skip_first_tree_root:
             stack = []
             continue
+        depth = max(raw_depth - depth_offset, 0)
         while len(stack) > depth:
             stack.pop()
         is_dir = content.endswith("/")
         name = content.rstrip("/")
         if not name:
             continue
-        relative = Path(*stack, name)
+        parent = stack[: min(depth, len(stack))]
+        relative = Path(*parent, name)
         target = project_root / relative
         if is_dir:
             target.mkdir(parents=True, exist_ok=True)
-            stack = [*stack[:depth], name]
+            stack = [*parent, name]
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.name in {"__init__.py", ".gitkeep"} and not target.exists():

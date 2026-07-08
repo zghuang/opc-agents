@@ -1525,6 +1525,121 @@ def test_import_task_review_repeated_machine_precondition_blocks_without_consumi
     assert second_state["escalation"]["kind"] == "repeated_machine_precondition"
     assert second_state.get("review_repair_limit_reached") is not True
 
+def test_access_control_surface_detection_covers_common_policy_models() -> None:
+    from delivery.loop_review import _task_owns_auth_or_rbac_surface
+    from delivery.task import Task
+
+    cases = [
+        {"title": "ABAC policy engine", "output_paths": ["backend/app/governance/abac.py"]},
+        {"title": "Attribute Based Access Control", "output_paths": ["backend/app/security/policies.py"]},
+        {"title": "ACL permissions", "output_paths": ["backend/app/governance/acl.py"]},
+        {"title": "IAM and OIDC integration", "output_paths": ["backend/app/governance/identity_provider.py"]},
+        {"title": "SAML SSO login", "output_paths": ["backend/app/governance/sso.py"]},
+        {"title": "JWT claims and scopes", "output_paths": ["backend/app/api/deps.py"]},
+        {"title": "Tenant isolation and row-level security", "output_paths": ["backend/app/governance/tenant.py"]},
+        {"title": "Roles and permissions", "output_paths": ["backend/app/models/rbac.py"]},
+    ]
+
+    for index, row in enumerate(cases):
+        task = Task.from_dict(
+            {
+                "id": f"T{index + 10:03d}",
+                "title": row["title"],
+                "status": "pending",
+                "requirements": [],
+                "acceptance_scenarios": [],
+                "dependencies": [],
+                "output_tests": [],
+                "output_paths": row["output_paths"],
+            }
+        )
+        assert _task_owns_auth_or_rbac_surface(task), row["title"]
+
+def test_import_task_review_defers_security_precondition_to_later_security_task(tmp_path: Path, monkeypatch) -> None:
+    from delivery import loop_review
+    from delivery.loop_review import import_task_review
+    from delivery.task import all_tasks, mark_task, save_tasks
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T014",
+                    "title": "External Mock Services and Inbound Webhook",
+                    "status": "review_pending",
+                    "requirements": ["REQ-014"],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T002"],
+                    "output_tests": ["mock-server/tests/test_contracts.py"],
+                    "output_paths": ["mock-server/routers/erp_api.py", "backend/app/api/v1/inbound.py"],
+                    "status_session_id": "ses-1",
+                },
+                {
+                    "id": "T015",
+                    "title": "Governance, Security, and Observability",
+                    "status": "pending",
+                    "requirements": ["REQ-015"],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T002"],
+                    "output_tests": ["backend/tests/test_governance/test_rbac.py"],
+                    "output_paths": ["backend/app/governance/auth.py", "backend/app/governance/rbac.py"],
+                    "intent": {
+                        "objective": "Implement authentication, RBAC, roles, permissions, and tenant security.",
+                    },
+                },
+            ],
+        },
+    )
+    errors = [
+        "production semantic finding in task-changed path: production-stub backend/app/api/v1/inbound.py: Production route returns static literal/default data.",
+        "production semantic finding in task-changed path: security-access-control backend/app/api/v1/inbound.py: FastAPI route module exposes non-health routes without visible authentication or access-control dependency.",
+    ]
+    monkeypatch.setattr(loop_review, "_review_pass_precondition_errors", lambda project_root, task: errors)
+    monkeypatch.setattr(loop_review, "git_commit_task", lambda *args, **kwargs: "commit-ok")
+    monkeypatch.setattr(loop_review, "git_commit_explicit_paths", lambda *args, **kwargs: "commit-ok")
+    review_payload = {
+        "status": "pass",
+        "summary": "External review accepts the implementation.",
+        "findings": [],
+        "requirement_assessment": [{"id": "REQ-014", "status": "pass", "notes": "ok"}],
+        "acceptance_assessment": [],
+    }
+
+    first_result = import_task_review(tmp_path, "T014", review_payload, tmp_path / "review-1.json")
+    first_item = all_tasks(tmp_path)[0]
+    first_state = load_task_runtime_state(tmp_path, "T014")
+    assert first_result == 2
+    assert first_item.status == "pending"
+    assert first_state["machine_precondition_repeat_count"] == 0
+
+    save_tasks(tmp_path, mark_task(all_tasks(tmp_path), "T014", "review_pending", status_session_id="ses-2"))
+    second_result = import_task_review(tmp_path, "T014", review_payload, tmp_path / "review-2.json")
+    second_item = all_tasks(tmp_path)[0]
+    second_state = load_task_runtime_state(tmp_path, "T014")
+    assert second_result == 2
+    assert second_item.status == "pending"
+    assert second_state["focused_repair"]["kind"] == "repeated_machine_precondition_family"
+    assert second_state["machine_precondition_repeat_count"] == 1
+
+    save_tasks(tmp_path, mark_task(all_tasks(tmp_path), "T014", "review_pending", status_session_id="ses-3"))
+    third_result = import_task_review(tmp_path, "T014", review_payload, tmp_path / "review-3.json")
+    third_item = all_tasks(tmp_path)[0]
+    third_state = load_task_runtime_state(tmp_path, "T014")
+    assert third_result == 0
+    assert third_item.status == "verified"
+    assert third_item.review_status == "pass"
+    assert third_state["semantic_review_deferred_for_progress"] is True
+
+    review_text = (tmp_path / "docs" / "reviews" / "code-review-T014.md").read_text(encoding="utf-8")
+    assert "## Deferred Semantic Risk" in review_text
+    risk_register = json.loads((tmp_path / "docs" / "reviews" / "semantic-risk-register.json").read_text(encoding="utf-8"))
+    assert risk_register["risks"][0]["task_id"] == "T014"
+
 def test_import_task_review_third_auth_machine_precondition_passes_with_semantic_risk(tmp_path: Path, monkeypatch) -> None:
     from delivery import loop_review
     from delivery.loop_review import import_task_review

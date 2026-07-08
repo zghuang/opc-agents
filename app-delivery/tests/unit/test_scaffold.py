@@ -197,6 +197,79 @@ def test_scaffold_project_creates_directory_skeleton_from_module_architecture(tm
     assert (project_root / "docs" / "modules" / ".gitkeep").is_file()
 
 
+def test_scaffold_project_creates_skeleton_from_unwrapped_indented_module_architecture(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    project_root = tmp_path / "project"
+    template_root.mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True, exist_ok=True)
+    (project_root / "docs" / "architecture.md").write_text(
+        "# Architecture\n\n## 3. Module Architecture\n\n```text\nbackend/\n  app/\n    main.py\n    config.py\n    models/\n    api/v1/\nmock-server/\n  routers/\nfrontend/\n  src/\n    app/\n    pages/\n    components/\n```\n",
+        encoding="utf-8",
+    )
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    assert (project_root / "backend" / "app" / "models").is_dir()
+    assert (project_root / "backend" / "app" / "api" / "v1").is_dir()
+    assert (project_root / "mock-server" / "routers").is_dir()
+    assert (project_root / "frontend" / "src" / "app").is_dir()
+    assert (project_root / "frontend" / "src" / "pages").is_dir()
+    assert not (project_root / "app").exists()
+    assert not (project_root / "src").exists()
+
+
+def test_scaffold_project_parses_arbitrary_fenced_module_architecture_language(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    project_root = tmp_path / "service-suite"
+    template_root.mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True, exist_ok=True)
+    (project_root / "docs" / "architecture.md").write_text(
+        "# Architecture\n\n## Module Architecture\n\n```tree\nservice-suite/\n  packages/\n    api/\n    web/\n  ops/\n```\n",
+        encoding="utf-8",
+    )
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    assert (project_root / "packages" / "api").is_dir()
+    assert (project_root / "packages" / "web").is_dir()
+    assert (project_root / "ops").is_dir()
+    assert not (project_root / "service-suite").exists()
+
+
+def test_scaffold_project_parses_unfenced_markdown_list_module_architecture(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    project_root = tmp_path / "fulfillment"
+    template_root.mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True, exist_ok=True)
+    (project_root / "docs" / "architecture.md").write_text(
+        "# Architecture\n\n## Module Architecture\n\n- fulfillment/\n  - services/\n    - api/\n  - workers/\n\n## Data Model\n\nNothing here should be scaffolded.\n",
+        encoding="utf-8",
+    )
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    assert (project_root / "services" / "api").is_dir()
+    assert (project_root / "workers").is_dir()
+    assert not (project_root / "fulfillment").exists()
+    assert not (project_root / "Nothing here should be scaffolded.").exists()
+
+
+def test_scaffold_project_preserves_single_unwrapped_module_root(tmp_path: Path) -> None:
+    template_root = tmp_path / "template"
+    project_root = tmp_path / "project"
+    template_root.mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True, exist_ok=True)
+    (project_root / "docs" / "architecture.md").write_text(
+        "# Architecture\n\n## Module Architecture\n\n```\nbackend/\n  app/\n    services/\n```\n",
+        encoding="utf-8",
+    )
+
+    scaffold_project(project_root, template_root=template_root, mock_server_root=tmp_path / "missing-mock")
+
+    assert (project_root / "backend" / "app" / "services").is_dir()
+    assert not (project_root / "app" / "services").exists()
+
+
 def test_scaffold_project_parses_ascii_tree_without_literal_tree_marker_dirs(tmp_path: Path) -> None:
     template_root = tmp_path / "template"
     project_root = tmp_path / "project"

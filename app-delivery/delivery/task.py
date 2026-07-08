@@ -139,6 +139,17 @@ def _dedupe_preserve(values: list[str]) -> list[str]:
     return ordered
 
 
+def normalize_intent_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return _dedupe_preserve([value])
+    if not isinstance(value, list):
+        return []
+    raw_values = [str(row).strip() for row in value if str(row).strip()]
+    if len(raw_values) >= 8 and all(len(row) == 1 for row in raw_values):
+        return ["".join(raw_values)]
+    return _dedupe_preserve(raw_values)
+
+
 def _normalize_intent(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -148,8 +159,7 @@ def _normalize_intent(payload: Any) -> dict[str, Any]:
         if value:
             normalized[key] = value
     for key in ("done_when", "non_goals"):
-        values = [str(value).strip() for value in payload.get(key, []) if str(value).strip()]
-        deduped = _dedupe_preserve(values)
+        deduped = normalize_intent_list(payload.get(key))
         if deduped:
             normalized[key] = deduped
     split_justification = str(payload.get("split_justification") or "").strip()
@@ -674,11 +684,6 @@ def _validate_dependency_graph(tasks: list[Task]) -> None:
 
 def _validate_task_shape(tasks: list[Task]) -> None:
     oversized: list[str] = []
-    delivery_tasks = [task for task in tasks if not _is_framework_generated_task(task)]
-    if len(delivery_tasks) > 20:
-        oversized.append(
-            f"task graph has {len(delivery_tasks)} non-built-in tasks (>20); reassess whether this count is appropriate for the project size and module boundaries. Keep the tasks separate if each is a coherent independently testable slice; merge only where the merged task remains focused. Add intent.split_justification to any intentionally retained count-heavy boundary."
-        )
     for task in tasks:
         if _is_framework_generated_task(task):
             continue

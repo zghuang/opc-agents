@@ -8,7 +8,7 @@ from .builtin_task_prompts import render_frontend_api_audit_review_request, rend
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
 from .requirements_context import format_acceptance_context, format_requirement_context
 from .runtime_config import resolve_project_root
-from .task import FINAL_VERIFY_TASK_ID, Task
+from .task import FINAL_VERIFY_TASK_ID, Task, normalize_intent_list
 
 
 REVIEW_PROMPT_NOISE_PATHS = {
@@ -38,8 +38,8 @@ def _task_intent_fields(task: Task) -> tuple[str, str, list[str], list[str]]:
     return (
         str(intent.get("objective") or "").strip(),
         str(intent.get("journey") or "").strip(),
-        [str(value).strip() for value in intent.get("done_when", []) if str(value).strip()],
-        [str(value).strip() for value in intent.get("non_goals", []) if str(value).strip()],
+        normalize_intent_list(intent.get("done_when")),
+        normalize_intent_list(intent.get("non_goals")),
     )
 
 

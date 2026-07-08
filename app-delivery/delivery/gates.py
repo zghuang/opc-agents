@@ -47,10 +47,41 @@ def _safe_int(value: Any) -> int:
 def _validate_complexity_signal_consistency(tier: str, signals: dict[str, Any]) -> None:
     estimated_loc = _safe_int(signals.get("estimated_loc"))
     estimated_modules = _safe_int(signals.get("estimated_modules"))
-    estimated_tasks = _safe_int(signals.get("estimated_tasks"))
+    estimated_tasks = max(
+        _safe_int(signals.get("estimated_tasks")),
+        _safe_int(signals.get("generated_tasks")),
+        _safe_int(signals.get("task_count")),
+    )
+    total_requirements = _safe_int(signals.get("total_requirements"))
+    total_acceptance_scenarios = max(
+        _safe_int(signals.get("total_acceptance_scenarios")),
+        _safe_int(signals.get("acceptance_scenarios")),
+    )
+    external_system_integrations = max(
+        _safe_int(signals.get("external_system_integrations")),
+        _safe_int(signals.get("integration_count")),
+    )
+    unique_agent_types = _safe_int(signals.get("unique_agent_types"))
+    frontend_page_archetypes = max(
+        _safe_int(signals.get("frontend_page_archetypes")),
+        _safe_int(signals.get("ui_pages")),
+    )
+    state_machine_count = _safe_int(signals.get("state_machine_count"))
+    rbac_roles = _safe_int(signals.get("rbac_roles"))
+    memory_system_types = _safe_int(signals.get("memory_system_types"))
     minimum_tier = "S"
     reasons: list[str] = []
-    if estimated_loc >= 80000 or estimated_modules >= 10 or estimated_tasks >= 15:
+    if (
+        estimated_loc >= 80000
+        or estimated_modules >= 10
+        or estimated_tasks >= 15
+        or total_requirements >= 80
+        or total_acceptance_scenarios >= 15
+        or external_system_integrations >= 5
+        or unique_agent_types >= 4
+        or frontend_page_archetypes >= 6
+        or state_machine_count >= 4
+    ):
         minimum_tier = "L"
         if estimated_loc >= 80000:
             reasons.append(f"estimated_loc={estimated_loc} >= 80000")
@@ -58,7 +89,31 @@ def _validate_complexity_signal_consistency(tier: str, signals: dict[str, Any]) 
             reasons.append(f"estimated_modules={estimated_modules} >= 10")
         if estimated_tasks >= 15:
             reasons.append(f"estimated_tasks={estimated_tasks} >= 15")
-    elif estimated_loc >= 20000 or estimated_modules >= 5 or estimated_tasks >= 9:
+        if total_requirements >= 80:
+            reasons.append(f"total_requirements={total_requirements} >= 80")
+        if total_acceptance_scenarios >= 15:
+            reasons.append(f"total_acceptance_scenarios={total_acceptance_scenarios} >= 15")
+        if external_system_integrations >= 5:
+            reasons.append(f"external_system_integrations={external_system_integrations} >= 5")
+        if unique_agent_types >= 4:
+            reasons.append(f"unique_agent_types={unique_agent_types} >= 4")
+        if frontend_page_archetypes >= 6:
+            reasons.append(f"frontend_page_archetypes={frontend_page_archetypes} >= 6")
+        if state_machine_count >= 4:
+            reasons.append(f"state_machine_count={state_machine_count} >= 4")
+    elif (
+        estimated_loc >= 20000
+        or estimated_modules >= 5
+        or estimated_tasks >= 9
+        or total_requirements >= 30
+        or total_acceptance_scenarios >= 6
+        or external_system_integrations >= 3
+        or unique_agent_types >= 2
+        or frontend_page_archetypes >= 3
+        or state_machine_count >= 2
+        or rbac_roles >= 5
+        or memory_system_types >= 2
+    ):
         minimum_tier = "M"
         if estimated_loc >= 20000:
             reasons.append(f"estimated_loc={estimated_loc} >= 20000")
@@ -66,6 +121,22 @@ def _validate_complexity_signal_consistency(tier: str, signals: dict[str, Any]) 
             reasons.append(f"estimated_modules={estimated_modules} >= 5")
         if estimated_tasks >= 9:
             reasons.append(f"estimated_tasks={estimated_tasks} >= 9")
+        if total_requirements >= 30:
+            reasons.append(f"total_requirements={total_requirements} >= 30")
+        if total_acceptance_scenarios >= 6:
+            reasons.append(f"total_acceptance_scenarios={total_acceptance_scenarios} >= 6")
+        if external_system_integrations >= 3:
+            reasons.append(f"external_system_integrations={external_system_integrations} >= 3")
+        if unique_agent_types >= 2:
+            reasons.append(f"unique_agent_types={unique_agent_types} >= 2")
+        if frontend_page_archetypes >= 3:
+            reasons.append(f"frontend_page_archetypes={frontend_page_archetypes} >= 3")
+        if state_machine_count >= 2:
+            reasons.append(f"state_machine_count={state_machine_count} >= 2")
+        if rbac_roles >= 5:
+            reasons.append(f"rbac_roles={rbac_roles} >= 5")
+        if memory_system_types >= 2:
+            reasons.append(f"memory_system_types={memory_system_types} >= 2")
     rank = {"S": 0, "M": 1, "L": 2, "XL": 3}
     if rank[tier] < rank[minimum_tier]:
         raise ValueError(
