@@ -1467,6 +1467,54 @@ def test_review_preconditions_ignore_missing_changed_paths(tmp_path: Path, monke
 
     assert result == 0
 
+def test_execute_task_runtime_failure_does_not_record_current_head_as_task_commit(tmp_path: Path, monkeypatch) -> None:
+    from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
+    from delivery.task import Task
+
+    ensure_git_repo(tmp_path)
+    (tmp_path / "README.md").write_text("# demo\n", encoding="utf-8")
+    git(["add", "--", "README.md"], cwd=tmp_path)
+    git(["commit", "-m", "feat(T001): Previous task"], cwd=tmp_path)
+    previous_head = git_head_sha(tmp_path)
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Login", "status": "pending", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["tests/test_login.py"], "output_paths": ["backend/src/login/"]},
+            ],
+        },
+    )
+    loop = DeliveryLoop(tmp_path)
+
+    class DummySession:
+        id = "session-2"
+        runtime = "claude"
+        task_count = 0
+        created_at = "2026-06-24T00:00:00Z"
+        status = "active"
+        title = "Login"
+
+    monkeypatch.setattr(loop, "_session_for_task", lambda task: DummySession())
+    monkeypatch.setattr("delivery.loop.build_task_prompt", lambda project_root, task: "prompt")
+    monkeypatch.setattr(
+        "delivery.loop.execute_in_session",
+        lambda project_root, session, prompt: (_ for _ in ()).throw(RuntimeErrorResponse("runtime failed", "boom", session_id="session-2", kind="runtime_failed")),
+    )
+
+    success, state = loop._execute_task(Task("T002", "Login", "pending", ["REQ-001"], [], [], ["tests/test_login.py"], ["backend/src/login/"]))
+
+    assert success is False
+    assert state == "exception"
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    item = payload["items"][0]
+    assert item["status"] == "exception"
+    assert item["git_commit"] is None
+    assert item["git_commit"] != previous_head
+
 def test_import_task_review_repeated_machine_precondition_blocks_without_consuming_review_limit(tmp_path: Path, monkeypatch) -> None:
     from delivery import loop_review
     from delivery.loop_review import import_task_review

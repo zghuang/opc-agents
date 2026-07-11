@@ -3192,6 +3192,186 @@ def test_status_reports_verified_task_with_mock_only_browser_e2e_as_invalid(tmp_
         "T002": "frontend/e2e/case.spec.ts:3 page.route for project-owned API calls uses route.fulfill without route.fetch/route.continue/route.fallback passthrough; mocked browser proof is not real backend E2E evidence"
     }
 
+def test_status_reports_verified_task_with_latest_failed_validation_as_invalid(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.loop_gitops.git_commit_timestamp", lambda project_root, commit: "2026-06-24T00:00:00Z")
+    docs_dir = tmp_path / "docs" / "reviews"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "exception-report-T020.md").write_text("status: exception\n", encoding="utf-8")
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "results": [
+                {
+                    "task_id": "T020",
+                    "timestamp": "2026-07-07T15:57:21Z",
+                    "test_files": ["frontend/e2e/ai-interaction.spec.ts"],
+                    "test_types": ["browser", "e2e", "integration"],
+                    "requirement_ids": ["REQ-056"],
+                    "passed": False,
+                    "passed_count": 0,
+                    "failed_count": 1,
+                    "failures": [{"test": "frontend/e2e/ai-interaction.spec.ts", "message": "Docker daemon unavailable"}],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {},
+        },
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T020",
+                    "title": "UI Integration and AI Interaction Validation",
+                    "status": "verified",
+                    "git_commit": "abc123",
+                    "review_status": None,
+                    "review_artifact": "docs/reviews/exception-report-T020.md",
+                    "blocked_reason": "[stalled_runtime] runtime liveness stalled",
+                    "requirements": ["REQ-056"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["frontend/e2e/ai-interaction.spec.ts"],
+                    "output_paths": ["docs/reviews/ui-ai-workbench-validation.md"],
+                },
+            ],
+        },
+    )
+
+    payload = loop_status(tmp_path)
+
+    assert payload["invalid_verified_tasks"] == {
+        "T020": "latest task validation failed at 2026-07-07T15:57:21Z; report=docs/reviews/test-report-T020.md"
+    }
+
+def test_status_reports_verified_task_with_mismatched_task_commit_as_invalid(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.loop_gitops.git_commit_timestamp", lambda project_root, commit: "2026-06-24T00:00:00Z")
+    monkeypatch.setattr("delivery.loop_gitops.git_commit_subject", lambda project_root, commit: "feat(T019): Agent Integration Validation")
+    docs_dir = tmp_path / "docs" / "reviews"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "code-review-T020.md").write_text("status: pass\n", encoding="utf-8")
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "results": [
+                {
+                    "task_id": "T020",
+                    "timestamp": "2026-07-07T15:46:12Z",
+                    "test_files": ["frontend/e2e/ai-interaction.spec.ts"],
+                    "test_types": ["browser", "e2e", "integration"],
+                    "requirement_ids": ["REQ-056"],
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                    "failures": [],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {},
+        },
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T020",
+                    "title": "UI Integration and AI Interaction Validation",
+                    "status": "verified",
+                    "git_commit": "ec3c6f18f7d069eaa69b57661909b534c06c887e",
+                    "review_status": "pass",
+                    "review_artifact": "docs/reviews/code-review-T020.md",
+                    "requirements": ["REQ-056"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["frontend/e2e/ai-interaction.spec.ts"],
+                    "output_paths": ["docs/reviews/ui-ai-workbench-validation.md"],
+                },
+            ],
+        },
+    )
+
+    payload = loop_status(tmp_path)
+
+    assert payload["invalid_verified_tasks"] == {
+        "T020": "task commit subject does not match task id: ec3c6f18f7d069eaa69b57661909b534c06c887e has subject 'feat(T019): Agent Integration Validation'"
+    }
+
+def test_status_does_not_allow_final_ready_or_claim_with_invalid_verified_task(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("delivery.loop_gitops.git_commit_timestamp", lambda project_root, commit: "2026-06-24T00:00:00Z")
+    docs_dir = tmp_path / "docs" / "reviews"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "exception-report-T020.md").write_text("status: exception\n", encoding="utf-8")
+    save_test_results(
+        tmp_path,
+        {
+            "schema_version": "1",
+            "project": "demo",
+            "results": [
+                {
+                    "task_id": "T020",
+                    "timestamp": "2026-07-07T15:57:21Z",
+                    "test_files": ["frontend/e2e/ai-interaction.spec.ts"],
+                    "test_types": ["browser", "e2e", "integration"],
+                    "requirement_ids": ["REQ-056"],
+                    "passed": False,
+                    "passed_count": 0,
+                    "failed_count": 1,
+                    "failures": [{"test": "frontend/e2e/ai-interaction.spec.ts", "message": "Docker daemon unavailable"}],
+                    "attempt": 1,
+                }
+            ],
+            "full_suite_results": {"passed": True},
+        },
+    )
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T020", "title": "UI Validation", "status": "verified", "git_commit": "abc123", "review_artifact": "docs/reviews/exception-report-T020.md", "requirements": ["REQ-056"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/ai-interaction.spec.ts"], "output_paths": ["docs/reviews/ui-ai-workbench-validation.md"]},
+                {"id": FINAL_VERIFY_TASK_ID, "title": "Final", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T020"], "output_tests": [], "output_paths": ["docs/release-evidence.md"]},
+            ],
+        },
+    )
+
+    pending_final_payload = loop_status(tmp_path)
+
+    assert pending_final_payload["final_verify_ready"] is False
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T020", "title": "UI Validation", "status": "verified", "git_commit": "abc123", "review_artifact": "docs/reviews/exception-report-T020.md", "requirements": ["REQ-056"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["frontend/e2e/ai-interaction.spec.ts"], "output_paths": ["docs/reviews/ui-ai-workbench-validation.md"]},
+                {"id": FINAL_VERIFY_TASK_ID, "title": "Final", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T020"], "output_tests": [], "output_paths": ["docs/release-evidence.md"]},
+            ],
+        },
+    )
+
+    verified_final_payload = cli.project_summary(tmp_path)
+
+    assert verified_final_payload["delivery_claim_allowed"] is False
+
 def test_routed_status_reports_invalid_verified_task_without_blocking_next_task(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("delivery.loop_gitops.git_commit_timestamp", lambda project_root, commit: "2026-06-24T00:00:00Z")
     monkeypatch.setattr("delivery.control_plane._planning_blocker_code", lambda project_root: None)

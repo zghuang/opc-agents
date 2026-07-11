@@ -12,7 +12,7 @@ from typing import Any
 from .runtime_config import load_project_runtime
 from .production_semantics import mock_only_browser_e2e_issues
 from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
-from .state import load_test_results
+from .state import load_task_runtime_state, load_test_results
 from .task import FINAL_VERIFY_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, SCAFFOLD_OUTPUT_PATHS, Task, reset_task
 from .verify import is_path_test_spec
 
@@ -74,6 +74,12 @@ RUNTIME_PROTECTED_FRAMEWORK_ARTIFACT_PREFIXES = (
 )
 
 RUNTIME_PROTECTED_TASK_TEST_REPORT_RE = re.compile(r"^docs/reviews/test-report-T[A-Za-z0-9_-]+\.md$")
+
+BLOCKING_VERIFIED_TASK_ISSUE_CODES = {
+    "latest_validation_failed",
+    "exception_review_artifact",
+    "commit_subject_mismatch",
+}
 
 T000_ONLY_FRAMEWORK_PREFIXES = (
     ".app-delivery-runtime/stage-inputs/",
@@ -197,7 +203,45 @@ def _review_file_status(review_path: Path) -> str | None:
     return None
 
 
-def verified_task_issue(project_root: Path | str, task: Task) -> str | None:
+def _latest_task_test_result(project_root: Path | str, task_id: str) -> dict[str, Any] | None:
+    payload = load_test_results(project_root)
+    rows = payload.get("results") if isinstance(payload.get("results"), list) else []
+    normalized_task_id = str(task_id or "").strip()
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("task_id") or "").strip() == normalized_task_id:
+            return row
+    return None
+
+
+def _has_manual_accept_override(project_root: Path | str, task_id: str) -> bool:
+    runtime_state = load_task_runtime_state(project_root, task_id)
+    override = runtime_state.get("manual_override") if isinstance(runtime_state.get("manual_override"), dict) else {}
+    return str(override.get("action") or "").strip() == "accept"
+
+
+def _task_commit_subject_matches(task_id: str, subject: str) -> bool:
+    normalized_task_id = str(task_id or "").strip()
+    normalized_subject = str(subject or "").strip()
+    prefixes = [f"feat({normalized_task_id}):"]
+    if normalized_task_id == "T000":
+        prefixes.insert(0, f"chore({normalized_task_id}):")
+    return any(normalized_subject.startswith(prefix) for prefix in prefixes)
+
+
+class VerifiedTaskIssue(str):
+    def __new__(cls, code: str, message: str) -> "VerifiedTaskIssue":
+        obj = str.__new__(cls, message)
+        obj.code = str(code or "").strip()
+        return obj
+
+
+def is_blocking_verified_task_issue(issue: str) -> bool:
+    return str(getattr(issue, "code", "") or "").strip() in BLOCKING_VERIFIED_TASK_ISSUE_CODES
+
+
+def _verified_task_issue(project_root: Path | str, task: Task) -> VerifiedTaskIssue | None:
     if task.status != "verified":
         return None
     project_dir = Path(project_root).expanduser().resolve()
@@ -205,33 +249,56 @@ def verified_task_issue(project_root: Path | str, task: Task) -> str | None:
         final_review_path = project_dir / "docs" / "reviews" / "final-review.md"
         final_review_status = str(_review_file_status(final_review_path) or "").strip().casefold()
         if final_review_status != "pass":
-            return "missing pass final review evidence"
+            return VerifiedTaskIssue("missing_final_review", "missing pass final review evidence")
         if not (project_dir / "docs" / "release-evidence.md").exists():
-            return "missing release evidence"
+            return VerifiedTaskIssue("missing_release_evidence", "missing release evidence")
         full_suite = load_test_results(project_root).get("full_suite_results")
         if not isinstance(full_suite, dict) or not bool(full_suite.get("passed")):
-            return "missing passing full-suite evidence"
+            return VerifiedTaskIssue("missing_full_suite_evidence", "missing passing full-suite evidence")
         return None
 
+    manual_accept = _has_manual_accept_override(project_root, task.id)
+    latest_result = _latest_task_test_result(project_root, task.id)
+    if not manual_accept and latest_result is not None and not bool(latest_result.get("passed")):
+        timestamp = str(latest_result.get("timestamp") or "unknown").strip() or "unknown"
+        return VerifiedTaskIssue(
+            "latest_validation_failed",
+            f"latest task validation failed at {timestamp}; report=docs/reviews/test-report-{task.id}.md",
+        )
+    review_artifact_value = str(task.review_artifact or "").strip()
+    if not manual_accept and review_artifact_value.startswith("docs/reviews/exception-report-"):
+        return VerifiedTaskIssue("exception_review_artifact", f"verified task points to exception report: {review_artifact_value}")
     commit_ok = bool(task.git_commit and git_commit_timestamp(project_root, task.git_commit))
+    if commit_ok and not manual_accept and task.id != "T000":
+        subject = git_commit_subject(project_root, task.git_commit or "")
+        if subject and not _task_commit_subject_matches(task.id, subject):
+            return VerifiedTaskIssue(
+                "commit_subject_mismatch",
+                f"task commit subject does not match task id: {task.git_commit} has subject '{subject}'",
+            )
     review_status_value, review_artifact = review_artifact_status(project_root, task.id)
     review_ok = bool(review_artifact) and str(review_status_value or "").strip().casefold() == "pass"
     semantic_issues = mock_only_browser_e2e_issues(project_root, task.output_tests)
     if semantic_issues:
-        return semantic_issues[0]
+        return VerifiedTaskIssue("mock_only_browser_e2e", semantic_issues[0])
     if commit_ok and review_ok:
         return None
     if not commit_ok and not review_ok:
-        return "missing task commit and pass code review evidence"
+        return VerifiedTaskIssue("missing_task_commit_and_review", "missing task commit and pass code review evidence")
     if not commit_ok:
-        return "missing task commit evidence"
-    return "missing pass code review evidence"
+        return VerifiedTaskIssue("missing_task_commit", "missing task commit evidence")
+    return VerifiedTaskIssue("missing_code_review", "missing pass code review evidence")
+
+
+def verified_task_issue(project_root: Path | str, task: Task) -> str | None:
+    issue = _verified_task_issue(project_root, task)
+    return str(issue) if issue is not None else None
 
 
 def repair_invalid_verified_tasks(project_root: Path | str, tasks: list[Task]) -> tuple[list[Task], dict[str, str]]:
     issues: dict[str, str] = {}
     for task in tasks:
-        issue = verified_task_issue(project_root, task)
+        issue = _verified_task_issue(project_root, task)
         if not issue:
             continue
         issues[task.id] = issue

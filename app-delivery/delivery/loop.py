@@ -738,7 +738,7 @@ class DeliveryLoop:
     def _execute_task(self, task: Task) -> tuple[bool, str]:
         session = self._session_for_task(task)
         tasks = all_tasks(self.project_root)
-        tasks = mark_task(tasks, task.id, "active", status_session_id=session.id, git_commit=git_head_sha(self.project_root), blocked_reason=None)
+        tasks = mark_task(tasks, task.id, "active", status_session_id=session.id, git_commit=None, blocked_reason=None)
         save_tasks(self.project_root, tasks)
         try:
             if task.id == SHARED_FOUNDATION_TASK_ID:

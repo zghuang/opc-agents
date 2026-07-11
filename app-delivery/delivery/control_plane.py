@@ -8,6 +8,7 @@ from typing import Any
 from .control_plane_host import build_planning_host_step, build_review_host_step
 from .errors import DeliveryError
 from .loop import PAUSE_FILE
+from .loop_gitops import is_blocking_verified_task_issue
 from .loop_reporting import status as runtime_status
 from .project_readiness import (
     architecture_ready,
@@ -231,7 +232,10 @@ def routed_status(project_root: Path | str, *, requirements_path: str | None = N
         for task in tasks
         if task.id != FINAL_VERIFY_TASK_ID and task.status != "cancelled" and getattr(task, "task_kind", "feature") != "repair"
     ]
-    all_actionable_verified = bool(actionable) and all(task.status == "verified" for task in actionable)
+    invalid_verified_task_ids = {
+        task_id for task_id, issue in invalid_verified.items() if is_blocking_verified_task_issue(issue)
+    }
+    all_actionable_verified = bool(actionable) and all(task.status == "verified" and task.id not in invalid_verified_task_ids for task in actionable)
     final_task = task_by_id.get(FINAL_VERIFY_TASK_ID)
     final_task_status = final_task.status if final_task is not None else None
     final_runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_dir, FINAL_VERIFY_TASK_ID))

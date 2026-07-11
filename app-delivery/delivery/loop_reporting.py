@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .gates import refresh_gates
-from .loop_gitops import repair_invalid_verified_tasks
+from .loop_gitops import is_blocking_verified_task_issue, repair_invalid_verified_tasks
 from .runtime_liveness import running_runtime_task_payload, runtime_attention_payload
 from .runtime_config import resolve_project_root
 from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
@@ -888,10 +888,11 @@ def _requirements_source_archived(project_root: Path) -> bool:
     return any(path.is_file() for path in docs_dir.glob("requirements-source.*"))
 
 
-def _delivery_claim_allowed(tasks: list[Any]) -> bool:
+def _delivery_claim_allowed(tasks: list[Any], invalid_verified_task_ids: set[str] | None = None) -> bool:
+    invalid_ids = set(invalid_verified_task_ids or set())
     actionable = [task for task in tasks if task.id != FINAL_VERIFY_TASK_ID and task.status != "cancelled"]
     final_task = next((task for task in tasks if task.id == FINAL_VERIFY_TASK_ID), None)
-    return final_task is not None and final_task.status == "verified" and not any(
+    return final_task is not None and final_task.status == "verified" and not invalid_ids and not any(
         task.status in {"pending", "active", "review_pending", "blocked", "exception"}
         for task in actionable
     )
@@ -1147,12 +1148,15 @@ def status(project_root: Path | str) -> dict[str, Any]:
     for task in display_tasks:
         by_status[task.status] = by_status.get(task.status, 0) + 1
     next_task = pick_next_task(display_tasks)
+    invalid_verified_task_ids = {
+        task_id for task_id, issue in invalid_verified.items() if is_blocking_verified_task_issue(issue)
+    }
     actionable = [
         task
         for task in display_tasks
         if task.id != FINAL_VERIFY_TASK_ID and task.status != "cancelled" and getattr(task, "task_kind", "feature") != "repair"
     ]
-    all_actionable_verified = bool(actionable) and all(task.status == "verified" for task in actionable)
+    all_actionable_verified = bool(actionable) and all(task.status == "verified" and task.id not in invalid_verified_task_ids for task in actionable)
     final_task = next((task for task in display_tasks if task.id == FINAL_VERIFY_TASK_ID), None)
     review_pending_task = next((task for task in display_tasks if task.status == "review_pending"), None)
     active_payload = _active_task_payload(project_dir, display_tasks)
@@ -1239,6 +1243,10 @@ def project_summary(project_root: Path | str) -> dict[str, Any]:
     project_dir = resolve_project_root(project_root)
     tasks = all_tasks(project_dir)
     status_payload = status(project_dir)
+    invalid_verified = status_payload.get("invalid_verified_tasks") if isinstance(status_payload.get("invalid_verified_tasks"), dict) else {}
+    invalid_verified_task_ids = {
+        task_id for task_id, issue in invalid_verified.items() if is_blocking_verified_task_issue(issue)
+    }
     requirement_ids = load_requirement_ids(project_dir)
     planned_covered: set[str] = set()
     for task in tasks:
@@ -1291,8 +1299,8 @@ def project_summary(project_root: Path | str) -> dict[str, Any]:
         "generated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "project": str(project_dir),
         "counts": status_payload["counts"],
-        "control_status_hint": "complete" if _delivery_claim_allowed(tasks) else "not_ready",
-        "delivery_claim_allowed": _delivery_claim_allowed(tasks),
+        "control_status_hint": "complete" if _delivery_claim_allowed(tasks, invalid_verified_task_ids) else "not_ready",
+        "delivery_claim_allowed": _delivery_claim_allowed(tasks, invalid_verified_task_ids),
         "paused": status_payload["paused"],
         "next_task": status_payload["next_task"],
         "review_pending_task": status_payload.get("review_pending_task"),
