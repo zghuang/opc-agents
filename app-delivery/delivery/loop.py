@@ -611,6 +611,9 @@ def recover(project_root: Path | str) -> list[Task]:
                 "review_artifact": review_artifact,
                 "reviewed_at": task.reviewed_at or commit_ts,
                 "verified_at": task.verified_at or commit_ts,
+                "verification_source": "reconcile_review_evidence",
+                "verification_actor": "framework",
+                "verification_reason": "reconciled existing pass review and task-owned commit",
                 "blocked_reason": None,
                 "attempts": max(task.attempts, 1),
             }
@@ -859,6 +862,9 @@ class DeliveryLoop:
                 review_artifact=review_artifact,
                 reviewed_at=utc_now_iso(),
                 git_commit=commit_sha,
+                verification_source="builtin_scaffold",
+                verification_actor="framework",
+                verification_reason="built-in scaffold completed and passed deterministic review",
                 blocked_reason=None,
                 attempts=1,
             )
@@ -1387,6 +1393,9 @@ class DeliveryLoop:
                     review_status="pass",
                     review_artifact="docs/reviews/final-review.md",
                     reviewed_at=utc_now_iso(),
+                    verification_source="final_verification",
+                    verification_actor="framework",
+                    verification_reason="full verification and pass final review evidence",
                     blocked_reason=None,
                 )
             elif ready_for_final_review:

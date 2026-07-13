@@ -2067,6 +2067,13 @@ def cmd_task(args: argparse.Namespace) -> int:
             )
         now = utc_now_iso()
         if action == "accept":
+            save_task_runtime_state(
+                project_root,
+                task_id,
+                {
+                    "manual_override": {"action": "accept", "reason": reason, "actor": "host", "accepted_at": now},
+                },
+            )
             tasks = mark_task(
                 tasks,
                 task_id,
@@ -2074,6 +2081,9 @@ def cmd_task(args: argparse.Namespace) -> int:
                 review_status=task.review_status or "pass",
                 reviewed_at=task.reviewed_at or now,
                 verified_at=now,
+                verification_source="manual_accept",
+                verification_actor="host",
+                verification_reason=reason,
                 completed_at=task.completed_at or now,
                 blocked_reason=f"manual host acceptance: {reason}",
                 attempts=max(task.attempts, 1),
@@ -2083,7 +2093,6 @@ def cmd_task(args: argparse.Namespace) -> int:
                 project_root,
                 task_id,
                 {
-                    "manual_override": {"action": "accept", "reason": reason, "actor": "host", "accepted_at": now},
                     "review_repair_limit_reached": False,
                     "final_repair_limit_reached": False,
                     "review_changes_requested_count": 0,

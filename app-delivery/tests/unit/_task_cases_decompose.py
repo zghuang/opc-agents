@@ -66,6 +66,97 @@ def test_decompose_tasks_inserts_builtin_foundations(tmp_path: Path) -> None:
     assert payload["items"][1]["intent"]["objective"].startswith("Create the minimal shared")
     assert "Do not preinstall project-wide technology packages" in payload["items"][1]["intent"]["non_goals"][-1]
 
+
+def test_decompose_tasks_rejects_requirement_without_feature_owner(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "Policy", "summary": "Policy"}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="REQ-001"):
+        decompose_tasks(
+            tmp_path,
+            [
+                {
+                    "title": "Policy validation",
+                    "task_kind": "validation",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "output_tests": ["backend/tests/test_policy.py"],
+                    "output_paths": ["docs/reviews/policy.md"],
+                }
+            ],
+            include_shared_foundation=True,
+        )
+
+
+def test_decompose_tasks_allows_explicit_validation_only_requirement(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "Recovery check", "summary": "Recovery check", "implementation_required": False}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Recovery validation",
+                "task_kind": "validation",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": [],
+                "output_tests": ["backend/tests/test_recovery.py"],
+                "output_paths": ["docs/reviews/recovery.md"],
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    assert any(item["title"] == "Recovery validation" for item in payload["items"])
+
+
+def test_decompose_tasks_rejects_unowned_acceptance_scenario(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "Policy", "summary": "Policy"}],
+                "acceptance_scenarios": [{"id": "AS-001", "title": "Policy flow", "summary": "Policy flow", "source_requirement_ids": ["REQ-001"]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="AS-001"):
+        decompose_tasks(
+            tmp_path,
+            [
+                {
+                    "title": "Policy feature",
+                    "task_kind": "feature",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "output_tests": ["backend/tests/test_policy.py"],
+                    "output_paths": ["backend/app/policy.py"],
+                }
+            ],
+            include_shared_foundation=True,
+        )
+
 def test_decompose_tasks_preserves_normalized_task_intent(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)

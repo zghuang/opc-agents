@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from delivery.builtin_tasks import FINAL_VERIFY_TASK_ID, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
-from delivery.state import save_gates, save_test_plan, save_test_results, save_work_items
-from delivery.task import Task, check_requirements_coverage, check_test_type_coverage, decompose_tasks, lint_task_contract, mark_task, pick_next_task, referenced_req_ids, reset_task
+from delivery.state import save_gates, save_task_runtime_state, save_test_plan, save_test_results, save_work_items
+from delivery.task import Task, check_requirements_coverage, check_test_type_coverage, decompose_tasks, lint_task_contract, mark_task, pick_next_task, referenced_req_ids, reset_task, save_task_ledger, save_tasks
 from delivery.gates import normalize_complexity_override, normalize_stage_gates, refresh_gates, validate_validation_tasks, validate_gate_references
 
 
@@ -46,6 +46,292 @@ def test_mark_task_sets_verified_timestamp() -> None:
     updated = mark_task(tasks, "T001", "verified")
     assert updated[0].status == "verified"
     assert updated[0].verified_at is not None
+
+
+def test_save_tasks_rejects_unproven_verified_transition(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "exception",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/app/feature.py"],
+                    "review_status": "changes_requested",
+                    "review_artifact": "docs/reviews/exception-report-T002.md",
+                }
+            ],
+        },
+    )
+    stale = Task.from_dict(
+        {
+            "id": "T002",
+            "title": "Feature",
+            "status": "verified",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": ["backend/tests/test_feature.py"],
+            "output_paths": ["backend/app/feature.py"],
+            "review_status": "changes_requested",
+            "review_artifact": "docs/reviews/exception-report-T002.md",
+        }
+    )
+
+    with pytest.raises(ValueError, match="refusing invalid task transition T002"):
+        save_tasks(tmp_path, [stale])
+
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "exception"
+
+
+def test_save_tasks_allows_proven_code_review_transition(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "review_pending",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/app/feature.py"],
+                }
+            ],
+        },
+    )
+    accepted = Task.from_dict(
+        {
+            "id": "T002",
+            "title": "Feature",
+            "status": "verified",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": ["backend/tests/test_feature.py"],
+            "output_paths": ["backend/app/feature.py"],
+            "review_status": "pass",
+            "review_artifact": "docs/reviews/code-review-T002.md",
+            "git_commit": "abc123",
+            "verification_source": "code_review",
+            "verification_actor": "code_review",
+            "verification_reason": "independent code review passed",
+        }
+    )
+
+    save_tasks(tmp_path, [accepted])
+
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "verified"
+    task_log = (tmp_path / ".app-delivery-runtime" / "task-log.jsonl").read_text(encoding="utf-8")
+    assert '"message": "Verified task transition accepted"' in task_log
+    assert '"verification_source": "code_review"' in task_log
+
+
+def test_save_tasks_allows_manual_accept_transition(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "exception",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/app/feature.py"],
+                }
+            ],
+        },
+    )
+    accepted = Task.from_dict(
+        {
+            "id": "T002",
+            "title": "Feature",
+            "status": "verified",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": ["backend/tests/test_feature.py"],
+            "output_paths": ["backend/app/feature.py"],
+            "verification_source": "manual_accept",
+            "verification_actor": "host",
+            "verification_reason": "accept known external dependency",
+        }
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "manual_override": {
+                "action": "accept",
+                "actor": "host",
+                "reason": "accept known external dependency",
+                "accepted_at": "2026-06-24T00:00:00Z",
+            }
+        },
+    )
+
+    save_tasks(tmp_path, [accepted])
+
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "verified"
+
+
+def test_save_tasks_rejects_review_promotion_from_exception(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "exception",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/app/feature.py"],
+                }
+            ],
+        },
+    )
+    stale = Task.from_dict(
+        {
+            "id": "T002",
+            "title": "Feature",
+            "status": "verified",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": ["backend/tests/test_feature.py"],
+            "output_paths": ["backend/app/feature.py"],
+            "review_status": "pass",
+            "review_artifact": "docs/reviews/code-review-T002.md",
+            "git_commit": "abc123",
+            "verification_source": "code_review",
+            "verification_actor": "code_review",
+            "verification_reason": "independent code review passed",
+        }
+    )
+
+    with pytest.raises(ValueError, match="code_review is not valid from exception"):
+        save_tasks(tmp_path, [stale])
+
+
+def test_save_tasks_rejects_stale_verified_feature_regression(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "verified",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/app/feature.py"],
+                }
+            ],
+        },
+    )
+    stale = Task.from_dict(
+        {
+            "id": "T002",
+            "title": "Feature",
+            "status": "active",
+            "requirements": ["REQ-001"],
+            "acceptance_scenarios": [],
+            "dependencies": [],
+            "output_tests": ["backend/tests/test_feature.py"],
+            "output_paths": ["backend/app/feature.py"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="verified feature tasks cannot regress"):
+        save_tasks(tmp_path, [stale])
+
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "verified"
+
+
+def test_save_task_ledger_rejects_decompose_overwrite_of_verified_feature(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "verified",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/app/feature.py"],
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(ValueError, match="verified feature tasks cannot regress"):
+        save_task_ledger(
+            tmp_path,
+            {
+                "schema_version": "2",
+                "project": "demo",
+                "generated_at": "2026-06-24T00:01:00Z",
+                "last_updated_commit": "",
+                "items": [
+                    {
+                        "id": "T002",
+                        "title": "Feature",
+                        "status": "pending",
+                        "requirements": ["REQ-001"],
+                        "acceptance_scenarios": [],
+                        "dependencies": [],
+                        "output_tests": ["backend/tests/test_feature.py"],
+                        "output_paths": ["backend/app/feature.py"],
+                    }
+                ],
+            },
+        )
 
 def test_mark_task_accumulates_session_history() -> None:
     tasks = [Task("T001", "功能", "pending", [], [], [], [], [], task_kind="feature")]

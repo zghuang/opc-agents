@@ -42,7 +42,23 @@ def test_run_continues_after_task_exception_when_other_task_is_ready(tmp_path: P
         if task.id == "T001":
             save_tasks(tmp_path, mark_task(tasks, "T001", "exception", blocked_reason="need follow-up"))
             return (False, "exception")
-        save_tasks(tmp_path, mark_task(tasks, "T002", "verified", verified_at="2026-06-24T00:30:00Z"))
+        save_tasks(tmp_path, mark_task(tasks, "T002", "review_pending"))
+        tasks = all_tasks(tmp_path)
+        save_tasks(
+            tmp_path,
+            mark_task(
+                tasks,
+                "T002",
+                "verified",
+                verified_at="2026-06-24T00:30:00Z",
+                review_status="pass",
+                review_artifact="docs/reviews/code-review-T002.md",
+                git_commit="abc123",
+                verification_source="code_review",
+                verification_actor="code_review",
+                verification_reason="independent code review passed",
+            ),
+        )
         return (True, "verified")
 
     monkeypatch.setattr(loop, "_execute_task", fake_execute)

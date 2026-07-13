@@ -539,6 +539,48 @@ def test_cmd_decompose_rejects_uncovered_ui_route_mapping(tmp_path: Path) -> Non
     assert exc_info.value.code == "stage_output_invalid"
     assert "UI route mappings" in exc_info.value.message
 
+
+def test_cmd_decompose_rejects_broad_directory_only_ui_route_owner(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-055", "title": "Control Tower", "summary": "Control tower home"}], "acceptance_scenarios": []}), encoding="utf-8")
+    ui_dir = docs_dir / "ui"
+    ui_dir.mkdir(parents=True, exist_ok=True)
+    (ui_dir / "page-archetypes.md").write_text(
+        "## Route Mapping\n\n"
+        "| Page / Route | Source Requirements | Primary Roles | Required Regions / Components | States | Suggested Output Paths | Suggested Browser Tests |\n"
+        "|--------------|---------------------|---------------|--------------------------------|--------|------------------------|-------------------------|\n"
+        "| Control Tower | REQ-055 | Admin | KPI cards | loading | `frontend/src/admin/ControlTowerPage.tsx` | `frontend/e2e/control-tower.spec.ts` |\n",
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "decompose.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "delivery_complexity": {"tier": "S", "rationale": "Small", "signals": {}},
+                "validation_gates": [],
+                "items": [
+                    {
+                        "title": "Control Tower",
+                        "task_kind": "feature",
+                        "requirements": ["REQ-055"],
+                        "acceptance_scenarios": [],
+                        "dependencies": [],
+                        "technology_constraints": [],
+                        "output_tests": ["frontend/e2e/control-tower.spec.ts"],
+                        "output_paths": ["frontend/src/admin/"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert any("explicitly owned" in error for error in exc_info.value.details["ui_route_coverage_errors"])
+
 def test_cmd_decompose_rejects_items_missing_technology_constraints(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)

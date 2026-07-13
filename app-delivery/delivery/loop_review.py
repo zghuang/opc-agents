@@ -901,6 +901,9 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
             review_artifact=review_artifact,
             reviewed_at=reviewed_at,
             verified_at=reviewed_at,
+            verification_source="code_review",
+            verification_actor="code_review",
+            verification_reason="independent code review passed",
             blocked_reason=None,
             attempts=max(task.attempts, 1),
         )
@@ -1178,6 +1181,9 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
                 review_artifact=review_artifact,
                 reviewed_at=reviewed_at,
                 verified_at=reviewed_at,
+                verification_source="code_review_deferred_acceptance",
+                verification_actor="code_review",
+                verification_reason="independent review passed with documented acceptance deferral",
                 blocked_reason=(
                     "verified with deferred acceptance scenario assignment; "
                     f"see {deferral_artifacts[1]}"
@@ -1400,6 +1406,9 @@ def import_final_review(project_root: Path | str, payload: dict[str, Any], input
             review_artifact=review_artifact,
             reviewed_at=reviewed_at,
             verified_at=reviewed_at,
+            verification_source="final_review",
+            verification_actor="final_review",
+            verification_reason="independent final review passed",
             blocked_reason=None,
         )
         save_tasks(project_dir, tasks)
