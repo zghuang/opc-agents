@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .builtin_tasks import FRONTEND_API_AUDIT_REPORT_PATH, PREFINAL_AUDIT_REPORT_PATH
+from .builtin_tasks import (
+    FRONTEND_API_AUDIT_REPORT_PATH,
+    PREFINAL_AUDIT_REPORT_PATH,
+    PREFINAL_AUDIT_TITLE,
+)
+from .system_gap_ledger import SYSTEM_GAP_LEDGER_PATH
 
 
 def render_frontend_api_audit_prompt(project_root: Path | str, task: Any) -> str:
@@ -74,19 +79,20 @@ def render_frontend_api_audit_prompt(project_root: Path | str, task: Any) -> str
 def render_prefinal_audit_prompt(project_root: Path | str, task: Any) -> str:
     project_dir = Path(project_root).expanduser().resolve()
     lines = [
-        f"## Task {task.id}: Pre-final full-system repair pass",
+        f"## Task {task.id}: {PREFINAL_AUDIT_TITLE}",
         "",
         f"Project path: {project_dir}",
         "",
-        "You are running a final pre-release scan-and-fix pass for the current repository state.",
-        "Do not treat this as a report-only audit. Find concrete release-relevant gaps, fix the responsibly fixable ones in this task, validate those fixes, and document both fixes and remaining blockers.",
+        "You are running a final pre-release scan-fix-validate-rescan loop for the current repository state.",
+        "This is a repair task, not a report-only audit. Find concrete release-relevant gaps, fix every gap whose correct behavior is determined by the project requirements and can be validated locally, validate each repair, then rescan before stopping.",
         "This is a new runtime session: do not rely on hidden conversation history. Base conclusions on the files and evidence present in this project directory.",
         "",
         "Mission:",
         "- Read the original requirements, the normalized requirements, any requirement clarification or conflict-resolution decisions, and the current system source code.",
         "- Compare implemented behavior against those requirement sources. Use other project docs, ledgers, reviews, and test evidence only as supporting evidence, not as replacements for the requirement sources.",
         "- Fix release-relevant gaps, incorrect implementations, broken flows, or missing validation evidence that can be responsibly fixed inside this task.",
-        f"- Write a detailed audit report to `{PREFINAL_AUDIT_REPORT_PATH}`.",
+        "- Continue repair work while an automatically repairable blocking gap remains. Do not stop after documenting a gap.",
+        f"- Write a concise human-readable scan report to `{PREFINAL_AUDIT_REPORT_PATH}` and the machine-readable ledger to `{SYSTEM_GAP_LEDGER_PATH}`.",
         "",
         "Authoritative inputs to inspect:",
         "- docs/requirements-source.md",
@@ -112,7 +118,7 @@ def render_prefinal_audit_prompt(project_root: Path | str, task: Any) -> str:
         "- If a user-visible flow is claimed complete, inspect the real user-facing behavior and appropriate end-to-end evidence for this stack.",
         "- If an integration, workflow, background job, data pipeline, or agent capability is claimed complete, inspect the real code path, contracts, fallback behavior, evidence model, and tests.",
         "- If you find a gap that can be fixed without inventing new product scope, fix it and add or strengthen relevant validation.",
-        "- If a gap requires major product reinterpretation or external clarification, document it as a blocker instead of hiding it behind a partial fix.",
+        "- Only stop blocked when the source requirements are contradictory or incomplete, an external dependency or environment prevents validation, or bounded repair attempts cannot converge. State the exact needed decision or external condition.",
         "",
         "Scope authority:",
         "- This task has project-wide scope for release-correctness fixes inside the target application project.",
@@ -126,22 +132,29 @@ def render_prefinal_audit_prompt(project_root: Path | str, task: Any) -> str:
         "- Record every validation command and result in the audit report. If a broader validation is deferred to final verification, say so explicitly.",
         "- Include the production semantic scan result or an equivalent source-backed inspection in the report. If production semantic findings remain, list them under `## Remaining Gaps / Blockers` and do not recommend release readiness.",
         "",
-        f"Required report: `{PREFINAL_AUDIT_REPORT_PATH}`",
+        f"Required human-readable report: `{PREFINAL_AUDIT_REPORT_PATH}`",
         "The report must contain these markdown sections exactly:",
-        "- # System Audit",
-        "- ## Audit Scope",
-        "- ## Executive Verdict",
-        "- ## Fixed Issues",
+        "- # System Gap Fix",
+        "- ## Scan Scope",
+        "- ## Gap Summary",
+        "- ## Fixed Gaps",
         "- ## Remaining Gaps / Blockers",
         "- ## Requirement Gap Matrix",
         "- ## Validation Summary",
         "- ## Changed Files",
         "- ## Final Recommendation",
         "",
+        f"Required machine-readable ledger: `{SYSTEM_GAP_LEDGER_PATH}`",
+        "The ledger must be valid JSON with this shape:",
+        "- schema_version: \"1\"",
+        "- audit_status: ready_for_final, repair_required, or blocked",
+        "- gaps: array of objects with id, severity, status, repairability, kind, summary, requirement_ids, acceptance_ids, source_refs, owner_task_ids, evidence, validation",
+        "- A fixed gap must include both implementation evidence and validation evidence.",
+        "- An unresolved automatic blocking gap requires audit_status=repair_required; a clarification or external blocking gap requires audit_status=blocked.",
         "Completion rules:",
-        f"- `{PREFINAL_AUDIT_REPORT_PATH}` must exist and be fully populated before stopping.",
+        f"- `{PREFINAL_AUDIT_REPORT_PATH}` and `{SYSTEM_GAP_LEDGER_PATH}` must exist and be fully populated before stopping.",
         "- If you changed code, tests, config, or mocks, include those files and validation evidence in the report.",
-        "- Stop only when all responsibly fixable release gaps are fixed and reported, or when remaining blockers are explicitly documented.",
+        "- You may be ready for review only when the ledger has audit_status=ready_for_final. Otherwise remain in repair_required or blocked with source-backed reasons.",
         "- When this task is complete, blocked, or ready for review, stop and let the framework route the next step.",
     ]
     return "\n".join(lines)
@@ -153,18 +166,20 @@ def render_prefinal_audit_review_request(project_root: Path | str, task: Any, *,
         f"Project path: {Path(project_root).expanduser().resolve()}",
         f"Task title: {task.title}",
         "",
-        "This task is the final pre-release system audit. Review whether the audit work and report are credible for the current repository state.",
+        "This task is the final pre-release System Gap Fix. Review whether the scan, repairs, and gap evidence are credible for the current repository state.",
         "",
         "Required checks:",
         f"- `{PREFINAL_AUDIT_REPORT_PATH}` exists and contains all required sections.",
+        f"- `{SYSTEM_GAP_LEDGER_PATH}` exists, is valid, and has audit_status=ready_for_final.",
         "- The report shows that original requirements, clarification/decision records, architecture, UI design, work-items, gates, reviews, tests, and current source code were inspected.",
         "- The report does not treat scaffolding, route stubs, wiring, or placeholders as full requirement satisfaction without actual behavior evidence.",
         "- The report treats production-path hardcoded/default responses, static fake data, stub routes, unauthenticated production APIs, and missing access-control enforcement as release-blocking unless explicitly allowed by source requirements.",
         "- Any release-relevant fixes made by this task are coherent, scoped to the project, and validated with appropriate backend/frontend/integration/e2e checks.",
-        "- Remaining blockers, if any, are explicit enough to stop T-FINAL from being trusted as a release signal.",
+        "- Every fixed gap has code or configuration evidence plus executable validation evidence.",
+        "- Any remaining blocker is explicit enough to stop T-FINAL from being trusted as a release signal.",
         "",
-        "Return status=changes_requested if the report is missing, shallow, contradicted by the code, omits obvious user-facing requirement gaps, lacks validation evidence for changes, omits production semantic findings, or claims readiness while release-blocking issues remain.",
-        "Return status=pass only when the audit report and changes are acceptable for T-FINAL to run next.",
+        "Return status=changes_requested if the report or ledger is missing, shallow, contradicted by the code, omits obvious user-facing requirement gaps, lacks validation evidence for changes, omits production semantic findings, or has any unresolved blocking gap.",
+        "Return status=pass only when the gap ledger is ready_for_final and the audit repairs are acceptable for T-FINAL to run next.",
     ]
     _append_scope_observations(lines, scope_report, broad_scope_reason="this audit has broad project scope", reject_guidance="these edits are unrelated to release correctness")
     lines.extend(

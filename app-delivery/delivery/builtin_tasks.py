@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .release_assessment import RELEASE_ASSESSMENT_PATH
+from .system_gap_ledger import SYSTEM_GAP_LEDGER_PATH
 
 SCAFFOLD_TASK_ID = "T000"
 SHARED_FOUNDATION_TASK_ID = "T001"
@@ -13,6 +15,12 @@ FINAL_VERIFY_TASK_ID = "T-FINAL"
 
 FRONTEND_API_AUDIT_REPORT_PATH = "docs/reviews/frontend-api-integration-audit.md"
 PREFINAL_AUDIT_REPORT_PATH = "docs/reviews/system-audit.md"
+PREFINAL_AUDIT_TITLE = "System Gap Fix"
+FINAL_VERIFY_OUTPUT_PATHS = [
+    "docs/release-evidence.md",
+    "docs/reviews/final-review.md",
+    RELEASE_ASSESSMENT_PATH,
+]
 
 FRONTEND_API_AUDIT_REQUIRED_SECTIONS = [
     "# Frontend API Integration Audit",
@@ -28,10 +36,10 @@ FRONTEND_API_AUDIT_REQUIRED_SECTIONS = [
 ]
 
 PREFINAL_AUDIT_REQUIRED_SECTIONS = [
-    "# System Audit",
-    "## Audit Scope",
-    "## Executive Verdict",
-    "## Fixed Issues",
+    "# System Gap Fix",
+    "## Scan Scope",
+    "## Gap Summary",
+    "## Fixed Gaps",
     "## Remaining Gaps / Blockers",
     "## Requirement Gap Matrix",
     "## Validation Summary",
@@ -47,9 +55,10 @@ PREFINAL_AUDIT_OUTPUT_PATHS = [
     "docker-compose.yml",
     "README.md",
     PREFINAL_AUDIT_REPORT_PATH,
+    SYSTEM_GAP_LEDGER_PATH,
 ]
 PREFINAL_AUDIT_OUTPUT_TESTS = [
-    "bash -lc 'test -s docs/reviews/system-audit.md && grep -q \"## Requirement Gap Matrix\" docs/reviews/system-audit.md && grep -q \"## Validation Summary\" docs/reviews/system-audit.md'",
+    "bash -lc 'test -s docs/reviews/system-audit.md && test -s docs/reviews/system-gap-fix.json'",
 ]
 
 FRONTEND_API_AUDIT_OUTPUT_PATHS = [

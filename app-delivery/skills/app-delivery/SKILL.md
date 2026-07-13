@@ -12,6 +12,27 @@ Rules:
 - For `/app-delivery <project> <requirements-file>`, treat the first positional argument as `{project}` and the second positional argument as `{requirements_path}`.
 - Never replace `{project}` with the parent directory of `{requirements_path}` when the user already supplied a first positional project argument.
 - If `{requirements_path}` is invalid or missing, keep `{project}` unchanged and report the requirements-path error instead of inferring a different project.
+- Before any `control`, `status`, `pause`, `resume`, or planning command, resolve and state `Target project: <resolved project path>` and `Requirements source: <resolved file path or none>` separately. A bare project name resolves to `${OPC_HOME:-$HOME/opc}/projects/<project>`; an explicit project path is used as-is.
+- Construct every CLI `--project` argument from the resolved target project only. Never derive it from, relabel it as, or replace it with the requirements source path or that path's parent directory.
+- When a target project and external requirements source are in different directories, treat that as expected input provenance, not as an error and not as a reason to switch projects.
+- For a two-positional invocation, run this deterministic binding preflight before any delivery command. Do not substitute, infer, or rewrite either variable after this point:
+
+```bash
+project_arg="{project}"
+requirements_arg="{requirements_path}"
+if [[ "$project_arg" == /* || "$project_arg" == .* ]]; then
+   target_project="$(cd "$project_arg" && pwd -P)"
+else
+   target_project="${OPC_HOME:-$HOME/opc}/projects/$project_arg"
+fi
+requirements_source="$(cd "$(dirname "$requirements_arg")" && pwd -P)/$(basename "$requirements_arg")"
+[[ -d "$target_project" ]] || { echo "Invalid target project: $target_project" >&2; exit 2; }
+[[ -f "$requirements_source" ]] || { echo "Invalid requirements source: $requirements_source" >&2; exit 2; }
+printf 'Target project: %s\nRequirements source: %s\n' "$target_project" "$requirements_source"
+${OPC_HOME:-$HOME/opc}/bin/app-delivery control --goal auto --project "$target_project" --requirements "$requirements_source"
+```
+
+- The values printed by this preflight are authoritative for the invocation. If they do not match the user-supplied project and requirements source, stop and report the binding error rather than calling `app-delivery`.
 - This skill and Hermes must not directly implement, edit, or validate target-project feature code. Target-project code changes must happen only inside app-delivery runtime task sessions.
 - This skill and Hermes may only run the delivery CLI and the planning skills explicitly requested by `next_step`. During implementation, task execution and code-review are framework-managed: code-review runs through the framework review runner as an isolated oneshot, not through the Hermes main session. If target-project code changes are needed, rerun `app-delivery control --goal auto` so the assigned runtime task session performs that work.
 - Do not stop while `must_continue=true` unless the framework reports a real blocking condition.

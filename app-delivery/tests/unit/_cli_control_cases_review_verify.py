@@ -1,26 +1,34 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
-import os
 from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-from delivery.builtin_tasks import FRONTEND_API_AUDIT_OUTPUT_PATHS, FRONTEND_API_AUDIT_OUTPUT_TESTS, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_OUTPUT_TESTS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID
+from delivery.builtin_tasks import (
+    FINAL_VERIFY_TASK_ID,
+    FRONTEND_API_AUDIT_OUTPUT_PATHS,
+    FRONTEND_API_AUDIT_OUTPUT_TESTS,
+    FRONTEND_API_AUDIT_REPORT_PATH,
+    FRONTEND_API_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_OUTPUT_PATHS,
+    PREFINAL_AUDIT_OUTPUT_TESTS,
+    PREFINAL_AUDIT_REPORT_PATH,
+    PREFINAL_AUDIT_TASK_ID,
+)
 from delivery.errors import DeliveryError
-from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
-from delivery.loop_review import code_review_request_path
-from delivery.loop import status as loop_status
-from delivery.control_plane_host import build_planning_host_step
-from delivery.runtime_config import resolve_project_root
-from delivery.skill_prompts import render_skill_prompt
-from delivery.stage_harness import stage_import_command, stage_input_path
-from delivery.state import load_gates, load_session_state, load_task_runtime_state, save_architecture_meta, save_session_state, save_task_runtime_state, save_test_plan, save_test_results, save_work_items
+from delivery.loop_gitops import ensure_git_repo, git
+from delivery.state import (
+    load_task_runtime_state,
+    save_architecture_meta,
+    save_task_runtime_state,
+    save_test_plan,
+    save_test_results,
+    save_work_items,
+)
 from delivery.task import Task
-
 
 cli = import_module("delivery.__main__")
 
@@ -732,15 +740,41 @@ def test_cmd_code_review_rejects_prefinal_audit_pass_when_report_declares_blocke
     report_path = tmp_path / PREFINAL_AUDIT_REPORT_PATH
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
-        "# System Audit\n\n"
-        "## Audit Scope\n\n"
-        "## Executive Verdict\n\n**Overall: DEFER** — T-FINAL should not proceed until critical blockers are fixed.\n\n"
-        "## Fixed Issues\n\n"
-        "## Remaining Gaps / Blockers\n\nCritical release-blocking issue remains.\n\n"
+        "# System Gap Fix\n\n"
+        "## Scan Scope\n\n"
+        "## Gap Summary\n\nNo report-only completion.\n\n"
+        "## Fixed Gaps\n\n"
+        "## Remaining Gaps / Blockers\n\nAn automatically repairable blocking gap remains.\n\n"
         "## Requirement Gap Matrix\n\n"
         "## Validation Summary\n\n"
         "## Changed Files\n\n"
-        "## Final Recommendation\n\nThe system fails pre-final validation.\n",
+        "## Final Recommendation\n\nContinue repair.\n",
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "docs" / "reviews" / "system-gap-fix.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "audit_status": "repair_required",
+                "gaps": [
+                    {
+                        "id": "GAP-001",
+                        "severity": "blocking",
+                        "status": "unresolved",
+                        "repairability": "automatic",
+                        "kind": "missing_behavior",
+                        "summary": "A source-determined behavior is missing.",
+                        "requirement_ids": [],
+                        "acceptance_ids": [],
+                        "source_refs": [],
+                        "owner_task_ids": [],
+                        "evidence": [],
+                        "validation": [],
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     save_work_items(
@@ -800,7 +834,7 @@ def test_cmd_code_review_rejects_prefinal_audit_pass_when_report_declares_blocke
     payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
     assert payload["items"][0]["status"] == "pending"
     assert payload["items"][0]["review_status"] == "changes_requested"
-    assert "T-FINAL should not proceed" in payload["items"][0]["blocked_reason"]
+    assert "unresolved automatically repairable blocking gaps" in payload["items"][0]["blocked_reason"]
 
 def test_cmd_code_review_rejects_frontend_api_audit_pass_when_report_missing(tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     save_work_items(
@@ -948,6 +982,14 @@ def test_cmd_code_review_rejects_frontend_api_audit_pass_when_stubs_are_nonblock
     assert "production-path stubs" in payload["items"][0]["blocked_reason"]
 
 def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path, monkeypatch) -> None:
+    from delivery.release_assessment import (
+        RELEASE_ASSESSMENT_PATH,
+        RELEASE_ASSESSMENT_SCHEMA_VERSION,
+        RELEASE_DIMENSIONS,
+        RELEASE_SCORE_THRESHOLD,
+        REQUIRED_HARD_GATES,
+    )
+
     save_work_items(
         tmp_path,
         {
@@ -967,6 +1009,47 @@ def test_cmd_final_review_import_marks_t_final_verified(tmp_path: Path, monkeypa
                     "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"],
                 }
             ],
+        },
+    )
+    assessment_path = tmp_path / RELEASE_ASSESSMENT_PATH
+    assessment_path.parent.mkdir(parents=True, exist_ok=True)
+    assessment_path.write_text(
+        json.dumps(
+            {
+                "schema_version": RELEASE_ASSESSMENT_SCHEMA_VERSION,
+                "score": RELEASE_SCORE_THRESHOLD,
+                "threshold": RELEASE_SCORE_THRESHOLD,
+                "dimensions": [
+                    {
+                        "id": dimension_id,
+                        "weight": weight,
+                        "score": {"requirements_fulfillment": 30, "behavioral_validation": 25, "security_and_boundaries": 20, "integration_and_recovery": 5, "operational_readiness": 0}[dimension_id],
+                        "notes": "Evidence reviewed.",
+                        "evidence": ["docs/reviews/release-evidence.md"],
+                    }
+                    for dimension_id, weight in RELEASE_DIMENSIONS
+                ],
+                "hard_gates": [
+                    {"id": gate_id, "status": "pass", "evidence": ["framework validation"]}
+                    for gate_id in REQUIRED_HARD_GATES
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "docs" / "reviews" / "system-gap-fix.json"
+    ledger_path.write_text(
+        json.dumps({"schema_version": "1", "audit_status": "ready_for_final", "gaps": []}),
+        encoding="utf-8",
+    )
+    save_task_runtime_state(
+        tmp_path,
+        FINAL_VERIFY_TASK_ID,
+        {
+            "final_release_hard_gates": [
+                {"id": gate_id, "status": "pass", "evidence": ["framework validation"]}
+                for gate_id in REQUIRED_HARD_GATES
+            ]
         },
     )
     input_path = tmp_path / "final-review.json"
@@ -1235,6 +1318,69 @@ def test_cmd_task_reset_repair_refuses_verified_feature_task(tmp_path: Path) -> 
     assert item["verified_at"] == "2026-06-24T00:10:00Z"
 
 
+def test_cmd_task_rerun_system_gap_fix_preserves_prior_evidence_and_requeues_audit(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    report_path = tmp_path / "docs" / "reviews" / "system-audit.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("# System Gap Fix\n", encoding="utf-8")
+    ledger_path = tmp_path / "docs" / "reviews" / "system-gap-fix.json"
+    ledger_path.write_text(json.dumps({"schema_version": "1", "audit_status": "ready_for_final", "gaps": []}), encoding="utf-8")
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": PREFINAL_AUDIT_TASK_ID, "title": "Pre-final full-system audit", "status": "verified", "task_kind": "audit", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": list(PREFINAL_AUDIT_OUTPUT_TESTS), "output_paths": list(PREFINAL_AUDIT_OUTPUT_PATHS), "git_commit": "abc123", "review_status": "pass", "review_artifact": "docs/reviews/code-review-T-SYSTEM-AUDIT.md"},
+                {"id": FINAL_VERIFY_TASK_ID, "title": "Final verification", "status": "blocked", "requirements": [], "acceptance_scenarios": [], "dependencies": [PREFINAL_AUDIT_TASK_ID], "output_tests": [], "output_paths": ["docs/release-evidence.md"]},
+            ],
+        },
+    )
+
+    result = cli.cmd_task(argparse.Namespace(project=str(tmp_path), task_id=PREFINAL_AUDIT_TASK_ID, action="rerun-system-gap-fix", reason="Validate the upgraded framework scan."))
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["action"] == "rerun-system-gap-fix"
+    items = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))["items"]
+    audit = next(item for item in items if item["id"] == PREFINAL_AUDIT_TASK_ID)
+    final = next(item for item in items if item["id"] == FINAL_VERIFY_TASK_ID)
+    assert audit["title"] == "System Gap Fix"
+    assert audit["status"] == "pending"
+    assert audit["git_commit"] is None
+    assert audit["review_artifact"] is None
+    assert final["status"] == "pending"
+    assert not report_path.exists()
+    assert not ledger_path.exists()
+    history = load_task_runtime_state(tmp_path, PREFINAL_AUDIT_TASK_ID)["system_gap_fix_rerun_history"]
+    assert history[0]["prior_git_commit"] == "abc123"
+    assert len(history[0]["archived_artifacts"]) == 2
+
+
+def test_cmd_task_rerun_system_gap_fix_rejects_unfinished_feature_tasks(tmp_path: Path) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Feature", "status": "pending", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": PREFINAL_AUDIT_TASK_ID, "title": "System Gap Fix", "status": "verified", "task_kind": "audit", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T002"], "output_tests": list(PREFINAL_AUDIT_OUTPUT_TESTS), "output_paths": list(PREFINAL_AUDIT_OUTPUT_PATHS)},
+                {"id": FINAL_VERIFY_TASK_ID, "title": "Final verification", "status": "pending", "requirements": [], "acceptance_scenarios": [], "dependencies": [PREFINAL_AUDIT_TASK_ID], "output_tests": [], "output_paths": []},
+            ],
+        },
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_task(argparse.Namespace(project=str(tmp_path), task_id=PREFINAL_AUDIT_TASK_ID, action="rerun-system-gap-fix", reason="Validate framework upgrade."))
+
+    assert exc_info.value.code == "system_gap_fix_prerequisites_incomplete"
+
+
 
 def test_cmd_task_reset_repair_refuses_final_repair_after_iteration_limit(tmp_path: Path) -> None:
     save_work_items(
@@ -1263,7 +1409,7 @@ def test_cmd_task_reset_repair_refuses_final_repair_after_iteration_limit(tmp_pa
     assert item["verified_at"] == "2026-06-24T00:10:00Z"
 
 
-def test_final_repair_preserves_verified_prefinal_audit_and_updates_final_dependency() -> None:
+def test_final_repair_requeues_system_gap_fix_and_updates_final_dependency() -> None:
     loop_module = import_module("delivery.loop")
     tasks = [
         Task.from_dict({"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []}),
@@ -1277,10 +1423,11 @@ def test_final_repair_preserves_verified_prefinal_audit_and_updates_final_depend
     audit = next(task for task in updated if task.id == PREFINAL_AUDIT_TASK_ID)
     final = next(task for task in updated if task.id == FINAL_VERIFY_TASK_ID)
 
-    assert audit.status == "verified"
-    assert audit.git_commit == "abc"
-    assert audit.review_status == "pass"
-    assert audit.blocked_reason is None
+    assert audit.status == "pending"
+    assert audit.git_commit is None
+    assert audit.review_status is None
+    assert audit.dependencies == ["T000", "T002", "T003"]
+    assert audit.blocked_reason == "System Gap Fix must re-scan after final repair task T003"
     assert final.dependencies == [PREFINAL_AUDIT_TASK_ID, "T003"]
 
 def test_final_verify_creates_environment_repair_for_environment_failures(tmp_path: Path, monkeypatch) -> None:

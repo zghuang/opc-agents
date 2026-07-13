@@ -995,6 +995,62 @@ def test_final_verify_creates_dedicated_repair_task_without_reopening_verified_t
     assert repair_runtime_state["force_task_prompt"] is True
     assert repair_runtime_state["force_task_prompt_reason"] == "final_verification_repair"
 
+
+def test_final_verify_creates_repair_for_invalid_verified_task_evidence(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import all_tasks
+
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {
+                    "id": "T002",
+                    "title": "Feature",
+                    "status": "verified",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": ["AS-001"],
+                    "dependencies": [],
+                    "output_tests": ["backend/tests/test_feature.py"],
+                    "output_paths": ["backend/app/feature.py"],
+                    "review_status": "changes_requested",
+                    "review_artifact": "docs/reviews/code-review-T002.md",
+                },
+                {
+                    "id": "T-FINAL",
+                    "title": "Final verification",
+                    "status": "pending",
+                    "requirements": [],
+                    "acceptance_scenarios": [],
+                    "dependencies": ["T002"],
+                    "output_tests": [],
+                    "output_paths": ["docs/release-evidence.md", "docs/reviews/final-review.md"],
+                },
+            ],
+        },
+    )
+    loop = DeliveryLoop(tmp_path)
+
+    def fail_if_run(*args, **kwargs):
+        raise AssertionError("full suite must not run while verified-task evidence is invalid")
+
+    monkeypatch.setattr("delivery.loop.run_full_suite", fail_if_run)
+
+    result = loop.final_verify()
+
+    by_id = {task.id: task for task in all_tasks(tmp_path)}
+    repair = next(task for task in by_id.values() if task.task_kind == "repair")
+    assert result["status"] == "repair_required"
+    assert result["repair_candidates"] == ["T002"]
+    assert by_id["T002"].status == "verified"
+    assert repair.requirements == ["REQ-001"]
+    assert repair.acceptance_scenarios == []
+    assert by_id["T-FINAL"].status == "blocked"
+
 def test_final_verify_includes_blocked_gate_missing_type_specs_in_repair_task(tmp_path: Path, monkeypatch) -> None:
     from delivery.state import save_gates
     from delivery.task import all_tasks

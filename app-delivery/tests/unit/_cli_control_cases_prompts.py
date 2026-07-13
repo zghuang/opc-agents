@@ -1,26 +1,32 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
-import os
 from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-from delivery.builtin_tasks import FRONTEND_API_AUDIT_OUTPUT_PATHS, FRONTEND_API_AUDIT_OUTPUT_TESTS, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_OUTPUT_TESTS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID
+from delivery.builtin_tasks import (
+    FINAL_VERIFY_TASK_ID,
+    FRONTEND_API_AUDIT_OUTPUT_PATHS,
+    FRONTEND_API_AUDIT_OUTPUT_TESTS,
+    FRONTEND_API_AUDIT_REPORT_PATH,
+    FRONTEND_API_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_OUTPUT_PATHS,
+    PREFINAL_AUDIT_OUTPUT_TESTS,
+    PREFINAL_AUDIT_REPORT_PATH,
+    PREFINAL_AUDIT_TASK_ID,
+)
 from delivery.errors import DeliveryError
-from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
-from delivery.loop_review import code_review_request_path
-from delivery.loop import status as loop_status
-from delivery.control_plane_host import build_planning_host_step
 from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt
 from delivery.stage_harness import stage_import_command, stage_input_path
-from delivery.state import load_gates, load_session_state, load_task_runtime_state, save_architecture_meta, save_session_state, save_task_runtime_state, save_test_plan, save_test_results, save_work_items
+from delivery.state import (
+    load_gates,
+    save_work_items,
+)
 from delivery.task import Task
-
 
 cli = import_module("delivery.__main__")
 
@@ -434,7 +440,8 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
     assert by_id[PREFINAL_AUDIT_TASK_ID]["task_kind"] == "audit"
     assert by_id[PREFINAL_AUDIT_TASK_ID]["status"] == "pending"
     assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
-    assert by_id[PREFINAL_AUDIT_TASK_ID]["output_paths"][-1] == PREFINAL_AUDIT_REPORT_PATH
+    assert PREFINAL_AUDIT_REPORT_PATH in by_id[PREFINAL_AUDIT_TASK_ID]["output_paths"]
+    assert "docs/reviews/system-gap-fix.json" in by_id[PREFINAL_AUDIT_TASK_ID]["output_paths"]
     assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == [PREFINAL_AUDIT_TASK_ID]
     persisted = json.loads((tmp_path / ".app-delivery-runtime" / "stage-inputs" / "task-decompose.json").read_text(encoding="utf-8"))
     assert isinstance(persisted, dict)

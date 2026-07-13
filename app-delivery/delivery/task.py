@@ -7,23 +7,34 @@ from pathlib import Path
 from typing import Any
 
 from .builtin_tasks import (
+    FINAL_VERIFY_OUTPUT_PATHS,
     FINAL_VERIFY_TASK_ID,
     FRONTEND_API_AUDIT_OUTPUT_PATHS,
     FRONTEND_API_AUDIT_OUTPUT_TESTS,
-    FRONTEND_API_AUDIT_REPORT_PATH,
     FRONTEND_API_AUDIT_TASK_ID,
     PREFINAL_AUDIT_OUTPUT_PATHS,
     PREFINAL_AUDIT_OUTPUT_TESTS,
-    PREFINAL_AUDIT_REPORT_PATH,
     PREFINAL_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_TITLE,
     SCAFFOLD_TASK_ID,
     SHARED_FOUNDATION_TASK_ID,
     needs_frontend_api_audit,
 )
-from .production_gates import PRODUCTION_GATE_TITLE_PREFIX, next_production_gate_task_id, production_gate_task_dict, required_production_gates
+from .production_gates import (
+    PRODUCTION_GATE_TITLE_PREFIX,
+    next_production_gate_task_id,
+    production_gate_task_dict,
+    required_production_gates,
+)
 from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root, optional_stack_paths
-from .state import load_gates, load_test_plan, load_work_items, project_paths, save_work_items, utc_now_iso
-
+from .state import (
+    load_gates,
+    load_test_plan,
+    load_work_items,
+    project_paths,
+    save_work_items,
+    utc_now_iso,
+)
 
 REQ_ID_RE = re.compile(r"\b((?:REQ|NFR)-\d{3,})\b")
 REQ_RANGE_RE = re.compile(
@@ -106,7 +117,7 @@ FRAMEWORK_BUILTIN_TASK_IDS = {
 }
 
 
-def _is_framework_generated_task(task: "Task") -> bool:
+def _is_framework_generated_task(task: Task) -> bool:
     if task.id in FRAMEWORK_BUILTIN_TASK_IDS:
         return True
     return task.task_kind == "validation" and task.id.startswith("T9") and task.title.startswith(PRODUCTION_GATE_TITLE_PREFIX)
@@ -322,7 +333,7 @@ def _collapse_shared_foundation_tasks(tasks: list[Task]) -> list[Task]:
     return collapsed
 
 
-def _normalize_builtin_task_contract(task: "Task") -> "Task":
+def _normalize_builtin_task_contract(task: Task) -> Task:
     data = task.to_dict()
     if task.id == SCAFFOLD_TASK_ID:
         data["output_paths"] = _dedupe_preserve([*SCAFFOLD_OUTPUT_PATHS, *task.output_paths])
@@ -341,12 +352,15 @@ def _normalize_builtin_task_contract(task: "Task") -> "Task":
         data["output_tests"] = _dedupe_preserve([*FRONTEND_API_AUDIT_OUTPUT_TESTS, *task.output_tests])
         return Task.from_dict(data)
     if task.id == PREFINAL_AUDIT_TASK_ID:
-        data["title"] = "Pre-final full-system repair pass"
+        data["title"] = PREFINAL_AUDIT_TITLE
         data["task_kind"] = "audit"
         data["requirements"] = []
         data["acceptance_scenarios"] = []
         data["output_paths"] = _dedupe_preserve([*PREFINAL_AUDIT_OUTPUT_PATHS, *task.output_paths])
         data["output_tests"] = _dedupe_preserve([*PREFINAL_AUDIT_OUTPUT_TESTS, *task.output_tests])
+        return Task.from_dict(data)
+    if task.id == FINAL_VERIFY_TASK_ID:
+        data["output_paths"] = _dedupe_preserve([*FINAL_VERIFY_OUTPUT_PATHS, *task.output_paths])
         return Task.from_dict(data)
     return task
 
@@ -377,7 +391,7 @@ class Task:
     technology_constraints: list[dict[str, Any]] | None = None
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "Task":
+    def from_dict(cls, payload: dict[str, Any]) -> Task:
         return cls(
             id=str(payload.get("id") or "").strip(),
             title=str(payload.get("title") or "").strip(),
@@ -1110,7 +1124,7 @@ def decompose_tasks(
     normalized_items.append(
         Task(
             id=PREFINAL_AUDIT_TASK_ID,
-            title="Pre-final full-system repair pass",
+            title=PREFINAL_AUDIT_TITLE,
             status="pending",
             requirements=[],
             acceptance_scenarios=[],
@@ -1135,7 +1149,7 @@ def decompose_tasks(
             acceptance_scenarios=[],
             dependencies=final_dependencies,
             output_tests=[],
-            output_paths=["docs/release-evidence.md", "docs/reviews/final-review.md"],
+            output_paths=list(FINAL_VERIFY_OUTPUT_PATHS),
         )
     )
     _validate_dependency_graph(normalized_items)

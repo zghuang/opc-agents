@@ -13,7 +13,8 @@ from .runtime_config import load_project_runtime
 from .production_semantics import mock_only_browser_e2e_issues
 from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
 from .state import load_task_runtime_state, load_test_results
-from .task import FINAL_VERIFY_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, SCAFFOLD_OUTPUT_PATHS, Task, reset_task
+from .builtin_tasks import PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID
+from .task import FINAL_VERIFY_TASK_ID, SCAFFOLD_OUTPUT_PATHS, Task, reset_task
 from .verify import is_path_test_spec
 
 
@@ -79,6 +80,7 @@ BLOCKING_VERIFIED_TASK_ISSUE_CODES = {
     "latest_validation_failed",
     "exception_review_artifact",
     "commit_subject_mismatch",
+    "verified_task_review_not_pass",
 }
 
 T000_ONLY_FRAMEWORK_PREFIXES = (
@@ -258,6 +260,12 @@ def _verified_task_issue(project_root: Path | str, task: Task) -> VerifiedTaskIs
         return None
 
     manual_accept = _has_manual_accept_override(project_root, task.id)
+    review_status = str(task.review_status or "").strip().casefold()
+    if not manual_accept and review_status and review_status != "pass":
+        return VerifiedTaskIssue(
+            "verified_task_review_not_pass",
+            f"verified task has non-passing review status: {task.review_status}",
+        )
     latest_result = _latest_task_test_result(project_root, task.id)
     if not manual_accept and latest_result is not None and not bool(latest_result.get("passed")):
         timestamp = str(latest_result.get("timestamp") or "unknown").strip() or "unknown"
@@ -303,6 +311,15 @@ def repair_invalid_verified_tasks(project_root: Path | str, tasks: list[Task]) -
             continue
         issues[task.id] = issue
     return tasks, issues
+
+
+def blocking_verified_task_issues(project_root: Path | str, tasks: list[Task]) -> dict[str, str]:
+    _, issues = repair_invalid_verified_tasks(project_root, tasks)
+    return {
+        task_id: issue
+        for task_id, issue in issues.items()
+        if is_blocking_verified_task_issue(issue)
+    }
 
 
 def ensure_git_repo(project_root: Path | str) -> None:
