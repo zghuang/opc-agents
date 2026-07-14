@@ -29,6 +29,7 @@ from .loop_gitops import (
     review_artifact_status,
     task_scope_delta,
     task_scoped_changed_paths,
+    try_reapply_task_exception_patch,
 )
 from .loop_reporting import PAUSE_FILE, project_summary, render_release_evidence
 from .loop_review import write_code_review_request, write_final_review_request
@@ -64,6 +65,7 @@ from .state import (
     remember_task_runtime_failure,
     repeated_task_runtime_failure_block,
     save_task_runtime_state,
+    append_task_log_event,
     utc_now_iso,
 )
 from .system_gap_ledger import system_gap_ledger_issues
@@ -1129,6 +1131,11 @@ class DeliveryLoop:
         )
         patch_relative_path = park_task_exception_changes(self.project_root, current) if current is not None else None
         patch_notice = f" [exception patch: {patch_relative_path}]" if patch_relative_path else ""
+        patch_provenance: dict[str, Any] = {
+            "status": "created" if patch_relative_path else "not_created",
+            "patch_path": patch_relative_path,
+            "created_at": utc_now_iso(),
+        }
         tasks = all_tasks(self.project_root)
         repeated_block = repeated_task_runtime_failure_block(self.project_root, task_id)
         blocked_reason = repeated_block["message"] if isinstance(repeated_block, dict) else (failure_prefix + failure_message)
@@ -1157,7 +1164,8 @@ class DeliveryLoop:
                     "session_id": resolved_session_id,
                     "failure_kind": exc.kind,
                     "exception_report": exception_report,
-                }
+                },
+                "exception_patch_provenance": patch_provenance,
             },
         )
         _release_session_after_exception(self.project_root, session)
@@ -1506,6 +1514,45 @@ class DeliveryLoop:
             if task is None:
                 exception_retry = self._next_exception_task_to_retry(tasks)
                 if exception_retry is not None:
+                    reapply_result = try_reapply_task_exception_patch(self.project_root, exception_retry.id)
+                    prior_runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, exception_retry.id))
+                    patch_was_created = str((prior_runtime_state.get("exception_patch_provenance") or {}).get("status") or "").strip() == "created"
+                    if reapply_result.get("status") == "missing" and patch_was_created:
+                        reapply_result = {
+                            **reapply_result,
+                            "status": "unaccounted_missing",
+                            "reason": "exception patch was previously created but is missing before retry",
+                        }
+                    save_task_runtime_state(
+                        self.project_root,
+                        exception_retry.id,
+                        {
+                            "exception_patch_reapply": reapply_result,
+                            "exception_patch_conflict": reapply_result if reapply_result.get("status") == "conflict" else None,
+                        },
+                    )
+                    append_task_log_event(
+                        self.project_root,
+                        runtime="framework",
+                        level="ERROR" if reapply_result.get("status") == "conflict" else "INFO",
+                        message="Exception patch reapply result",
+                        task_id=exception_retry.id,
+                        task_title=exception_retry.title,
+                        extra=reapply_result,
+                    )
+                    if reapply_result.get("status") in {"conflict", "unaccounted_missing"}:
+                        return {
+                            "status": "exception",
+                            "task_id": exception_retry.id,
+                            "reason": (
+                                "exception patch conflict requires resolution before retry"
+                                if reapply_result.get("status") == "conflict"
+                                else "exception patch disappeared before retry and requires investigation"
+                            ),
+                            "exception_task_ids": [exception_retry.id],
+                            "exception_patch_conflict": reapply_result if reapply_result.get("status") == "conflict" else None,
+                            "exception_patch_reapply": reapply_result,
+                        }
                     tasks = reset_task(tasks, exception_retry.id)
                     save_tasks(self.project_root, tasks)
                     task = next((row for row in tasks if row.id == exception_retry.id), None)

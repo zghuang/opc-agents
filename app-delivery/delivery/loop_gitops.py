@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import json
+import hashlib
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -803,6 +804,7 @@ def try_reapply_task_exception_patch(project_root: Path | str, task_id: str) -> 
         patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         patch_text = ""
+    patch_sha256 = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
     affected_paths = _patch_changed_paths(patch_text)
     check_result = git(["apply", "--check", "--whitespace=nowarn", str(patch_path)], cwd=project_dir)
     if check_result.returncode == 0:
@@ -826,13 +828,13 @@ def try_reapply_task_exception_patch(project_root: Path | str, task_id: str) -> 
             }
         patch_path.unlink()
         clear_task_exception_patch_conflict(project_dir, task_id)
-        return {"status": "applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths}
+        return {"status": "applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths, "patch_sha256": patch_sha256}
 
     reverse_check = git(["apply", "--reverse", "--check", "--whitespace=nowarn", str(patch_path)], cwd=project_dir)
     if reverse_check.returncode == 0:
         patch_path.unlink()
         clear_task_exception_patch_conflict(project_dir, task_id)
-        return {"status": "already_applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths}
+        return {"status": "already_applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths, "patch_sha256": patch_sha256}
 
     git_output = _truncate_exception_patch_output(check_result.stdout.strip() or f"git apply --check failed for {patch_path}")
     conflict_brief_path = _write_exception_patch_conflict_brief(
@@ -849,6 +851,7 @@ def try_reapply_task_exception_patch(project_root: Path | str, task_id: str) -> 
         "conflict_brief_path": conflict_brief_path,
         "affected_paths": affected_paths,
         "git_output": git_output,
+        "patch_sha256": patch_sha256,
     }
 
 

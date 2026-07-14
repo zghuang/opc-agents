@@ -111,6 +111,148 @@ def test_run_retries_exception_task_when_pending_tasks_depend_on_it(tmp_path: Pa
     assert calls == ["T001"]
     assert result == {"status": "paused"}
 
+
+def test_run_reapplies_exception_patch_before_retry(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import save_tasks
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T001", "title": "Shared", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/shared/"]},
+                {"id": "T002", "title": "Feature", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature/"], "blocked_reason": "retry"},
+            ],
+        },
+    )
+    calls: list[str] = []
+    reapply_calls: list[str] = []
+    monkeypatch.setattr(DeliveryLoop, "_pause_requested", lambda self: len(calls) > 0)
+    monkeypatch.setattr(DeliveryLoop, "_next_exception_task_to_retry", lambda self, tasks: next(task for task in tasks if task.id == "T002"))
+
+    def fake_reapply(project_root, task_id):
+        reapply_calls.append(task_id)
+        return {"status": "applied", "task_id": task_id, "patch_path": ".app-delivery-runtime/exception-patches/T002.patch", "affected_paths": []}
+
+    monkeypatch.setattr("delivery.loop.try_reapply_task_exception_patch", fake_reapply)
+
+    def fake_execute(self, task):
+        calls.append(task.id)
+        return (False, "exception")
+
+    monkeypatch.setattr(DeliveryLoop, "_execute_task", fake_execute)
+
+    result = DeliveryLoop(tmp_path).run()
+
+    assert reapply_calls == ["T002"]
+    assert calls == ["T002"]
+    assert result == {"status": "paused"}
+    runtime_state = json.loads((tmp_path / ".app-delivery-runtime" / "task-runtime" / "T002.json").read_text(encoding="utf-8"))
+    assert runtime_state["exception_patch_reapply"]["status"] == "applied"
+    task_log = (tmp_path / ".app-delivery-runtime" / "task-log.jsonl").read_text(encoding="utf-8")
+    assert "Exception patch reapply result" in task_log
+
+
+def test_run_does_not_retry_when_exception_patch_conflicts(tmp_path: Path, monkeypatch) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T001", "title": "Shared", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/shared/"]},
+                {"id": "T002", "title": "Feature", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature/"], "blocked_reason": "retry"},
+            ],
+        },
+    )
+    monkeypatch.setattr(DeliveryLoop, "_pause_requested", lambda self: False)
+    monkeypatch.setattr(DeliveryLoop, "_next_exception_task_to_retry", lambda self, tasks: next(task for task in tasks if task.id == "T002"))
+    monkeypatch.setattr(
+        "delivery.loop.try_reapply_task_exception_patch",
+        lambda project_root, task_id: {"status": "conflict", "task_id": task_id, "patch_path": ".app-delivery-runtime/exception-patches/T002.patch", "conflict_brief_path": ".app-delivery-runtime/exception-conflicts/T002.md", "affected_paths": ["backend/src/feature/feature.py"], "git_output": "patch does not apply"},
+    )
+
+    result = DeliveryLoop(tmp_path).run()
+
+    assert result["status"] == "exception"
+    assert result["exception_patch_conflict"]["status"] == "conflict"
+    assert json.loads((tmp_path / ".app-delivery-runtime" / "task-runtime" / "T002.json").read_text(encoding="utf-8"))["exception_patch_conflict"]["status"] == "conflict"
+
+
+def test_run_records_missing_exception_patch_before_retry(tmp_path: Path, monkeypatch) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T001", "title": "Shared", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/shared/"]},
+                {"id": "T002", "title": "Feature", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature/"], "blocked_reason": "retry"},
+            ],
+        },
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(DeliveryLoop, "_pause_requested", lambda self: len(calls) > 0)
+    monkeypatch.setattr(DeliveryLoop, "_next_exception_task_to_retry", lambda self, tasks: next(task for task in tasks if task.id == "T002"))
+    monkeypatch.setattr(DeliveryLoop, "_execute_task", lambda self, task: (calls.append(task.id) or False, "exception"))
+
+    result = DeliveryLoop(tmp_path).run()
+
+    assert result["status"] == "paused"
+    runtime_state = json.loads((tmp_path / ".app-delivery-runtime" / "task-runtime" / "T002.json").read_text(encoding="utf-8"))
+    assert runtime_state["exception_patch_reapply"]["status"] == "missing"
+
+
+def test_run_blocks_unaccounted_missing_exception_patch(tmp_path: Path, monkeypatch) -> None:
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T000", "title": "Scaffold", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": [], "output_tests": [], "output_paths": []},
+                {"id": "T001", "title": "Shared", "status": "verified", "requirements": [], "acceptance_scenarios": [], "dependencies": ["T000"], "output_tests": [], "output_paths": ["backend/src/shared/"]},
+                {"id": "T002", "title": "Feature", "status": "exception", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": ["T001"], "output_tests": ["backend/tests/test_feature.py"], "output_paths": ["backend/src/feature/"], "blocked_reason": "retry"},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {
+            "exception_patch_provenance": {
+                "status": "created",
+                "patch_path": ".app-delivery-runtime/exception-patches/T002.patch",
+                "created_at": "2026-07-13T00:00:00Z",
+            }
+        },
+    )
+    execute_calls: list[str] = []
+    monkeypatch.setattr(DeliveryLoop, "_pause_requested", lambda self: False)
+    monkeypatch.setattr(DeliveryLoop, "_next_exception_task_to_retry", lambda self, tasks: next(task for task in tasks if task.id == "T002"))
+    monkeypatch.setattr(DeliveryLoop, "_execute_task", lambda self, task: (execute_calls.append(task.id) or False, "exception"))
+
+    result = DeliveryLoop(tmp_path).run()
+
+    assert result["status"] == "exception"
+    assert result["exception_patch_reapply"]["status"] == "unaccounted_missing"
+    assert execute_calls == []
+    runtime_state = json.loads((tmp_path / ".app-delivery-runtime" / "task-runtime" / "T002.json").read_text(encoding="utf-8"))
+    assert runtime_state["exception_patch_reapply"]["status"] == "unaccounted_missing"
+    assert "Exception patch reapply result" in (tmp_path / ".app-delivery-runtime" / "task-log.jsonl").read_text(encoding="utf-8")
+
 def test_run_does_not_retry_exception_task_after_repeated_identical_runtime_failure(tmp_path: Path, monkeypatch) -> None:
     save_work_items(
         tmp_path,
