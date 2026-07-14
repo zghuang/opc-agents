@@ -27,14 +27,15 @@ ${OPC_HOME:-$HOME/opc}/bin/app-delivery-preflight.sh --project {project} --requi
 	- if the source includes explicit or implicit user stories, use cases, user journeys, approval flows, degradation/recovery flows, or end-to-end operational scenarios, convert them into structured `acceptance_scenarios` instead of leaving them only in prose
 4. Load the stage contract from [references/stage-contract.md](./references/stage-contract.md), replace placeholders with the actual project inputs, and produce a JSON object with `requirements`, `acceptance_scenarios`, `clarifications`, and `source_requirements_path`.
 	- `technology_hints` preserve the exact named choice, rationale, and evidence. Do not guess package coordinates.
-	- Set `source_requirements_path` to the same absolute raw requirements path provided to this skill.
+	- Set `source_requirements_path` to the absolute raw requirements path; the planning review uses it to read the source.
+	- Use `null` or omit `source_requirements_path` only when the original source path is genuinely unavailable; the reviewer can then use the archived raw source under `docs/requirements-source.*`.
 	- If the project already has clarification answers from an earlier spec-review pass, fold those resolved answers back into the canonical requirement interpretation instead of treating clarification resolution as a separate external planning stage.
 	- When a clarification still genuinely requires a user decision, include a concise `recommended_answer` and a small `answer_options` list when defensible so the host can offer suggested choices without blocking freeform user input.
 5. If `docs/clarification-needed.md` contains blocking questions from an earlier pass, inspect whether the current source requirements, existing project artifacts, or framework-selected defaults already support defensible answers.
 	- When they do, write or update `docs/clarification-answers.md` with concise answers before regenerating the canonical JSON.
 	- Do not invent answers that require a genuinely new product, security, architecture, or scope decision from the user.
 6. Write that JSON to `${project}/.app-delivery-runtime/stage-inputs/spec-review.json`.
-7. Import the stage result through the harness:
+7. Import the candidate through the stage command below. The framework synchronously runs a fresh foreground planning review and waits for its result before returning. If the review returns `revise`, regenerate the candidate from its findings and rerun this stage command.
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery spec-review --project {project} --input {project}/.app-delivery-runtime/stage-inputs/spec-review.json
 ```

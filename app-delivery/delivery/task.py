@@ -303,6 +303,23 @@ def _is_shared_foundation_candidate(task: Task) -> bool:
     return not task.requirements and not task.acceptance_scenarios
 
 
+def _is_shared_foundation_candidate_payload(raw_item: dict[str, Any]) -> bool:
+    return _is_shared_foundation_candidate(
+        Task.from_dict(
+            {
+                "id": "__shared_foundation_candidate__",
+                "title": raw_item.get("title") or "",
+                "task_kind": raw_item.get("task_kind") or "feature",
+                "requirements": raw_item.get("requirements", []),
+                "acceptance_scenarios": raw_item.get("acceptance_scenarios", []),
+                "dependencies": raw_item.get("dependencies", []),
+                "output_tests": raw_item.get("output_tests", []),
+                "output_paths": raw_item.get("output_paths", []),
+            }
+        )
+    )
+
+
 def _is_project_root_relative_path(value: str) -> bool:
     normalized = _strip_current_dir_prefix(value)
     if not normalized:
@@ -887,6 +904,17 @@ def _validate_dependency_graph(tasks: list[Task]) -> None:
         visit(task.id, [])
 
 
+def _validate_task_id_continuity(generated_ids: list[int], reserved_ids: set[int] | None = None) -> None:
+    generated_ids = sorted(set(generated_ids))
+    if not generated_ids:
+        return
+    expected_ids = set(range(2, generated_ids[-1] + 1)).difference(reserved_ids or set())
+    missing_ids = sorted(expected_ids.difference(generated_ids))
+    if missing_ids:
+        formatted = ", ".join(f"T{task_id:03d}" for task_id in missing_ids)
+        raise ValueError(f"task-decompose generated task IDs must be contiguous; missing {formatted}")
+
+
 def _validate_task_shape(tasks: list[Task]) -> None:
     oversized: list[str] = []
     for task in tasks:
@@ -1210,14 +1238,25 @@ def decompose_tasks(
     previous_id = SHARED_FOUNDATION_TASK_ID if include_shared_foundation else SCAFFOLD_TASK_ID
     raw_dependency_map: dict[str, list[str]] = {}
     raw_task_records: list[dict[str, Any]] = []
+    foundation_candidates: list[dict[str, Any]] = []
+    foundation_aliases: dict[str, str] = {}
+    auto_generated_ids: list[int] = []
     for raw_item in items:
         if not isinstance(raw_item, dict):
+            continue
+        if include_shared_foundation and _is_shared_foundation_candidate_payload(raw_item):
+            foundation_candidates.append(raw_item)
+            explicit_foundation_id = str(raw_item.get("id") or "").strip()
+            if TASK_ID_RE.match(explicit_foundation_id):
+                foundation_aliases[explicit_foundation_id] = SHARED_FOUNDATION_TASK_ID
+                next_index = max(next_index, int(explicit_foundation_id[1:]) + 1)
             continue
         task_id = str(raw_item.get("id") or "").strip()
         if task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
         if not TASK_ID_RE.match(task_id) or task_id in task_ids or task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID}:
             task_id = f"T{next_index:03d}"
+            auto_generated_ids.append(next_index)
         next_index += 1
         explicit_dependencies = [str(value).strip() for value in raw_item.get("dependencies", []) if str(value).strip()]
         raw_task_records.append(
@@ -1254,6 +1293,25 @@ def decompose_tasks(
         task_ids.add(task_id)
         previous_id = task_id
 
+    for index, raw_item in enumerate(foundation_candidates):
+        normalized_items.append(
+            Task.from_dict(
+                {
+                    "id": f"__shared_foundation_candidate_{index}",
+                    "title": raw_item.get("title") or "",
+                    "status": "pending",
+                    "task_kind": raw_item.get("task_kind") or "feature",
+                    "requirements": raw_item.get("requirements", []),
+                    "acceptance_scenarios": raw_item.get("acceptance_scenarios", []),
+                    "dependencies": [SHARED_FOUNDATION_TASK_ID],
+                    "output_tests": raw_item.get("output_tests", []),
+                    "output_paths": raw_item.get("output_paths", []),
+                    "intent": raw_item.get("intent") or {},
+                    "technology_constraints": raw_item.get("technology_constraints", []),
+                }
+            )
+        )
+
     _validate_raw_dependency_quality(raw_task_records, require_graph_edges=include_shared_foundation)
 
     aliases: dict[str, str] = {}
@@ -1267,7 +1325,11 @@ def decompose_tasks(
         resolved: list[str] = []
         seen: set[str] = set()
         for dependency in raw_dependency_map.get(task.id, task.dependencies):
-            resolved_id = aliases.get(dependency) or aliases.get(_normalized_dependency_key(dependency))
+            resolved_id = (
+                foundation_aliases.get(dependency)
+                or aliases.get(dependency)
+                or aliases.get(_normalized_dependency_key(dependency))
+            )
             if not resolved_id or resolved_id == task.id or resolved_id in seen:
                 continue
             seen.add(resolved_id)
@@ -1343,6 +1405,12 @@ def decompose_tasks(
             output_paths=list(FINAL_VERIFY_OUTPUT_PATHS),
         )
     )
+    reserved_foundation_ids = {
+        int(task_id[1:])
+        for task_id in foundation_aliases
+        if TASK_ID_RE.match(task_id)
+    }
+    _validate_task_id_continuity(auto_generated_ids, reserved_foundation_ids)
     _validate_dependency_graph(normalized_items)
     payload = load_work_items(project_root)
     payload["items"] = [task.to_dict() for task in normalized_items]

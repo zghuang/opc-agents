@@ -19,6 +19,7 @@ from delivery.builtin_tasks import (
     PREFINAL_AUDIT_TASK_ID,
 )
 from delivery.errors import DeliveryError
+from tests.unit.planning_review_test_helpers import approve_candidate
 from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt
 from delivery.stage_harness import stage_import_command, stage_input_path
@@ -429,6 +430,7 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    approve_candidate(tmp_path, "task-decompose", input_path)
 
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -467,6 +469,7 @@ def test_cmd_decompose_allows_architecture_selected_backend_root_package_paths(t
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
     assert result == 0
@@ -501,6 +504,7 @@ def test_cmd_decompose_requires_ui_route_mapping_coverage(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
     assert result == 0
@@ -632,6 +636,7 @@ def test_cmd_decompose_allows_architecture_selected_top_level_mcp_server_paths(t
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
     assert result == 0
@@ -687,6 +692,7 @@ def test_cmd_decompose_imports_complexity_and_validation_gates_from_object_paylo
         ),
         encoding="utf-8",
     )
+    approve_candidate(tmp_path, "task-decompose", input_path)
 
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -760,6 +766,7 @@ def test_cmd_decompose_requires_full_object_payload_contract(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     with pytest.raises(DeliveryError) as exc_info:
         cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -911,6 +918,7 @@ def test_cmd_arch_design_rejects_missing_dependency_hints(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     with pytest.raises(DeliveryError) as exc_info:
         cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -969,6 +977,7 @@ def test_cmd_arch_design_rejects_adr_documents_in_modules(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     with pytest.raises(DeliveryError) as exc_info:
         cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 

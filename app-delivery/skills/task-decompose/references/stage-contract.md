@@ -68,6 +68,7 @@ Technology constraint rules:
 
 Constraints:
 - Do not emit T000, T001, or T-FINAL. The framework inserts built-in tasks itself.
+- The framework assigns canonical numeric task IDs after foundation candidates are merged. Do not infer gate `scope_tasks` from raw item positions; import rejects unknown IDs and requires the generated numeric sequence to remain contiguous.
 - Prefer complete user-visible slices over layer-by-layer tasks.
 - Decompose from overall product capability into executable vertical slices.
 - Choose the smallest coherent task that still delivers a meaningful product capability.

@@ -31,6 +31,7 @@ from .session import RuntimeSession, current_session, retire_session, save_curre
 from .watchdog import process_alive, save_watchdog_state, should_watchdog_resume, spawn_watchdog
 from .stage_harness import import_arch_design, import_context_sync, import_decompose, import_spec_review, import_ui_design, load_stage_payload, stage_import_command, stage_input_path, stage_missing_error
 from .loop_gitops import task_scoped_changed_paths, try_reapply_task_exception_patch
+from .planning_review_runner import run_planning_review
 from .state import (
     acquire_lock,
     latest_task_log_event,
@@ -1116,6 +1117,7 @@ def _mark_host_handoff_review_runner_failed(project_root: Path, fallback_state: 
         return
     completed_at = str(fallback_state.get("completed_at") or "").strip() or utc_now_iso()
     body = dict(existing)
+    failed_skill = str(existing.get("skill") or fallback_state.get("skill") or "host review").strip() or "host review"
     body.update(
         {
             "schema_version": "1",
@@ -1130,7 +1132,7 @@ def _mark_host_handoff_review_runner_failed(project_root: Path, fallback_state: 
             "review_runner_stderr_log": str(fallback_state.get("stderr_log") or existing.get("runner_stderr_log") or ""),
             "review_runner_last_activity_at": str(fallback_state.get("last_activity_at") or "").strip() or None,
             "review_runner_idle_seconds": fallback_state.get("idle_seconds"),
-            "message": "Review runner failed before importing a fresh code-review artifact; retry may run automatically if attempts remain.",
+            "message": f"Review runner failed before importing a fresh {failed_skill} artifact; retry may run automatically if attempts remain.",
         }
     )
     write_json(path, body)
@@ -1483,10 +1485,11 @@ def _host_fallback_prompt(project_root: Path, handoff: dict[str, Any]) -> str:
 
 def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any], *, reason: str) -> dict[str, Any]:
     handoff_id = str(handoff.get("handoff_id") or "").strip()
+    skill = str(handoff.get("skill") or "").strip()
     task_id = str(handoff.get("task_id") or "").strip()
     hermes_bin = _resolve_hermes_bin()
     if not hermes_bin:
-        result = {"status": "failed", "reason": "hermes_binary_missing", "handoff_id": handoff_id, "task_id": task_id}
+        result = {"status": "failed", "reason": "hermes_binary_missing", "handoff_id": handoff_id, "skill": skill, "task_id": task_id}
         _write_host_fallback_state(project_root, result)
         return result
 
@@ -1499,8 +1502,8 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
         except (TypeError, ValueError):
             pid = 0
         if process_alive(pid):
-            return {"status": "running", "reason": "existing_fallback_running", "handoff_id": handoff_id, "task_id": task_id, "pid": pid}
-        failed_state = {"status": "failed", "reason": "previous_fallback_exited_without_clearing_handoff", "handoff_id": handoff_id, "task_id": task_id, "pid": pid, "completed_at": utc_now_iso()}
+            return {"status": "running", "reason": "existing_fallback_running", "handoff_id": handoff_id, "skill": skill, "task_id": task_id, "pid": pid}
+        failed_state = {"status": "failed", "reason": "previous_fallback_exited_without_clearing_handoff", "handoff_id": handoff_id, "skill": skill, "task_id": task_id, "pid": pid, "completed_at": utc_now_iso()}
         _write_host_fallback_state(project_root, failed_state)
         _mark_host_handoff_review_runner_failed(project_root, failed_state, reason="previous_fallback_exited_without_clearing_handoff")
 
@@ -1542,7 +1545,7 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
         "status": "running",
         "handoff_id": handoff_id,
         "task_id": task_id,
-        "skill": "code-review",
+        "skill": skill,
         "pid": process.pid,
         "started_at": started_at,
         "reason": reason,
@@ -1553,7 +1556,7 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
     write_json(lock_path, lock_payload)
     _write_host_fallback_state(project_root, {**lock_payload, "attempt": attempt})
     _mark_host_handoff_review_running(project_root, handoff, pid=process.pid, started_at=started_at, stdout_log=stdout_path, stderr_log=stderr_path)
-    return {"status": "started", "handoff_id": handoff_id, "task_id": task_id, "pid": process.pid, "attempt": attempt, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path)}
+    return {"status": "started", "handoff_id": handoff_id, "skill": "code-review", "task_id": task_id, "pid": process.pid, "attempt": attempt, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path)}
 
 
 def _maybe_start_code_review_host_fallback(project_root: Path) -> dict[str, Any]:
@@ -1568,8 +1571,9 @@ def _maybe_start_code_review_host_fallback(project_root: Path) -> dict[str, Any]
     handoff_status = str(handoff.get("status") or "").strip()
     if handoff_status not in {"waiting_for_host", HANDOFF_REVIEW_RUNNING_STATUS, HANDOFF_REVIEW_RUNNER_FAILED_STATUS}:
         return {"status": "skipped", "reason": "host_handoff_not_waiting", "handoff_status": handoff_status}
-    if str(handoff.get("skill") or "").strip() != "code-review":
-        return {"status": "skipped", "reason": "unsupported_host_skill", "skill": str(handoff.get("skill") or "")}
+    skill = str(handoff.get("skill") or "").strip()
+    if skill != "code-review":
+        return {"status": "skipped", "reason": "unsupported_host_skill", "skill": skill}
     task_id = str(handoff.get("task_id") or "").strip()
     if not task_id:
         return {"status": "skipped", "reason": "task_id_missing"}
@@ -2198,7 +2202,21 @@ def cmd_spec_review(args: argparse.Namespace) -> int:
     with _project_execution_guard(project_root, already_locked=_command_locked(args)):
         payload, input_path = load_stage_payload(project_root, "spec-review", args.input, expected_type=dict, required_fields=["requirements", "acceptance_scenarios"])
         assert isinstance(payload, dict)
-        return import_spec_review(project_root, payload, input_path)
+        try:
+            return import_spec_review(project_root, payload, input_path)
+        except DeliveryError as exc:
+            if exc.code not in {"planning_review_required", "planning_review_stale", "planning_review_runner_required"}:
+                raise
+            result = run_planning_review(project_root, "spec-review", input_path)
+            if not result["passed"]:
+                raise DeliveryError(
+                    code="planning_review_not_passed",
+                    message="spec-review planning review returned revise; regenerate the candidate from its findings",
+                    exit_code=2,
+                    details={"stage": "spec-review", **result},
+                    suggested_action="Regenerate spec-review.json from the review findings, then rerun spec-review.",
+                )
+            return import_spec_review(project_root, payload, input_path)
 
 
 def cmd_arch_design(args: argparse.Namespace) -> int:
@@ -2236,7 +2254,21 @@ def cmd_decompose(args: argparse.Namespace) -> int:
             required_fields=["items", "delivery_complexity", "validation_gates"],
         )
         assert isinstance(payload, dict)
-        return import_decompose(project_root, payload, input_path)
+        try:
+            return import_decompose(project_root, payload, input_path)
+        except DeliveryError as exc:
+            if exc.code not in {"planning_review_required", "planning_review_stale", "planning_review_runner_required"}:
+                raise
+            result = run_planning_review(project_root, "task-decompose", input_path)
+            if not result["passed"]:
+                raise DeliveryError(
+                    code="planning_review_not_passed",
+                    message="task-decompose planning review returned revise; regenerate the candidate from its findings",
+                    exit_code=2,
+                    details={"stage": "task-decompose", **result},
+                    suggested_action="Regenerate task-decompose.json from the review findings, then rerun decompose.",
+                )
+            return import_decompose(project_root, payload, input_path)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
