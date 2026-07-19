@@ -101,6 +101,7 @@ from .verify import (
 
 MAX_TEST_FIX_ATTEMPTS = 3
 MAX_STALLED_RUNTIME_RECOVERIES = 2
+MAX_STARTUP_RUNTIME_RETRIES = 1
 MAX_FINAL_REPAIR_ITERATIONS = 3
 FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
@@ -768,6 +769,52 @@ class DeliveryLoop:
         execute_in_session(self.project_root, session, prompt)
         self._sync_active_task_session_id(task_id, session)
 
+    def _is_startup_runtime_interruption(self, task: Task, exc: RuntimeErrorResponse) -> bool:
+        if exc.kind != "runtime_interrupted":
+            return False
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
+        started_at = str(runtime_state.get("started_at") or "").strip()
+        last_output_at = str(runtime_state.get("last_output_at") or "").strip()
+        return bool(
+            started_at
+            and last_output_at
+            and last_output_at >= started_at
+            and not runtime_state.get("last_tool_at")
+            and not runtime_state.get("last_mutation_at")
+            and int(runtime_state.get("startup_retry_count") or 0) < MAX_STARTUP_RUNTIME_RETRIES
+        )
+
+    def _prepare_startup_runtime_retry(self, task: Task, session: RuntimeSession) -> tuple[bool, str]:
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
+        retry_count = int(runtime_state.get("startup_retry_count") or 0) + 1
+        tasks = reset_task(all_tasks(self.project_root), task.id, blocked_reason="runtime startup interrupted; fresh retry in progress")
+        save_tasks(self.project_root, tasks)
+        save_task_runtime_state(
+            self.project_root,
+            task.id,
+            {
+                "status": "interrupted",
+                "completed_at": None,
+                "exit_code": None,
+                "session_id": None,
+                "last_output_at": None,
+                "last_session_update_at": None,
+                "last_tool_at": None,
+                "last_mutation_at": None,
+                "startup_retry_count": retry_count,
+                "recovery_prompt": None,
+                "recovery_reason": "runtime_startup",
+                "recovery_requested_at": utc_now_iso(),
+            },
+        )
+        retire_session(self.project_root, session)
+        return False, "stalled_recovery"
+
+    def _handle_runtime_interruption(self, task: Task, session: RuntimeSession, exc: RuntimeErrorResponse) -> tuple[bool, str]:
+        if self._is_startup_runtime_interruption(task, exc):
+            return self._prepare_startup_runtime_retry(task, session)
+        return self._prepare_stalled_runtime_recovery(task, session, exc)
+
     def _prepare_stalled_runtime_recovery(self, task: Task, session: RuntimeSession, exc: RuntimeErrorResponse) -> tuple[bool, str]:
         runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
         recovery_count = int(runtime_state.get("stalled_recovery_count") or 0) + 1
@@ -942,7 +989,7 @@ class DeliveryLoop:
                     self._execute_session_prompt(task.id, session, recovery_prompt)
                 except RuntimeErrorResponse as exc:
                     if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
-                        return self._prepare_stalled_runtime_recovery(task, session, exc)
+                        return self._handle_runtime_interruption(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
                 save_task_runtime_state(
                     self.project_root,
@@ -960,7 +1007,7 @@ class DeliveryLoop:
                     self._execute_session_prompt(task.id, session, prompt)
                 except RuntimeErrorResponse as exc:
                     if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
-                        return self._prepare_stalled_runtime_recovery(task, session, exc)
+                        return self._handle_runtime_interruption(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
                 if force_task_prompt:
                     save_task_runtime_state(
@@ -1061,7 +1108,7 @@ class DeliveryLoop:
                     self._execute_session_prompt(current.id, session, fix_prompt)
                 except RuntimeErrorResponse as exc:
                     if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
-                        return self._prepare_stalled_runtime_recovery(current, session, exc)
+                        return self._handle_runtime_interruption(current, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
             tasks = all_tasks(self.project_root)
             patch_relative_path = park_task_exception_changes(self.project_root, task)
@@ -1156,6 +1203,13 @@ class DeliveryLoop:
             self.project_root,
             task_id,
             {
+                "status": "exception",
+                "completed_at": utc_now_iso(),
+                "exit_code": exc.returncode,
+                "session_id": resolved_session_id,
+                "failure_kind": exc.kind,
+                "failure_message": failure_message,
+                "recovery_prompt": None,
                 "escalation": {
                     "status": "required",
                     "kind": "runtime_failure",
