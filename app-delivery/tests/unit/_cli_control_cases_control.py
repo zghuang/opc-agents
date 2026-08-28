@@ -11,9 +11,10 @@ import pytest
 
 from delivery.builtin_tasks import FRONTEND_API_AUDIT_OUTPUT_PATHS, FRONTEND_API_AUDIT_OUTPUT_TESTS, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_OUTPUT_TESTS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID
 from delivery.errors import DeliveryError
+from tests.unit.planning_review_test_helpers import approve_candidate
 from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
 from delivery.loop_review import code_review_request_path
-from delivery.loop import status as loop_status
+from delivery.loop_reporting import status as loop_status
 from delivery.control_plane_host import build_planning_host_step, build_review_host_step
 from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt
@@ -82,7 +83,9 @@ def test_cmd_spec_review_archives_source_requirements_when_payload_includes_path
         ),
         encoding="utf-8",
     )
+    approve_candidate(tmp_path, "spec-review", input_path)
 
+    assert not (tmp_path / "docs" / "requirements.json").exists()
     result = cli.cmd_spec_review(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
     assert result == 0
@@ -112,6 +115,7 @@ def test_cmd_spec_review_preserves_blocking_clarifications(tmp_path: Path) -> No
         encoding="utf-8",
     )
     (tmp_path / "raw.md").write_text("# Raw requirements\n", encoding="utf-8")
+    approve_candidate(tmp_path, "spec-review", input_path)
 
     result = cli.cmd_spec_review(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 

@@ -4,10 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .release_assessment import RELEASE_ASSESSMENT_PATH, release_assessment_path, validate_release_assessment
 from .runtime_config import resolve_project_root
 from .state import ensure_runtime_dirs, project_paths, utc_now_iso
 from .task import Task
-
 
 REVIEW_INPUT_DIRNAME = "review-inputs"
 REVIEW_REQUEST_DIRNAME = "review-requests"
@@ -385,6 +385,22 @@ def write_final_review_artifact(project_root: Path | str, review_payload: dict[s
     status = str(review_payload.get("status") or "changes_requested").strip()
     summary = str(review_payload.get("summary") or "").strip()
     findings = review_payload.get("findings") if isinstance(review_payload.get("findings"), list) else []
+    assessment_path = release_assessment_path(project_root)
+    assessment_summary = "- missing"
+    try:
+        assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        assessment = {}
+    if isinstance(assessment, dict):
+        try:
+            validated_assessment = validate_release_assessment(assessment)
+        except ValueError:
+            validated_assessment = None
+        assessment_summary = (
+            f"- score: {assessment.get('score', '-')} / {assessment.get('threshold', '-')}\n"
+            f"- release_eligible: {validated_assessment.get('release_eligible', False) if validated_assessment else False}\n"
+            f"- artifact: {RELEASE_ASSESSMENT_PATH}"
+        )
     lines = [
         f"status: {status}",
         "review_type: final",
@@ -411,6 +427,7 @@ def write_final_review_artifact(project_root: Path | str, review_payload: dict[s
                 lines.append(f"- {finding}")
     else:
         lines.append("- No blocking findings.")
+    lines.extend(["", "## Release Assessment", "", assessment_summary])
     review_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(review_path.relative_to(project_paths(project_root).project_root))
 
@@ -430,6 +447,14 @@ _write_final_review_artifact = write_final_review_artifact
 
 
 __all__ = [
+    "_archive_review_round",
+    "_deferred_review_payload",
+    "_final_review_path",
+    "_write_final_review_artifact",
+    "_write_request_if_changed",
+    "_write_review_artifact",
+    "_write_review_repair_limit_report",
+    "_write_task_contract_deferral_artifacts",
     "archive_review_round",
     "code_review_request_path",
     "deferred_review_payload",
@@ -442,12 +467,4 @@ __all__ = [
     "write_review_artifact",
     "write_review_repair_limit_report",
     "write_task_contract_deferral_artifacts",
-    "_archive_review_round",
-    "_deferred_review_payload",
-    "_final_review_path",
-    "_write_final_review_artifact",
-    "_write_request_if_changed",
-    "_write_review_artifact",
-    "_write_review_repair_limit_report",
-    "_write_task_contract_deferral_artifacts",
 ]

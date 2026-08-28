@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-def load_requirement_details(project_root: Path | str) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, Any]]]:
+def load_requirement_details(project_root: Path | str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     requirements_path = Path(project_root).expanduser().resolve() / "docs" / "requirements.json"
     if not requirements_path.exists():
         return {}, {}
@@ -21,6 +21,7 @@ def load_requirement_details(project_root: Path | str) -> tuple[dict[str, dict[s
         str(row.get("id") or "").strip(): {
             "title": str(row.get("title") or "").strip(),
             "summary": str(row.get("summary") or "").strip(),
+            "source_requirement_ids": [str(value).strip() for value in row.get("source_requirement_ids", []) if str(value).strip()],
         }
         for row in requirements
         if isinstance(row, dict) and str(row.get("id") or "").strip()
@@ -44,7 +45,13 @@ def format_requirement_context(project_root: Path | str, requirement_ids: list[s
         title = row.get("title") or ""
         summary = row.get("summary") or ""
         detail = " — ".join(part for part in [title, summary] if part)
-        lines.append(f"- {requirement_id}: {detail}" if detail else f"- {requirement_id}")
+        anchors = [str(value).strip() for value in row.get("source_requirement_ids", []) if str(value).strip()]
+        context = f"- {requirement_id}: {detail}" if detail else f"- {requirement_id}"
+        if anchors:
+            context += "\n  Source anchors: " + ", ".join(anchors) + ". Read these parts of `docs/requirements-source.md` before coding."
+        else:
+            context += "\n  Source anchors: unavailable. Treat this as a requirements-traceability warning and inspect `docs/requirements-source.md` before coding."
+        lines.append(context)
     return lines
 
 
@@ -59,5 +66,11 @@ def format_acceptance_context(project_root: Path | str, acceptance_ids: list[str
         title = str(row.get("title") or "").strip()
         summary = str(row.get("summary") or "").strip()
         detail = " — ".join(part for part in [title, summary] if part)
-        lines.append(f"- {acceptance_id}: {detail}" if detail else f"- {acceptance_id}")
+        anchors = [str(value).strip() for value in row.get("source_requirement_ids", []) if str(value).strip()]
+        context = f"- {acceptance_id}: {detail}" if detail else f"- {acceptance_id}"
+        if anchors:
+            context += "\n  Source anchors: " + ", ".join(anchors) + ". Read these parts of `docs/requirements-source.md` before coding."
+        else:
+            context += "\n  Source anchors: unavailable. Inspect `docs/requirements-source.md` before treating this scenario as proven."
+        lines.append(context)
     return lines

@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 import re
 from pathlib import Path
 from typing import Any
 
-from .requirements_context import format_acceptance_context, format_requirement_context
-from .state import load_gates, load_task_runtime_state, load_test_results, project_paths
-from .test_env import frontend_e2e_env_prefix
 from .builtin_task_prompts import render_frontend_api_audit_prompt, render_prefinal_audit_prompt
-from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, SHARED_FOUNDATION_TASK_ID
+from .builtin_tasks import (
+    FRONTEND_API_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_REPORT_PATH,
+    PREFINAL_AUDIT_TASK_ID,
+    SHARED_FOUNDATION_TASK_ID,
+)
 from .loop_gitops import repair_invalid_verified_tasks
+from .requirements_context import format_acceptance_context, format_requirement_context
 from .scaffold import _extract_module_architecture_tree
+from .state import load_gates, load_task_runtime_state, load_test_results, project_paths
+from .system_gap_ledger import SYSTEM_GAP_LEDGER_PATH, unresolved_system_gap_summary
 from .task import Task, all_tasks, lint_task_contract, normalize_intent_list
-
+from .test_env import frontend_e2e_env_prefix
 
 FINAL_REPAIR_REPORT_PATH = "docs/reviews/final-repair-report.md"
 FINAL_VERIFICATION_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
@@ -48,7 +52,7 @@ def _safe_prompt_kind(prompt_kind: str) -> str:
 
 
 def _prompt_history_timestamp() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _prompt_history_path(project_root: Path | str, task: Task, prompt_kind: str) -> Path:
@@ -857,6 +861,8 @@ def build_validation_task_prompt(project_root: Path | str, task: Task) -> str:
 
 
 def build_fix_prompt(project_root: Path | str, task: Task, test_summary: str) -> str:
+    if task.id == PREFINAL_AUDIT_TASK_ID:
+        return build_system_gap_fix_retry_prompt(project_root, task, test_summary)
     project_dir = Path(project_root).expanduser().resolve()
     lines = [
         f"The tests for task {task.id} are still failing.",
@@ -901,6 +907,28 @@ def build_fix_prompt(project_root: Path | str, task: Task, test_summary: str) ->
     prompt = "\n".join(lines)
     write_task_prompt(project_root, task, prompt, prompt_kind="test-fix")
     return prompt
+
+
+def build_system_gap_fix_retry_prompt(project_root: Path | str, task: Task, test_summary: str) -> str:
+    project_dir = Path(project_root).expanduser().resolve()
+    prompt = render_prefinal_audit_prompt(project_dir, task)
+    unresolved = unresolved_system_gap_summary(project_dir)
+    lines = [
+        prompt,
+        "",
+        "Retry context:",
+        f"- The prior System Gap Fix validation failed: {test_summary}",
+        f"- Read the existing report at `{PREFINAL_AUDIT_REPORT_PATH}` and ledger at `{SYSTEM_GAP_LEDGER_PATH}` before changing code.",
+        "- Do not reduce this retry to formatting or artifact checks. Continue the scan-fix-validate-rescan mission until automatically repairable gaps are fixed.",
+    ]
+    if unresolved:
+        lines.append("- Unresolved blocking gaps from the prior ledger:")
+        lines.extend(f"  - {summary}" for summary in unresolved)
+    else:
+        lines.append("- No valid unresolved-gap summary was available. Rebuild the ledger from the source requirements and current repository state.")
+    retry_prompt = "\n".join(lines)
+    write_task_prompt(project_dir, task, retry_prompt, prompt_kind="system-gap-fix-retry")
+    return retry_prompt
 
 
 def build_stalled_recovery_prompt(

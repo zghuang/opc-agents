@@ -6,15 +6,27 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .builtin_tasks import (
+    FINAL_VERIFY_TASK_ID,
+    FRONTEND_API_AUDIT_REPORT_PATH,
+    FRONTEND_API_AUDIT_REQUIRED_SECTIONS,
+    FRONTEND_API_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_REPORT_PATH,
+    PREFINAL_AUDIT_REQUIRED_SECTIONS,
+    PREFINAL_AUDIT_TASK_ID,
+)
 from .errors import DeliveryError
 from .gates import refresh_gates
-from .loop_gitops import git_commit_explicit_paths, git_commit_task
-from .builtin_tasks import FINAL_VERIFY_TASK_ID, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_REQUIRED_SECTIONS, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_REQUIRED_SECTIONS, PREFINAL_AUDIT_TASK_ID
-from .runtime_config import resolve_project_root
+from .loop_gitops import blocking_verified_task_issues, git_commit_explicit_paths, git_commit_task
+from .production_semantics import mock_only_browser_e2e_issues, scan_production_semantics
+from .release_assessment import (
+    RELEASE_SCORE_THRESHOLD,
+    release_assessment_path,
+    validate_release_assessment,
+)
 from .review_artifacts import (
     _archive_review_round,
     _deferred_review_payload,
-    _final_review_path,
     _write_final_review_artifact,
     _write_request_if_changed,
     _write_review_artifact,
@@ -32,13 +44,27 @@ from .review_payload import (
     _review_requests_task_decompose_repair,
     _validate_pass_review_matrix,
 )
-from .review_prompts import build_code_review_request, build_final_review_request, build_validation_code_review_request
-from .production_semantics import mock_only_browser_e2e_issues, scan_production_semantics
+from .review_prompts import (
+    build_code_review_request,
+    build_final_review_request,
+)
+from .runtime_config import resolve_project_root
 from .session import current_session, retire_session, save_current_session
-from .state import ensure_runtime_dirs, load_task_runtime_state, load_test_results, normalize_task_runtime_state, project_paths, save_task_runtime_state, utc_now_iso
+from .state import (
+    load_task_runtime_state,
+    load_test_results,
+    normalize_task_runtime_state,
+    project_paths,
+    save_task_runtime_state,
+    utc_now_iso,
+)
+from .system_gap_ledger import system_gap_ledger_issues, system_gap_ledger_status, unresolved_system_gap_summary
 from .task import Task, all_tasks, mark_task, next_generated_task_id, save_tasks
-from .task_contract_repair import TaskContractRepairBlocked, TaskContractRepairError, apply_task_contract_repair, defer_acceptance_scenarios
-
+from .task_contract_repair import (
+    TaskContractRepairError,
+    apply_task_contract_repair,
+    defer_acceptance_scenarios,
+)
 
 MAX_CODE_REVIEW_REPAIR_ATTEMPTS = 4
 MAX_FINAL_REPAIR_ITERATIONS = 3
@@ -173,6 +199,54 @@ def _prefinal_audit_artifact_issues(project_root: Path | str) -> list[str]:
         return [
             "system audit report declares release-blocking gaps or says T-FINAL should not proceed; review pass is not allowed until blockers are fixed or the report is updated with source-backed evidence"
         ]
+    return system_gap_ledger_issues(project_root)
+
+
+def _final_release_assessment_issues(project_root: Path | str) -> list[str]:
+    system_gap_issues = system_gap_ledger_issues(project_root)
+    if system_gap_issues:
+        return system_gap_issues
+    path = release_assessment_path(project_root)
+    if not path.is_file():
+        return [f"required release assessment is missing: {path.relative_to(resolve_project_root(project_root))}"]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ["required release assessment cannot be read"]
+    try:
+        assessment = validate_release_assessment(payload)
+    except ValueError as exc:
+        return [f"required release assessment is invalid: {exc}"]
+    if assessment["score"] < RELEASE_SCORE_THRESHOLD:
+        return [f"release assessment score {assessment['score']} is below the required threshold {RELEASE_SCORE_THRESHOLD}"]
+    failed_gates = [gate["id"] for gate in assessment["hard_gates"] if gate["status"] != "pass"]
+    if failed_gates:
+        return ["release assessment has failed hard gates: " + ", ".join(failed_gates)]
+    if not assessment["release_eligible"]:
+        return ["release assessment is not eligible for release"]
+    runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, FINAL_VERIFY_TASK_ID))
+    framework_gates = runtime_state.get("final_release_hard_gates")
+    if not isinstance(framework_gates, list):
+        return ["framework hard-gate attestation is missing; rerun final verification before importing a pass review"]
+    framework_status = {
+        str(row.get("id") or "").strip(): str(row.get("status") or "").strip().casefold()
+        for row in framework_gates
+        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    }
+    assessment_status = {gate["id"]: gate["status"] for gate in assessment["hard_gates"]}
+    missing_framework_gates = [gate_id for gate_id in assessment_status if gate_id not in framework_status]
+    if missing_framework_gates:
+        return ["framework hard-gate attestation is missing gates: " + ", ".join(missing_framework_gates)]
+    failed_framework_gates = [gate_id for gate_id, status in framework_status.items() if gate_id in assessment_status and status != "pass"]
+    if failed_framework_gates:
+        return ["framework hard-gate attestation has failed gates: " + ", ".join(failed_framework_gates)]
+    mismatched_gates = [
+        gate_id
+        for gate_id, status in assessment_status.items()
+        if framework_status.get(gate_id) != status
+    ]
+    if mismatched_gates:
+        return ["release assessment hard gates disagree with framework attestation: " + ", ".join(mismatched_gates)]
     return []
 
 
@@ -757,6 +831,42 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
     machine_repeat_count = int(runtime_state.get("machine_precondition_repeat_count") or 0) + 1 if same_machine_fingerprint else 0
     deferred_semantic_risk_path: str | None = None
     project_tasks = all_tasks(project_dir)
+    if task.id == PREFINAL_AUDIT_TASK_ID and system_gap_ledger_status(project_dir) == "blocked":
+        blockers = unresolved_system_gap_summary(project_dir)
+        blocked_reason = "System Gap Fix requires clarification or an external dependency"
+        if blockers:
+            blocked_reason += ": " + "; ".join(blockers[:3])
+        tasks = mark_task(
+            project_tasks,
+            task.id,
+            "blocked",
+            git_commit=None,
+            status_session_id=task.status_session_id,
+            started_at=None,
+            completed_at=None,
+            review_status=review_status,
+            review_artifact=review_artifact,
+            reviewed_at=reviewed_at,
+            verified_at=None,
+            blocked_reason=blocked_reason,
+            attempts=max(task.attempts, 1),
+        )
+        save_tasks(project_dir, tasks)
+        active_session = current_session(project_dir)
+        if active_session is not None and active_session.id == task.status_session_id:
+            retire_session(project_dir, active_session)
+        save_task_runtime_state(
+            project_dir,
+            task_id,
+            {
+                "system_gap_fix_status": "blocked",
+                "system_gap_fix_blockers": blockers,
+                "system_gap_fix_blocked_at": reviewed_at,
+                "pending_scope_report": None,
+            },
+        )
+        refresh_gates(project_dir)
+        return 2
     if same_machine_fingerprint and _machine_precondition_can_defer_for_progress(task, parsed, machine_repeat_count, project_tasks):
         parsed = _machine_precondition_progress_pass_payload(task, parsed, fingerprint=machine_fingerprint, repeat_count=machine_repeat_count, project_tasks=project_tasks)
         review_status = "pass"
@@ -791,6 +901,9 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
             review_artifact=review_artifact,
             reviewed_at=reviewed_at,
             verified_at=reviewed_at,
+            verification_source="code_review",
+            verification_actor="code_review",
+            verification_reason="independent code review passed",
             blocked_reason=None,
             attempts=max(task.attempts, 1),
         )
@@ -1068,6 +1181,9 @@ def import_task_review(project_root: Path | str, task_id: str, payload: dict[str
                 review_artifact=review_artifact,
                 reviewed_at=reviewed_at,
                 verified_at=reviewed_at,
+                verification_source="code_review_deferred_acceptance",
+                verification_actor="code_review",
+                verification_reason="independent review passed with documented acceptance deferral",
                 blocked_reason=(
                     "verified with deferred acceptance scenario assignment; "
                     f"see {deferral_artifacts[1]}"
@@ -1214,6 +1330,59 @@ def import_final_review(project_root: Path | str, payload: dict[str, Any], input
             details={"project": str(project_dir), "status": task.status, "input_path": str(input_path)},
         )
     parsed = _parse_review_payload(json.dumps(payload, ensure_ascii=False))
+    review_status = str(parsed.get("status") or "changes_requested").strip()
+    if review_status.casefold() == "pass":
+        project_tasks = all_tasks(project_dir)
+        invalid_verified = blocking_verified_task_issues(project_dir, project_tasks)
+        invalid_verified.pop(FINAL_VERIFY_TASK_ID, None)
+        if invalid_verified:
+            tasks_by_id = {candidate.id: candidate for candidate in project_tasks}
+            evidence_findings = [
+                {
+                    "severity": "blocking",
+                    "requirement_ids": list(tasks_by_id[task_id].requirements),
+                    "acceptance_ids": list(tasks_by_id[task_id].acceptance_scenarios),
+                    "message": f"Verified task {task_id} has invalid release evidence: {issue}",
+                }
+                for task_id, issue in invalid_verified.items()
+                if task_id in tasks_by_id
+            ]
+            parsed = {
+                **parsed,
+                "status": "changes_requested",
+                "summary": "Final review pass rejected because verified-task release evidence is invalid: "
+                + "; ".join(f"{task_id}: {issue}" for task_id, issue in invalid_verified.items()),
+                "findings": [
+                    *[finding for finding in parsed.get("findings", []) if isinstance(finding, dict)],
+                    *evidence_findings,
+                ],
+            }
+            review_status = "changes_requested"
+    # Release assessment is intentionally display-only. The framework's existing
+    # verification, gate, and System Gap Fix checks remain the release controls.
+    # Keep this former score-gating branch for a future policy decision rather
+    # than deleting it, but do not let scorecard values start repair work now.
+    # if review_status.casefold() == "pass":
+    #     assessment_errors = _final_release_assessment_issues(project_dir)
+    #     if assessment_errors:
+    #         parsed = {
+    #             **parsed,
+    #             "status": "changes_requested",
+    #             "summary": "Final review pass rejected because release assessment requirements are not satisfied. " + "; ".join(assessment_errors),
+    #             "findings": [
+    #                 *[finding for finding in parsed.get("findings", []) if isinstance(finding, dict)],
+    #                 *[
+    #                     {
+    #                         "severity": "blocking",
+    #                         "requirement_ids": [],
+    #                         "acceptance_ids": [],
+    #                         "message": error,
+    #                     }
+    #                     for error in assessment_errors
+    #                 ],
+    #             }
+    #         }
+    #         review_status = "changes_requested"
     reviewed_at = utc_now_iso()
     persisted_input = final_review_input_path(project_dir)
     persisted_input_content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
@@ -1228,7 +1397,6 @@ def import_final_review(project_root: Path | str, payload: dict[str, Any], input
         artifact_path=project_paths(project_dir).project_root / review_artifact,
         reviewed_at=reviewed_at,
     )
-    review_status = str(parsed.get("status") or "changes_requested").strip()
     if review_status.casefold() == "pass":
         tasks = mark_task(
             all_tasks(project_dir),
@@ -1238,6 +1406,9 @@ def import_final_review(project_root: Path | str, payload: dict[str, Any], input
             review_artifact=review_artifact,
             reviewed_at=reviewed_at,
             verified_at=reviewed_at,
+            verification_source="final_review",
+            verification_actor="final_review",
+            verification_reason="independent final review passed",
             blocked_reason=None,
         )
         save_tasks(project_dir, tasks)
@@ -1285,17 +1456,17 @@ def import_final_review(project_root: Path | str, payload: dict[str, Any], input
 
 __all__ = [
     "REVIEW_SCHEMA",
+    "_parse_review_payload",
+    "_write_final_review_artifact",
+    "_write_review_artifact",
     "build_code_review_request",
     "build_final_review_request",
     "code_review_request_path",
-    "final_review_request_path",
-    "review_input_path",
     "final_review_input_path",
-    "import_task_review",
+    "final_review_request_path",
     "import_final_review",
-    "_parse_review_payload",
-    "_write_review_artifact",
-    "_write_final_review_artifact",
+    "import_task_review",
+    "review_input_path",
     "write_code_review_request",
     "write_final_review_request",
 ]

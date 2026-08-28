@@ -7,23 +7,37 @@ from pathlib import Path
 from typing import Any
 
 from .builtin_tasks import (
+    FINAL_VERIFY_OUTPUT_PATHS,
     FINAL_VERIFY_TASK_ID,
     FRONTEND_API_AUDIT_OUTPUT_PATHS,
     FRONTEND_API_AUDIT_OUTPUT_TESTS,
-    FRONTEND_API_AUDIT_REPORT_PATH,
     FRONTEND_API_AUDIT_TASK_ID,
     PREFINAL_AUDIT_OUTPUT_PATHS,
     PREFINAL_AUDIT_OUTPUT_TESTS,
-    PREFINAL_AUDIT_REPORT_PATH,
     PREFINAL_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_TITLE,
     SCAFFOLD_TASK_ID,
     SHARED_FOUNDATION_TASK_ID,
     needs_frontend_api_audit,
 )
-from .production_gates import PRODUCTION_GATE_TITLE_PREFIX, next_production_gate_task_id, production_gate_task_dict, required_production_gates
+from .production_gates import (
+    PRODUCTION_GATE_TITLE_PREFIX,
+    next_production_gate_task_id,
+    production_gate_task_dict,
+    required_production_gates,
+)
 from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root, optional_stack_paths
-from .state import load_gates, load_test_plan, load_work_items, project_paths, save_work_items, utc_now_iso
-
+from .state import (
+    acquire_lock,
+    append_task_log_event,
+    load_gates,
+    load_task_runtime_state,
+    load_test_plan,
+    load_work_items,
+    project_paths,
+    save_work_items,
+    utc_now_iso,
+)
 
 REQ_ID_RE = re.compile(r"\b((?:REQ|NFR)-\d{3,})\b")
 REQ_RANGE_RE = re.compile(
@@ -32,6 +46,23 @@ REQ_RANGE_RE = re.compile(
 )
 TASK_ID_RE = re.compile(r"^T\d{3,}$")
 VALID_STATUSES = {"pending", "active", "review_pending", "done", "verified", "blocked", "exception", "cancelled"}
+VERIFICATION_SOURCES = {
+    "builtin_scaffold",
+    "code_review",
+    "code_review_deferred_acceptance",
+    "final_review",
+    "final_verification",
+    "manual_accept",
+    "reconcile_review_evidence",
+}
+VERIFICATION_PREVIOUS_STATUSES = {
+    "builtin_scaffold": {"pending", "active"},
+    "code_review": {"review_pending"},
+    "code_review_deferred_acceptance": {"review_pending"},
+    "final_review": {"review_pending"},
+    "final_verification": {"pending", "review_pending", "blocked"},
+    "reconcile_review_evidence": {"active", "pending"},
+}
 NON_CANONICAL_BACKEND_ROOT_DIRS = set(PYTHON_REACT_CONTRACT.noncanonical_backend_root_dirs)
 FOUNDATION_SCOPE_PREFIXES = (
     "backend/",
@@ -106,7 +137,7 @@ FRAMEWORK_BUILTIN_TASK_IDS = {
 }
 
 
-def _is_framework_generated_task(task: "Task") -> bool:
+def _is_framework_generated_task(task: Task) -> bool:
     if task.id in FRAMEWORK_BUILTIN_TASK_IDS:
         return True
     return task.task_kind == "validation" and task.id.startswith("T9") and task.title.startswith(PRODUCTION_GATE_TITLE_PREFIX)
@@ -272,6 +303,23 @@ def _is_shared_foundation_candidate(task: Task) -> bool:
     return not task.requirements and not task.acceptance_scenarios
 
 
+def _is_shared_foundation_candidate_payload(raw_item: dict[str, Any]) -> bool:
+    return _is_shared_foundation_candidate(
+        Task.from_dict(
+            {
+                "id": "__shared_foundation_candidate__",
+                "title": raw_item.get("title") or "",
+                "task_kind": raw_item.get("task_kind") or "feature",
+                "requirements": raw_item.get("requirements", []),
+                "acceptance_scenarios": raw_item.get("acceptance_scenarios", []),
+                "dependencies": raw_item.get("dependencies", []),
+                "output_tests": raw_item.get("output_tests", []),
+                "output_paths": raw_item.get("output_paths", []),
+            }
+        )
+    )
+
+
 def _is_project_root_relative_path(value: str) -> bool:
     normalized = _strip_current_dir_prefix(value)
     if not normalized:
@@ -322,7 +370,7 @@ def _collapse_shared_foundation_tasks(tasks: list[Task]) -> list[Task]:
     return collapsed
 
 
-def _normalize_builtin_task_contract(task: "Task") -> "Task":
+def _normalize_builtin_task_contract(task: Task) -> Task:
     data = task.to_dict()
     if task.id == SCAFFOLD_TASK_ID:
         data["output_paths"] = _dedupe_preserve([*SCAFFOLD_OUTPUT_PATHS, *task.output_paths])
@@ -341,12 +389,15 @@ def _normalize_builtin_task_contract(task: "Task") -> "Task":
         data["output_tests"] = _dedupe_preserve([*FRONTEND_API_AUDIT_OUTPUT_TESTS, *task.output_tests])
         return Task.from_dict(data)
     if task.id == PREFINAL_AUDIT_TASK_ID:
-        data["title"] = "Pre-final full-system repair pass"
+        data["title"] = PREFINAL_AUDIT_TITLE
         data["task_kind"] = "audit"
         data["requirements"] = []
         data["acceptance_scenarios"] = []
         data["output_paths"] = _dedupe_preserve([*PREFINAL_AUDIT_OUTPUT_PATHS, *task.output_paths])
         data["output_tests"] = _dedupe_preserve([*PREFINAL_AUDIT_OUTPUT_TESTS, *task.output_tests])
+        return Task.from_dict(data)
+    if task.id == FINAL_VERIFY_TASK_ID:
+        data["output_paths"] = _dedupe_preserve([*FINAL_VERIFY_OUTPUT_PATHS, *task.output_paths])
         return Task.from_dict(data)
     return task
 
@@ -375,9 +426,12 @@ class Task:
     blocked_reason: str | None = None
     attempts: int = 0
     technology_constraints: list[dict[str, Any]] | None = None
+    verification_source: str | None = None
+    verification_actor: str | None = None
+    verification_reason: str | None = None
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "Task":
+    def from_dict(cls, payload: dict[str, Any]) -> Task:
         return cls(
             id=str(payload.get("id") or "").strip(),
             title=str(payload.get("title") or "").strip(),
@@ -398,6 +452,9 @@ class Task:
             review_artifact=str(payload.get("review_artifact") or "").strip() or None,
             reviewed_at=str(payload.get("reviewed_at") or "").strip() or None,
             verified_at=str(payload.get("verified_at") or "").strip() or None,
+            verification_source=str(payload.get("verification_source") or "").strip() or None,
+            verification_actor=str(payload.get("verification_actor") or "").strip() or None,
+            verification_reason=str(payload.get("verification_reason") or "").strip() or None,
             blocked_reason=str(payload.get("blocked_reason") or "").strip() or None,
             attempts=int(payload.get("attempts") or 0),
             technology_constraints=_normalize_technology_constraints(payload.get("technology_constraints")) or None,
@@ -418,6 +475,9 @@ class Task:
             "review_artifact": self.review_artifact,
             "reviewed_at": self.reviewed_at,
             "verified_at": self.verified_at,
+            "verification_source": self.verification_source,
+            "verification_actor": self.verification_actor,
+            "verification_reason": self.verification_reason,
             "requirements": self.requirements,
             "acceptance_scenarios": self.acceptance_scenarios,
             "dependencies": self.dependencies,
@@ -482,10 +542,106 @@ def all_tasks(project_root: Path | str) -> list[Task]:
     return [_normalize_builtin_task_contract(Task.from_dict(item)) for item in items if isinstance(item, dict)]
 
 
+def _verified_transition_error(project_root: Path | str, previous: Task, current: Task) -> str | None:
+    source = str(current.verification_source or "").strip()
+    if source not in VERIFICATION_SOURCES:
+        return "missing explicit verification source"
+    if source == "manual_accept":
+        if str(current.verification_actor or "").strip() != "host" or not str(current.verification_reason or "").strip():
+            return "manual acceptance requires host actor and non-empty reason"
+        runtime_state = load_task_runtime_state(project_root, current.id)
+        override = runtime_state.get("manual_override") if isinstance(runtime_state.get("manual_override"), dict) else {}
+        if (
+            str(override.get("action") or "").strip() != "accept"
+            or str(override.get("actor") or "").strip() != "host"
+            or str(override.get("reason") or "").strip() != str(current.verification_reason or "").strip()
+            or not str(override.get("accepted_at") or "").strip()
+        ):
+            return "manual acceptance requires matching runtime override evidence"
+        return None
+    allowed_previous_statuses = VERIFICATION_PREVIOUS_STATUSES.get(source, set())
+    if previous.status not in allowed_previous_statuses:
+        return f"verification source {source} is not valid from {previous.status}"
+    if source == "builtin_scaffold":
+        if current.id != SCAFFOLD_TASK_ID:
+            return "builtin scaffold verification source is only valid for T000"
+    elif source in {"final_review", "final_verification"}:
+        if current.id != FINAL_VERIFY_TASK_ID:
+            return "final verification source is only valid for T-FINAL"
+    if str(current.review_status or "").strip().casefold() != "pass":
+        return "verification requires review_status=pass"
+    if not str(current.review_artifact or "").strip():
+        return "verification requires a review artifact"
+    if source not in {"final_review", "final_verification"} and not str(current.git_commit or "").strip():
+        return "verification requires a task-owned commit"
+    return None
+
+
+def _validated_task_transition_rows(project_root: Path | str, tasks: list[Task]) -> list[tuple[Task, Task]]:
+    previous_by_id = {task.id: task for task in all_tasks(project_root)}
+    current_ids = {task.id for task in tasks}
+    for previous in previous_by_id.values():
+        if previous.status == "verified" and previous.task_kind == "feature" and previous.id not in current_ids:
+            raise ValueError(f"refusing invalid task transition {previous.id}: verified feature tasks cannot be removed")
+    transitions: list[tuple[Task, Task]] = []
+    for current in tasks:
+        previous = previous_by_id.get(current.id)
+        if previous is None:
+            continue
+        if previous.status == "verified":
+            if current.status != "verified" and previous.task_kind == "feature":
+                raise ValueError(
+                    f"refusing invalid task transition {current.id}: verified feature tasks cannot regress to {current.status}"
+                )
+            continue
+        if current.status != "verified":
+            continue
+        error = _verified_transition_error(project_root, previous, current)
+        if error:
+            raise ValueError(
+                f"refusing invalid task transition {current.id}: {previous.status} -> verified; {error}"
+            )
+        transitions.append((previous, current))
+    return transitions
+
+
+def _save_task_ledger(project_root: Path | str, payload: dict[str, Any], tasks: list[Task]) -> None:
+    with acquire_lock(project_root, name="ledger"):
+        transitions = _validated_task_transition_rows(project_root, tasks)
+        payload = dict(payload)
+        payload["items"] = [_normalize_builtin_task_contract(task).to_dict() for task in tasks]
+        save_work_items(project_root, payload)
+        for previous, current in transitions:
+            append_task_log_event(
+                project_root,
+                runtime="framework",
+                level="INFO",
+                message="Verified task transition accepted",
+                task_id=current.id,
+                task_title=current.title,
+                extra={
+                    "from_status": previous.status,
+                    "to_status": current.status,
+                    "verification_source": current.verification_source,
+                    "verification_actor": current.verification_actor,
+                    "verification_reason": current.verification_reason,
+                    "review_artifact": current.review_artifact,
+                    "git_commit": current.git_commit,
+                },
+            )
+
+
+def save_task_ledger(project_root: Path | str, payload: dict[str, Any]) -> None:
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    _save_task_ledger(
+        project_root,
+        payload,
+        [_normalize_builtin_task_contract(Task.from_dict(item)) for item in items if isinstance(item, dict)],
+    )
+
+
 def save_tasks(project_root: Path | str, tasks: list[Task]) -> None:
-    payload = load_work_items(project_root)
-    payload["items"] = [_normalize_builtin_task_contract(task).to_dict() for task in tasks]
-    save_work_items(project_root, payload)
+    _save_task_ledger(project_root, load_work_items(project_root), tasks)
 
 
 def index_tasks(tasks: list[Task]) -> dict[str, Task]:
@@ -636,19 +792,85 @@ def load_requirement_ids(project_root: Path | str) -> set[str]:
     return all_requirements(payload)
 
 
+def load_requirements(project_root: Path | str) -> list[dict[str, Any]]:
+    requirements_path = project_paths(project_root).docs_dir / "requirements.json"
+    if not requirements_path.exists():
+        return []
+    payload = json.loads(requirements_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"requirements.json must be a JSON object: {requirements_path}")
+    requirements = payload.get("requirements")
+    return [row for row in requirements if isinstance(row, dict) and str(row.get("id") or "").strip()] if isinstance(requirements, list) else []
+
+
+def load_acceptance_scenarios(project_root: Path | str) -> list[dict[str, Any]]:
+    requirements_path = project_paths(project_root).docs_dir / "requirements.json"
+    if not requirements_path.exists():
+        return []
+    payload = json.loads(requirements_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"requirements.json must be a JSON object: {requirements_path}")
+    scenarios = payload.get("acceptance_scenarios")
+    return [row for row in scenarios if isinstance(row, dict) and str(row.get("id") or "").strip()] if isinstance(scenarios, list) else []
+
+
 def _validate_requirement_task_coverage(project_root: Path | str, tasks: list[Task]) -> None:
-    requirement_ids = load_requirement_ids(project_root)
+    requirement_rows = load_requirements(project_root)
+    requirement_ids = {str(row.get("id") or "").strip() for row in requirement_rows}
     if not requirement_ids:
         return
-    covered: set[str] = set()
-    for task in tasks:
-        if task.id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
-            continue
-        covered.update(task.requirements)
+    implementation_tasks = [
+        task
+        for task in tasks
+        if task.task_kind == "feature"
+        and task.id not in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
+    ]
+    execution_tasks = [
+        task
+        for task in tasks
+        if task.task_kind in {"feature", "validation"}
+        and task.id not in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
+    ]
+    implementation_requirements = {req_id for task in implementation_tasks for req_id in task.requirements}
+    feature_required_ids = set()
+    for row in requirement_rows:
+        requirement_id = str(row.get("id") or "").strip()
+        explicit_flag = row.get("implementation_required")
+        if explicit_flag is True or (explicit_flag is not False and requirement_id.startswith("REQ-")):
+            feature_required_ids.add(requirement_id)
+    missing_implementation = sorted(feature_required_ids - implementation_requirements)
+    if missing_implementation:
+        raise ValueError(
+            "task decomposition left implementation requirements without a feature owner: "
+            + ", ".join(missing_implementation)
+        )
+    covered: set[str] = {req_id for task in execution_tasks for req_id in task.requirements}
     covered.update(req_id for req_id in requirement_ids if _is_final_verify_requirement(req_id))
     uncovered = sorted(req_id for req_id in requirement_ids if req_id not in covered)
     if uncovered:
         raise ValueError(f"task decomposition left requirements uncovered: {', '.join(uncovered)}")
+    scenario_rows = {str(row.get("id") or "").strip(): row for row in load_acceptance_scenarios(project_root)}
+    scenario_ids = set(scenario_rows)
+    owned_scenarios = {scenario_id for task in execution_tasks for scenario_id in task.acceptance_scenarios}
+    missing_scenarios = sorted(scenario_ids - owned_scenarios)
+    if missing_scenarios:
+        raise ValueError(
+            "task decomposition left acceptance scenarios without a feature or validation owner: "
+            + ", ".join(missing_scenarios)
+        )
+    misaligned_scenarios = []
+    for scenario_id, scenario in scenario_rows.items():
+        source_requirements = {str(value).strip() for value in scenario.get("source_requirement_ids", []) if str(value).strip()}
+        if not source_requirements:
+            continue
+        owners = [task for task in execution_tasks if scenario_id in task.acceptance_scenarios]
+        if not any(source_requirements.intersection(task.requirements) for task in owners):
+            misaligned_scenarios.append(scenario_id)
+    if misaligned_scenarios:
+        raise ValueError(
+            "task decomposition assigned acceptance scenarios to tasks without a matching source requirement: "
+            + ", ".join(sorted(misaligned_scenarios))
+        )
 
 
 def _validate_dependency_graph(tasks: list[Task]) -> None:
@@ -680,6 +902,17 @@ def _validate_dependency_graph(tasks: list[Task]) -> None:
 
     for task in tasks:
         visit(task.id, [])
+
+
+def _validate_task_id_continuity(generated_ids: list[int], reserved_ids: set[int] | None = None) -> None:
+    generated_ids = sorted(set(generated_ids))
+    if not generated_ids:
+        return
+    expected_ids = set(range(2, generated_ids[-1] + 1)).difference(reserved_ids or set())
+    missing_ids = sorted(expected_ids.difference(generated_ids))
+    if missing_ids:
+        formatted = ", ".join(f"T{task_id:03d}" for task_id in missing_ids)
+        raise ValueError(f"task-decompose generated task IDs must be contiguous; missing {formatted}")
 
 
 def _validate_task_shape(tasks: list[Task]) -> None:
@@ -1005,14 +1238,25 @@ def decompose_tasks(
     previous_id = SHARED_FOUNDATION_TASK_ID if include_shared_foundation else SCAFFOLD_TASK_ID
     raw_dependency_map: dict[str, list[str]] = {}
     raw_task_records: list[dict[str, Any]] = []
+    foundation_candidates: list[dict[str, Any]] = []
+    foundation_aliases: dict[str, str] = {}
+    auto_generated_ids: list[int] = []
     for raw_item in items:
         if not isinstance(raw_item, dict):
+            continue
+        if include_shared_foundation and _is_shared_foundation_candidate_payload(raw_item):
+            foundation_candidates.append(raw_item)
+            explicit_foundation_id = str(raw_item.get("id") or "").strip()
+            if TASK_ID_RE.match(explicit_foundation_id):
+                foundation_aliases[explicit_foundation_id] = SHARED_FOUNDATION_TASK_ID
+                next_index = max(next_index, int(explicit_foundation_id[1:]) + 1)
             continue
         task_id = str(raw_item.get("id") or "").strip()
         if task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}:
             continue
         if not TASK_ID_RE.match(task_id) or task_id in task_ids or task_id in {SCAFFOLD_TASK_ID, SHARED_FOUNDATION_TASK_ID, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID}:
             task_id = f"T{next_index:03d}"
+            auto_generated_ids.append(next_index)
         next_index += 1
         explicit_dependencies = [str(value).strip() for value in raw_item.get("dependencies", []) if str(value).strip()]
         raw_task_records.append(
@@ -1049,6 +1293,25 @@ def decompose_tasks(
         task_ids.add(task_id)
         previous_id = task_id
 
+    for index, raw_item in enumerate(foundation_candidates):
+        normalized_items.append(
+            Task.from_dict(
+                {
+                    "id": f"__shared_foundation_candidate_{index}",
+                    "title": raw_item.get("title") or "",
+                    "status": "pending",
+                    "task_kind": raw_item.get("task_kind") or "feature",
+                    "requirements": raw_item.get("requirements", []),
+                    "acceptance_scenarios": raw_item.get("acceptance_scenarios", []),
+                    "dependencies": [SHARED_FOUNDATION_TASK_ID],
+                    "output_tests": raw_item.get("output_tests", []),
+                    "output_paths": raw_item.get("output_paths", []),
+                    "intent": raw_item.get("intent") or {},
+                    "technology_constraints": raw_item.get("technology_constraints", []),
+                }
+            )
+        )
+
     _validate_raw_dependency_quality(raw_task_records, require_graph_edges=include_shared_foundation)
 
     aliases: dict[str, str] = {}
@@ -1062,7 +1325,11 @@ def decompose_tasks(
         resolved: list[str] = []
         seen: set[str] = set()
         for dependency in raw_dependency_map.get(task.id, task.dependencies):
-            resolved_id = aliases.get(dependency) or aliases.get(_normalized_dependency_key(dependency))
+            resolved_id = (
+                foundation_aliases.get(dependency)
+                or aliases.get(dependency)
+                or aliases.get(_normalized_dependency_key(dependency))
+            )
             if not resolved_id or resolved_id == task.id or resolved_id in seen:
                 continue
             seen.add(resolved_id)
@@ -1110,7 +1377,7 @@ def decompose_tasks(
     normalized_items.append(
         Task(
             id=PREFINAL_AUDIT_TASK_ID,
-            title="Pre-final full-system repair pass",
+            title=PREFINAL_AUDIT_TITLE,
             status="pending",
             requirements=[],
             acceptance_scenarios=[],
@@ -1135,9 +1402,15 @@ def decompose_tasks(
             acceptance_scenarios=[],
             dependencies=final_dependencies,
             output_tests=[],
-            output_paths=["docs/release-evidence.md", "docs/reviews/final-review.md"],
+            output_paths=list(FINAL_VERIFY_OUTPUT_PATHS),
         )
     )
+    reserved_foundation_ids = {
+        int(task_id[1:])
+        for task_id in foundation_aliases
+        if TASK_ID_RE.match(task_id)
+    }
+    _validate_task_id_continuity(auto_generated_ids, reserved_foundation_ids)
     _validate_dependency_graph(normalized_items)
     payload = load_work_items(project_root)
     payload["items"] = [task.to_dict() for task in normalized_items]

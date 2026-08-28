@@ -1,26 +1,33 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
-import os
 from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-from delivery.builtin_tasks import FRONTEND_API_AUDIT_OUTPUT_PATHS, FRONTEND_API_AUDIT_OUTPUT_TESTS, FRONTEND_API_AUDIT_REPORT_PATH, FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_OUTPUT_TESTS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID
+from delivery.builtin_tasks import (
+    FINAL_VERIFY_TASK_ID,
+    FRONTEND_API_AUDIT_OUTPUT_PATHS,
+    FRONTEND_API_AUDIT_OUTPUT_TESTS,
+    FRONTEND_API_AUDIT_REPORT_PATH,
+    FRONTEND_API_AUDIT_TASK_ID,
+    PREFINAL_AUDIT_OUTPUT_PATHS,
+    PREFINAL_AUDIT_OUTPUT_TESTS,
+    PREFINAL_AUDIT_REPORT_PATH,
+    PREFINAL_AUDIT_TASK_ID,
+)
 from delivery.errors import DeliveryError
-from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
-from delivery.loop_review import code_review_request_path
-from delivery.loop import status as loop_status
-from delivery.control_plane_host import build_planning_host_step
+from tests.unit.planning_review_test_helpers import approve_candidate
 from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt
 from delivery.stage_harness import stage_import_command, stage_input_path
-from delivery.state import load_gates, load_session_state, load_task_runtime_state, save_architecture_meta, save_session_state, save_task_runtime_state, save_test_plan, save_test_results, save_work_items
+from delivery.state import (
+    load_gates,
+    save_work_items,
+)
 from delivery.task import Task
-
 
 cli = import_module("delivery.__main__")
 
@@ -423,6 +430,7 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    approve_candidate(tmp_path, "task-decompose", input_path)
 
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -434,7 +442,8 @@ def test_cmd_decompose_imports_from_input_file(tmp_path: Path) -> None:
     assert by_id[PREFINAL_AUDIT_TASK_ID]["task_kind"] == "audit"
     assert by_id[PREFINAL_AUDIT_TASK_ID]["status"] == "pending"
     assert by_id[PREFINAL_AUDIT_TASK_ID]["dependencies"] == ["T000", "T001", "T002"]
-    assert by_id[PREFINAL_AUDIT_TASK_ID]["output_paths"][-1] == PREFINAL_AUDIT_REPORT_PATH
+    assert PREFINAL_AUDIT_REPORT_PATH in by_id[PREFINAL_AUDIT_TASK_ID]["output_paths"]
+    assert "docs/reviews/system-gap-fix.json" in by_id[PREFINAL_AUDIT_TASK_ID]["output_paths"]
     assert by_id[FINAL_VERIFY_TASK_ID]["dependencies"] == [PREFINAL_AUDIT_TASK_ID]
     persisted = json.loads((tmp_path / ".app-delivery-runtime" / "stage-inputs" / "task-decompose.json").read_text(encoding="utf-8"))
     assert isinstance(persisted, dict)
@@ -460,6 +469,7 @@ def test_cmd_decompose_allows_architecture_selected_backend_root_package_paths(t
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
     assert result == 0
@@ -494,6 +504,7 @@ def test_cmd_decompose_requires_ui_route_mapping_coverage(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
     assert result == 0
@@ -531,6 +542,48 @@ def test_cmd_decompose_rejects_uncovered_ui_route_mapping(tmp_path: Path) -> Non
 
     assert exc_info.value.code == "stage_output_invalid"
     assert "UI route mappings" in exc_info.value.message
+
+
+def test_cmd_decompose_rejects_broad_directory_only_ui_route_owner(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(json.dumps({"requirements": [{"id": "REQ-055", "title": "Control Tower", "summary": "Control tower home"}], "acceptance_scenarios": []}), encoding="utf-8")
+    ui_dir = docs_dir / "ui"
+    ui_dir.mkdir(parents=True, exist_ok=True)
+    (ui_dir / "page-archetypes.md").write_text(
+        "## Route Mapping\n\n"
+        "| Page / Route | Source Requirements | Primary Roles | Required Regions / Components | States | Suggested Output Paths | Suggested Browser Tests |\n"
+        "|--------------|---------------------|---------------|--------------------------------|--------|------------------------|-------------------------|\n"
+        "| Control Tower | REQ-055 | Admin | KPI cards | loading | `frontend/src/admin/ControlTowerPage.tsx` | `frontend/e2e/control-tower.spec.ts` |\n",
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "decompose.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "delivery_complexity": {"tier": "S", "rationale": "Small", "signals": {}},
+                "validation_gates": [],
+                "items": [
+                    {
+                        "title": "Control Tower",
+                        "task_kind": "feature",
+                        "requirements": ["REQ-055"],
+                        "acceptance_scenarios": [],
+                        "dependencies": [],
+                        "technology_constraints": [],
+                        "output_tests": ["frontend/e2e/control-tower.spec.ts"],
+                        "output_paths": ["frontend/src/admin/"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryError) as exc_info:
+        cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
+
+    assert any("explicitly owned" in error for error in exc_info.value.details["ui_route_coverage_errors"])
 
 def test_cmd_decompose_rejects_items_missing_technology_constraints(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
@@ -583,6 +636,7 @@ def test_cmd_decompose_allows_architecture_selected_top_level_mcp_server_paths(t
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
     assert result == 0
@@ -638,6 +692,7 @@ def test_cmd_decompose_imports_complexity_and_validation_gates_from_object_paylo
         ),
         encoding="utf-8",
     )
+    approve_candidate(tmp_path, "task-decompose", input_path)
 
     result = cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -711,6 +766,7 @@ def test_cmd_decompose_requires_full_object_payload_contract(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     with pytest.raises(DeliveryError) as exc_info:
         cli.cmd_decompose(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -862,6 +918,7 @@ def test_cmd_arch_design_rejects_missing_dependency_hints(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     with pytest.raises(DeliveryError) as exc_info:
         cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 
@@ -920,6 +977,7 @@ def test_cmd_arch_design_rejects_adr_documents_in_modules(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
+    approve_candidate(tmp_path, "task-decompose", input_path)
     with pytest.raises(DeliveryError) as exc_info:
         cli.cmd_arch_design(argparse.Namespace(project=str(tmp_path), input=str(input_path)))
 

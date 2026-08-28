@@ -9,10 +9,11 @@ from .bootstrap import archive_requirements_source, save_project_dependency_hint
 from .errors import DeliveryError
 from .runtime_config import load_project_metadata, load_project_runtime, root_context_filename
 from .scaffold import _extract_module_architecture_tree, _parse_module_architecture_lines, write_project_structure_snapshot
-from .gates import sync_gates
+from .gates import normalize_stage_gates, sync_gates, validate_gate_references
 from .stack_contracts import PYTHON_REACT_CONTRACT
-from .state import ensure_runtime_dirs, load_architecture_meta, project_paths, save_architecture_meta, save_test_plan, save_work_items, utc_now_iso
-from .task import Task, decompose_tasks, lint_task_contracts, parse_task_json
+from .state import ensure_runtime_dirs, load_architecture_meta, project_paths, save_architecture_meta, save_test_plan, utc_now_iso
+from .planning_review import require_planning_review_pass
+from .task import Task, decompose_tasks, lint_task_contracts, parse_task_json, save_task_ledger
 
 
 STAGE_INPUT_DIRNAME = "stage-inputs"
@@ -431,6 +432,7 @@ def import_spec_review(project_root: Path | str, payload: dict[str, Any], input_
     _validate_spec_review_ids(input_path, requirements, acceptance_scenarios)
     project_root = Path(project_root).expanduser().resolve()
     clarifications = [item for item in clarifications if isinstance(item, dict)]
+    require_planning_review_pass(project_root, "spec-review", input_path)
     _persist_stage_input(project_root, "spec-review", payload)
     docs_dir = project_root / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -688,12 +690,31 @@ def _has_browser_test(task: Task) -> bool:
     )
 
 
+def _route_output_paths(value: str) -> list[str]:
+    candidates = re.findall(r"(?:frontend|backend|mock-server)/[^\s,;|`]+", str(value or ""))
+    return [candidate.rstrip(".,") for candidate in candidates]
+
+
+def _owns_route_output_path(task: Task, output_path: str) -> bool:
+    normalized = str(output_path or "").strip().rstrip("/")
+    if not normalized:
+        return False
+    for task_path in task.output_paths:
+        candidate = str(task_path or "").strip().rstrip("/")
+        if candidate == normalized:
+            return True
+        if output_path.endswith("/") and candidate.startswith(normalized + "/"):
+            return True
+    return False
+
+
 def _validate_ui_route_task_coverage(project_root: Path, tasks: list[Task], input_path: Path) -> None:
     route_rows = _ui_route_mapping_rows(project_root)
     if not route_rows:
         return
     errors: list[str] = []
     candidates = [task for task in tasks if task.task_kind in {"feature", "validation"}]
+    feature_tasks = [task for task in tasks if task.task_kind == "feature"]
     for row in route_rows:
         reqs = set(row["requirements"])
         covering = [task for task in candidates if reqs.intersection(task.requirements)]
@@ -705,6 +726,12 @@ def _validate_ui_route_task_coverage(project_root: Path, tasks: list[Task], inpu
             errors.append(f"{row['page']}: covering tasks lack frontend output paths ({', '.join(task.id for task in covering)})")
         if str(row.get("suggested_tests") or "").strip() and not any(_has_browser_test(task) for task in covering):
             errors.append(f"{row['page']}: route mapping suggests browser tests but covering tasks lack browser/e2e output_tests ({', '.join(task.id for task in covering)})")
+        suggested_outputs = _route_output_paths(str(row.get("suggested_outputs") or ""))
+        for output_path in suggested_outputs:
+            if not any(_owns_route_output_path(task, output_path) for task in feature_tasks):
+                errors.append(
+                    f"{row['page']}: suggested UI output path is not explicitly owned by a feature task: {output_path}"
+                )
     if errors:
         raise DeliveryError(
             code="stage_output_invalid",
@@ -718,7 +745,6 @@ def _validate_ui_route_task_coverage(project_root: Path, tasks: list[Task], inpu
 def import_decompose(project_root: Path | str, payload: dict[str, Any], input_path: Path) -> int:
     project_root = Path(project_root).expanduser().resolve()
     _validate_decompose_technology_constraints(payload, input_path)
-    _persist_stage_input(project_root, "task-decompose", payload)
     include_shared = (project_root / "docs" / "shared-components.md").exists()
     items = parse_task_json(json.dumps(payload, ensure_ascii=False))
     try:
@@ -751,7 +777,24 @@ def import_decompose(project_root: Path | str, payload: dict[str, Any], input_pa
             },
             suggested_action="Ask the stage skill to repair the task graph using the reported contract errors and rerun the same import command",
         )
-    _validate_ui_route_task_coverage(project_root, [Task.from_dict(item) for item in work_items_payload.get("items", []) if isinstance(item, dict)], input_path)
-    save_work_items(project_root, work_items_payload)
-    sync_gates(project_root, stage_payload=payload)
+    canonical_tasks = [
+        Task.from_dict(item)
+        for item in work_items_payload.get("items", [])
+        if isinstance(item, dict)
+    ]
+    _validate_ui_route_task_coverage(project_root, canonical_tasks, input_path)
+    try:
+        validate_gate_references(canonical_tasks, normalize_stage_gates(payload.get("validation_gates")))
+    except ValueError as exc:
+        raise DeliveryError(
+            code="stage_output_invalid",
+            message=str(exc),
+            exit_code=2,
+            details={"stage": "task-decompose", "input_path": str(input_path), "project": str(project_root)},
+            suggested_action="Regenerate task-decompose so validation gate scope_tasks reference canonical task IDs.",
+        ) from exc
+    require_planning_review_pass(project_root, "task-decompose", input_path)
+    _persist_stage_input(project_root, "task-decompose", payload)
+    save_task_ledger(project_root, work_items_payload)
+    sync_gates(project_root, tasks=canonical_tasks, stage_payload=payload)
     return 0

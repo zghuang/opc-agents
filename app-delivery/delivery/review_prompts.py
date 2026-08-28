@@ -4,12 +4,19 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .builtin_task_prompts import render_frontend_api_audit_review_request, render_prefinal_audit_review_request
+from .builtin_task_prompts import (
+    render_frontend_api_audit_review_request,
+    render_prefinal_audit_review_request,
+)
 from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID, PREFINAL_AUDIT_TASK_ID
+from .release_assessment import (
+    RELEASE_ASSESSMENT_PATH,
+    RELEASE_DIMENSIONS,
+    RELEASE_SCORE_THRESHOLD,
+    REQUIRED_HARD_GATES,
+)
 from .requirements_context import format_acceptance_context, format_requirement_context
-from .runtime_config import resolve_project_root
-from .task import FINAL_VERIFY_TASK_ID, Task, normalize_intent_list
-
+from .task import Task, normalize_intent_list
 
 REVIEW_PROMPT_NOISE_PATHS = {
     "docs/gates.json",
@@ -284,8 +291,32 @@ def build_final_review_request(
         lines.append("These risks were deferred only to keep implementation moving; final release review must decide whether they block acceptance.")
     else:
         lines.append("- none")
+    final_state_path = Path(project_root).expanduser().resolve() / ".app-delivery-runtime" / "task-runtime" / "T-FINAL.json"
+    try:
+        final_state = json.loads(final_state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        final_state = {}
+    framework_gates = final_state.get("final_release_hard_gates") if isinstance(final_state, dict) else None
+    lines.extend(["", "Framework hard-gate attestation:"])
+    if isinstance(framework_gates, list):
+        for gate in framework_gates:
+            if isinstance(gate, dict):
+                lines.append(f"- {gate.get('id', '-')}: {gate.get('status', '-')}")
+    else:
+        lines.append("- missing; do not submit pass until final verification writes this attestation")
     lines.extend(
         [
+            "",
+            "Informational release assessment:",
+            f"- Write `{RELEASE_ASSESSMENT_PATH}` as JSON to publish a human-readable scorecard.",
+            f"- Set threshold to {RELEASE_SCORE_THRESHOLD}. Score must equal the sum of the dimension scores.",
+            "- Include these dimensions with their fixed maximum weights:",
+            *[f"  - {dimension_id}: {weight}" for dimension_id, weight in RELEASE_DIMENSIONS],
+            "- Every dimension must include non-empty notes and evidence.",
+            "- Include these hard gates with status pass or fail and non-empty evidence:",
+            *[f"  - {gate_id}" for gate_id in REQUIRED_HARD_GATES],
+            "- The score is informational only. A score below 80, a failed scorecard hard-gate row, or a missing framework attestation must not create repair work or change final-review status.",
+            "- The framework's independent verification, validation gates, production semantic scan, and System Gap Fix checks remain the actual release controls.",
             "",
             "Inspect the repository state and release evidence.",
             "Use status=pass only when the release is ready to accept as-is. Otherwise use status=changes_requested.",

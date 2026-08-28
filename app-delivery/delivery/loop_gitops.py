@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import json
+import hashlib
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -13,7 +14,8 @@ from .runtime_config import load_project_runtime
 from .production_semantics import mock_only_browser_e2e_issues
 from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
 from .state import load_task_runtime_state, load_test_results
-from .task import FINAL_VERIFY_TASK_ID, PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID, SCAFFOLD_OUTPUT_PATHS, Task, reset_task
+from .builtin_tasks import PREFINAL_AUDIT_OUTPUT_PATHS, PREFINAL_AUDIT_REPORT_PATH, PREFINAL_AUDIT_TASK_ID
+from .task import FINAL_VERIFY_TASK_ID, SCAFFOLD_OUTPUT_PATHS, Task, reset_task
 from .verify import is_path_test_spec
 
 
@@ -79,6 +81,7 @@ BLOCKING_VERIFIED_TASK_ISSUE_CODES = {
     "latest_validation_failed",
     "exception_review_artifact",
     "commit_subject_mismatch",
+    "verified_task_review_not_pass",
 }
 
 T000_ONLY_FRAMEWORK_PREFIXES = (
@@ -258,6 +261,12 @@ def _verified_task_issue(project_root: Path | str, task: Task) -> VerifiedTaskIs
         return None
 
     manual_accept = _has_manual_accept_override(project_root, task.id)
+    review_status = str(task.review_status or "").strip().casefold()
+    if not manual_accept and review_status and review_status != "pass":
+        return VerifiedTaskIssue(
+            "verified_task_review_not_pass",
+            f"verified task has non-passing review status: {task.review_status}",
+        )
     latest_result = _latest_task_test_result(project_root, task.id)
     if not manual_accept and latest_result is not None and not bool(latest_result.get("passed")):
         timestamp = str(latest_result.get("timestamp") or "unknown").strip() or "unknown"
@@ -303,6 +312,15 @@ def repair_invalid_verified_tasks(project_root: Path | str, tasks: list[Task]) -
             continue
         issues[task.id] = issue
     return tasks, issues
+
+
+def blocking_verified_task_issues(project_root: Path | str, tasks: list[Task]) -> dict[str, str]:
+    _, issues = repair_invalid_verified_tasks(project_root, tasks)
+    return {
+        task_id: issue
+        for task_id, issue in issues.items()
+        if is_blocking_verified_task_issue(issue)
+    }
 
 
 def ensure_git_repo(project_root: Path | str) -> None:
@@ -786,6 +804,7 @@ def try_reapply_task_exception_patch(project_root: Path | str, task_id: str) -> 
         patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         patch_text = ""
+    patch_sha256 = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
     affected_paths = _patch_changed_paths(patch_text)
     check_result = git(["apply", "--check", "--whitespace=nowarn", str(patch_path)], cwd=project_dir)
     if check_result.returncode == 0:
@@ -809,13 +828,13 @@ def try_reapply_task_exception_patch(project_root: Path | str, task_id: str) -> 
             }
         patch_path.unlink()
         clear_task_exception_patch_conflict(project_dir, task_id)
-        return {"status": "applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths}
+        return {"status": "applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths, "patch_sha256": patch_sha256}
 
     reverse_check = git(["apply", "--reverse", "--check", "--whitespace=nowarn", str(patch_path)], cwd=project_dir)
     if reverse_check.returncode == 0:
         patch_path.unlink()
         clear_task_exception_patch_conflict(project_dir, task_id)
-        return {"status": "already_applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths}
+        return {"status": "already_applied", "task_id": task_id, "patch_path": patch_relative_path, "affected_paths": affected_paths, "patch_sha256": patch_sha256}
 
     git_output = _truncate_exception_patch_output(check_result.stdout.strip() or f"git apply --check failed for {patch_path}")
     conflict_brief_path = _write_exception_patch_conflict_brief(
@@ -832,6 +851,7 @@ def try_reapply_task_exception_patch(project_root: Path | str, task_id: str) -> 
         "conflict_brief_path": conflict_brief_path,
         "affected_paths": affected_paths,
         "git_output": git_output,
+        "patch_sha256": patch_sha256,
     }
 
 

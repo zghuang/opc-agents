@@ -15,7 +15,7 @@ from delivery.builtin_tasks import FRONTEND_API_AUDIT_OUTPUT_PATHS, FRONTEND_API
 from delivery.errors import DeliveryError
 from delivery.loop_gitops import ensure_git_repo, git, git_head_sha
 from delivery.loop_review import code_review_request_path
-from delivery.loop import status as loop_status
+from delivery.loop_reporting import status as loop_status
 from delivery.control_plane_host import build_planning_host_step
 from delivery.runtime_config import resolve_project_root
 from delivery.skill_prompts import render_skill_prompt

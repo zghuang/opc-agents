@@ -35,7 +35,7 @@ Procedure:
 6. If the project is `M` or higher, `items` must include one or more validation-focused work items with `task_kind: "validation"`. These are ordinary execution tasks and should be planned with correct dependencies just like feature tasks.
 7. Validation tasks must depend on the feature tasks they validate. Do not put them before their owning feature slices. Keep the DAG explicit and minimal.
 8. Write that JSON to `${project}/.app-delivery-runtime/stage-inputs/task-decompose.json`.
-9. Import the stage result through the harness:
+9. Import the candidate through the stage command below. The framework synchronously runs a fresh foreground planning review and waits for its result before returning. If the review returns `revise`, regenerate the candidate from its findings and rerun this stage command.
 ```bash
 ${OPC_HOME:-$HOME/opc}/bin/app-delivery decompose --project {project} --input {project}/.app-delivery-runtime/stage-inputs/task-decompose.json
 ```

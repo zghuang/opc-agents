@@ -1514,6 +1514,10 @@ def test_execute_task_runtime_failure_does_not_record_current_head_as_task_commi
     assert item["status"] == "exception"
     assert item["git_commit"] is None
     assert item["git_commit"] != previous_head
+    runtime_state = load_task_runtime_state(tmp_path, "T002")
+    assert runtime_state["status"] == "exception"
+    assert runtime_state["failure_kind"] == "runtime_failed"
+    assert runtime_state["completed_at"]
 
 def test_import_task_review_repeated_machine_precondition_blocks_without_consuming_review_limit(tmp_path: Path, monkeypatch) -> None:
     from delivery import loop_review
@@ -2114,6 +2118,58 @@ def test_execute_task_runtime_interrupted_uses_recovery_path(tmp_path: Path, mon
     runtime_state = load_task_runtime_state(tmp_path, "T002")
     assert runtime_state["status"] == "interrupted"
     assert runtime_state["recovery_reason"] == "stalled_runtime"
+
+
+def test_execute_task_retries_runtime_interruption_before_first_tool_or_mutation(tmp_path: Path, monkeypatch) -> None:
+    from delivery.task import Task
+
+    save_work_items(
+        tmp_path,
+        {
+            "schema_version": "2",
+            "project": "demo",
+            "generated_at": "2026-06-24T00:00:00Z",
+            "last_updated_commit": "",
+            "items": [
+                {"id": "T002", "title": "Login", "status": "pending", "requirements": ["REQ-001"], "acceptance_scenarios": [], "dependencies": [], "output_tests": ["backend/tests/test_login.py"], "output_paths": ["backend/src/login/"]},
+            ],
+        },
+    )
+    save_task_runtime_state(
+        tmp_path,
+        "T002",
+        {"status": "running", "started_at": "2026-07-15T00:00:00Z", "last_output_at": "2026-07-15T00:00:00Z", "last_tool_at": None, "last_mutation_at": None},
+    )
+    loop = DeliveryLoop(tmp_path)
+
+    class DummySession:
+        id = "session-startup"
+        runtime = "opencode"
+        task_count = 0
+        created_at = "2026-07-15T00:00:00Z"
+        status = "active"
+        title = "Login"
+        current_task_id = "T002"
+        last_heartbeat = "2026-07-15T00:00:00Z"
+
+    monkeypatch.setattr(loop, "_session_for_task", lambda task: DummySession())
+    monkeypatch.setattr(
+        "delivery.loop.execute_in_session",
+        lambda project_root, session, prompt: (_ for _ in ()).throw(
+            RuntimeErrorResponse("runtime command interrupted", "terminated", kind="runtime_interrupted", returncode=-15)
+        ),
+    )
+
+    success, state = loop._execute_task(Task("T002", "Login", "pending", ["REQ-001"], [], [], ["backend/tests/test_login.py"], ["backend/src/login/"]))
+
+    assert success is False
+    assert state == "stalled_recovery"
+    payload = json.loads((tmp_path / "docs" / "work-items.json").read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "pending"
+    runtime_state = load_task_runtime_state(tmp_path, "T002")
+    assert runtime_state["recovery_reason"] == "runtime_startup"
+    assert runtime_state["startup_retry_count"] == 1
+    assert runtime_state["session_id"] is None
 
 def test_execute_task_converts_unexpected_local_exception_into_task_exception(tmp_path: Path, monkeypatch) -> None:
     from delivery.task import Task

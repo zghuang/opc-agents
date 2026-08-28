@@ -24,13 +24,14 @@ from .loop_task_prompt import build_stalled_recovery_prompt
 from .loop_review import import_final_review, import_task_review
 from . import project_readiness as readiness
 from .production_semantics import scan_production_semantics
-from .review_artifacts import code_review_request_path, final_review_request_path
+from .review_artifacts import archive_review_history_entry, code_review_request_path, final_review_request_path
 from .runtime_config import load_project_metadata, resolve_project_root, resolve_runtime
 from .scaffold import write_project_structure_snapshot
 from .session import RuntimeSession, current_session, retire_session, save_current_session
 from .watchdog import process_alive, save_watchdog_state, should_watchdog_resume, spawn_watchdog
 from .stage_harness import import_arch_design, import_context_sync, import_decompose, import_spec_review, import_ui_design, load_stage_payload, stage_import_command, stage_input_path, stage_missing_error
 from .loop_gitops import task_scoped_changed_paths, try_reapply_task_exception_patch
+from .planning_review_runner import run_planning_review
 from .state import (
     acquire_lock,
     latest_task_log_event,
@@ -46,7 +47,8 @@ from .state import (
     utc_now_iso,
     write_json,
 )
-from .task import FINAL_VERIFY_TASK_ID, all_tasks, mark_task, reset_task, save_tasks
+from .system_gap_ledger import SYSTEM_GAP_LEDGER_PATH, system_gap_ledger_path
+from .task import FINAL_VERIFY_TASK_ID, PREFINAL_AUDIT_TASK_ID, PREFINAL_AUDIT_TITLE, Task, all_tasks, mark_task, reset_task, save_tasks
 
 
 CONTROL_STEP_LIMIT = 128
@@ -1115,6 +1117,7 @@ def _mark_host_handoff_review_runner_failed(project_root: Path, fallback_state: 
         return
     completed_at = str(fallback_state.get("completed_at") or "").strip() or utc_now_iso()
     body = dict(existing)
+    failed_skill = str(existing.get("skill") or fallback_state.get("skill") or "host review").strip() or "host review"
     body.update(
         {
             "schema_version": "1",
@@ -1129,7 +1132,7 @@ def _mark_host_handoff_review_runner_failed(project_root: Path, fallback_state: 
             "review_runner_stderr_log": str(fallback_state.get("stderr_log") or existing.get("runner_stderr_log") or ""),
             "review_runner_last_activity_at": str(fallback_state.get("last_activity_at") or "").strip() or None,
             "review_runner_idle_seconds": fallback_state.get("idle_seconds"),
-            "message": "Review runner failed before importing a fresh code-review artifact; retry may run automatically if attempts remain.",
+            "message": f"Review runner failed before importing a fresh {failed_skill} artifact; retry may run automatically if attempts remain.",
         }
     )
     write_json(path, body)
@@ -1482,10 +1485,11 @@ def _host_fallback_prompt(project_root: Path, handoff: dict[str, Any]) -> str:
 
 def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any], *, reason: str) -> dict[str, Any]:
     handoff_id = str(handoff.get("handoff_id") or "").strip()
+    skill = str(handoff.get("skill") or "").strip()
     task_id = str(handoff.get("task_id") or "").strip()
     hermes_bin = _resolve_hermes_bin()
     if not hermes_bin:
-        result = {"status": "failed", "reason": "hermes_binary_missing", "handoff_id": handoff_id, "task_id": task_id}
+        result = {"status": "failed", "reason": "hermes_binary_missing", "handoff_id": handoff_id, "skill": skill, "task_id": task_id}
         _write_host_fallback_state(project_root, result)
         return result
 
@@ -1498,8 +1502,8 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
         except (TypeError, ValueError):
             pid = 0
         if process_alive(pid):
-            return {"status": "running", "reason": "existing_fallback_running", "handoff_id": handoff_id, "task_id": task_id, "pid": pid}
-        failed_state = {"status": "failed", "reason": "previous_fallback_exited_without_clearing_handoff", "handoff_id": handoff_id, "task_id": task_id, "pid": pid, "completed_at": utc_now_iso()}
+            return {"status": "running", "reason": "existing_fallback_running", "handoff_id": handoff_id, "skill": skill, "task_id": task_id, "pid": pid}
+        failed_state = {"status": "failed", "reason": "previous_fallback_exited_without_clearing_handoff", "handoff_id": handoff_id, "skill": skill, "task_id": task_id, "pid": pid, "completed_at": utc_now_iso()}
         _write_host_fallback_state(project_root, failed_state)
         _mark_host_handoff_review_runner_failed(project_root, failed_state, reason="previous_fallback_exited_without_clearing_handoff")
 
@@ -1541,7 +1545,7 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
         "status": "running",
         "handoff_id": handoff_id,
         "task_id": task_id,
-        "skill": "code-review",
+        "skill": skill,
         "pid": process.pid,
         "started_at": started_at,
         "reason": reason,
@@ -1552,7 +1556,7 @@ def _start_code_review_host_fallback(project_root: Path, handoff: dict[str, Any]
     write_json(lock_path, lock_payload)
     _write_host_fallback_state(project_root, {**lock_payload, "attempt": attempt})
     _mark_host_handoff_review_running(project_root, handoff, pid=process.pid, started_at=started_at, stdout_log=stdout_path, stderr_log=stderr_path)
-    return {"status": "started", "handoff_id": handoff_id, "task_id": task_id, "pid": process.pid, "attempt": attempt, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path)}
+    return {"status": "started", "handoff_id": handoff_id, "skill": "code-review", "task_id": task_id, "pid": process.pid, "attempt": attempt, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path)}
 
 
 def _maybe_start_code_review_host_fallback(project_root: Path) -> dict[str, Any]:
@@ -1567,8 +1571,9 @@ def _maybe_start_code_review_host_fallback(project_root: Path) -> dict[str, Any]
     handoff_status = str(handoff.get("status") or "").strip()
     if handoff_status not in {"waiting_for_host", HANDOFF_REVIEW_RUNNING_STATUS, HANDOFF_REVIEW_RUNNER_FAILED_STATUS}:
         return {"status": "skipped", "reason": "host_handoff_not_waiting", "handoff_status": handoff_status}
-    if str(handoff.get("skill") or "").strip() != "code-review":
-        return {"status": "skipped", "reason": "unsupported_host_skill", "skill": str(handoff.get("skill") or "")}
+    skill = str(handoff.get("skill") or "").strip()
+    if skill != "code-review":
+        return {"status": "skipped", "reason": "unsupported_host_skill", "skill": skill}
     task_id = str(handoff.get("task_id") or "").strip()
     if not task_id:
         return {"status": "skipped", "reason": "task_id_missing"}
@@ -1905,6 +1910,143 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _archive_system_gap_fix_artifacts(project_root: Path, *, rerun_at: str) -> list[str]:
+    artifacts = [
+        project_root / "docs" / "reviews" / "system-audit.md",
+        system_gap_ledger_path(project_root),
+    ]
+    archived: list[str] = []
+    for artifact in artifacts:
+        if not artifact.is_file():
+            continue
+        archived.append(
+            archive_review_history_entry(
+                project_root,
+                review_name="system-gap-fix",
+                variant=f"prior-{artifact.stem}",
+                extension=artifact.suffix or ".txt",
+                content=artifact.read_text(encoding="utf-8", errors="replace"),
+                reviewed_at=rerun_at,
+            )
+        )
+        artifact.unlink()
+    return archived
+
+
+def _rerun_system_gap_fix(project_root: Path, tasks: list[Task], *, reason: str, rerun_at: str) -> list[Task]:
+    audit = next((task for task in tasks if task.id == PREFINAL_AUDIT_TASK_ID), None)
+    if audit is None:
+        raise DeliveryError(
+            code="system_gap_fix_missing",
+            message=f"{PREFINAL_AUDIT_TASK_ID} is missing; regenerate the task graph before requesting a System Gap Fix rerun",
+            exit_code=2,
+            details={"project": str(project_root)},
+        )
+    unfinished = [
+        task.id
+        for task in tasks
+        if task.id not in {PREFINAL_AUDIT_TASK_ID, FINAL_VERIFY_TASK_ID}
+        and task.status not in {"verified", "cancelled"}
+    ]
+    if unfinished:
+        raise DeliveryError(
+            code="system_gap_fix_prerequisites_incomplete",
+            message="System Gap Fix rerun requires all non-final delivery tasks to be verified or cancelled",
+            exit_code=2,
+            details={"project": str(project_root), "unfinished_task_ids": unfinished},
+            suggested_action="Complete, repair, or explicitly cancel the listed tasks before requesting a full-system gap scan.",
+        )
+
+    archived_artifacts = _archive_system_gap_fix_artifacts(project_root, rerun_at=rerun_at)
+    prior_round = {
+        "rerun_at": rerun_at,
+        "reason": reason,
+        "prior_status": audit.status,
+        "prior_git_commit": audit.git_commit,
+        "prior_review_artifact": audit.review_artifact,
+        "prior_review_status": audit.review_status,
+        "archived_artifacts": archived_artifacts,
+    }
+    runtime_state = normalize_task_runtime_state(load_task_runtime_state(project_root, PREFINAL_AUDIT_TASK_ID))
+    history = runtime_state.get("system_gap_fix_rerun_history") if isinstance(runtime_state.get("system_gap_fix_rerun_history"), list) else []
+    history.append(prior_round)
+
+    updated: list[Task] = []
+    for task in tasks:
+        if task.id == PREFINAL_AUDIT_TASK_ID:
+            data = task.to_dict()
+            data.update(
+                {
+                    "title": PREFINAL_AUDIT_TITLE,
+                    "status": "pending",
+                    "git_commit": None,
+                    "status_session_id": None,
+                    "started_at": None,
+                    "completed_at": None,
+                    "review_status": None,
+                    "review_artifact": None,
+                    "reviewed_at": None,
+                    "verified_at": None,
+                    "blocked_reason": f"manual System Gap Fix rerun: {reason}",
+                    "attempts": 0,
+                }
+            )
+            updated.append(Task.from_dict(data))
+            continue
+        if task.id == FINAL_VERIFY_TASK_ID:
+            data = task.to_dict()
+            data.update(
+                {
+                    "status": "pending",
+                    "git_commit": None,
+                    "status_session_id": None,
+                    "started_at": None,
+                    "completed_at": None,
+                    "review_status": None,
+                    "review_artifact": None,
+                    "reviewed_at": None,
+                    "verified_at": None,
+                    "blocked_reason": "System Gap Fix rerun is pending before final verification",
+                    "attempts": 0,
+                }
+            )
+            updated.append(Task.from_dict(data))
+            continue
+        updated.append(task)
+
+    save_task_runtime_state(
+        project_root,
+        PREFINAL_AUDIT_TASK_ID,
+        {
+            "force_task_prompt": True,
+            "force_task_prompt_reason": "manual_system_gap_fix_rerun",
+            "system_gap_fix_rerun_history": history,
+            "system_gap_fix_round": len(history) + 1,
+            "system_gap_fix_rerun_at": rerun_at,
+            "system_gap_fix_rerun_reason": reason,
+            "status": "pending",
+            "session_id": None,
+            "completed_at": None,
+            "failure_count": 0,
+            "failure_signature": "",
+            "failure_kind": "",
+            "failure_message": "",
+        },
+    )
+    save_task_runtime_state(
+        project_root,
+        FINAL_VERIFY_TASK_ID,
+        {
+            "final_verify_status": "deferred",
+            "repair_candidates": [PREFINAL_AUDIT_TASK_ID],
+            "repair_task_id": PREFINAL_AUDIT_TASK_ID,
+            "final_release_hard_gates": [],
+            "final_verify_system_gap_issues": ["fresh System Gap Fix scan required"],
+        },
+    )
+    return updated
+
+
 def cmd_task(args: argparse.Namespace) -> int:
     project_root = resolve_project_root(args.project)
     task_id = str(args.task_id or "").strip()
@@ -1929,6 +2071,13 @@ def cmd_task(args: argparse.Namespace) -> int:
             )
         now = utc_now_iso()
         if action == "accept":
+            save_task_runtime_state(
+                project_root,
+                task_id,
+                {
+                    "manual_override": {"action": "accept", "reason": reason, "actor": "host", "accepted_at": now},
+                },
+            )
             tasks = mark_task(
                 tasks,
                 task_id,
@@ -1936,6 +2085,9 @@ def cmd_task(args: argparse.Namespace) -> int:
                 review_status=task.review_status or "pass",
                 reviewed_at=task.reviewed_at or now,
                 verified_at=now,
+                verification_source="manual_accept",
+                verification_actor="host",
+                verification_reason=reason,
                 completed_at=task.completed_at or now,
                 blocked_reason=f"manual host acceptance: {reason}",
                 attempts=max(task.attempts, 1),
@@ -1945,7 +2097,6 @@ def cmd_task(args: argparse.Namespace) -> int:
                 project_root,
                 task_id,
                 {
-                    "manual_override": {"action": "accept", "reason": reason, "actor": "host", "accepted_at": now},
                     "review_repair_limit_reached": False,
                     "final_repair_limit_reached": False,
                     "review_changes_requested_count": 0,
@@ -1987,12 +2138,22 @@ def cmd_task(args: argparse.Namespace) -> int:
             )
             reapply_result = try_reapply_task_exception_patch(project_root, task_id)
             save_task_runtime_state(project_root, task_id, _runtime_state_for_exception_patch_reapply(reapply_result))
+        elif action == "rerun-system-gap-fix":
+            if task_id != PREFINAL_AUDIT_TASK_ID:
+                raise DeliveryError(
+                    code="system_gap_fix_rerun_task_invalid",
+                    message=f"rerun-system-gap-fix is only valid for {PREFINAL_AUDIT_TASK_ID}",
+                    exit_code=2,
+                    details={"task_id": task_id},
+                )
+            tasks = _rerun_system_gap_fix(project_root, tasks, reason=reason, rerun_at=now)
+            save_tasks(project_root, tasks)
         else:
             raise DeliveryError(
                 code="manual_task_action_invalid",
                 message=f"unsupported task action: {action}",
                 exit_code=2,
-                details={"supported_actions": ["accept", "reset-repair"]},
+                details={"supported_actions": ["accept", "reset-repair", "rerun-system-gap-fix"]},
             )
         runtime_state = load_task_runtime_state(project_root, task_id)
     print(json.dumps({"status": "ok", "task_id": task_id, "action": action, "runtime_state": runtime_state}, indent=2, ensure_ascii=False))
@@ -2041,7 +2202,21 @@ def cmd_spec_review(args: argparse.Namespace) -> int:
     with _project_execution_guard(project_root, already_locked=_command_locked(args)):
         payload, input_path = load_stage_payload(project_root, "spec-review", args.input, expected_type=dict, required_fields=["requirements", "acceptance_scenarios"])
         assert isinstance(payload, dict)
-        return import_spec_review(project_root, payload, input_path)
+        try:
+            return import_spec_review(project_root, payload, input_path)
+        except DeliveryError as exc:
+            if exc.code not in {"planning_review_required", "planning_review_stale", "planning_review_runner_required"}:
+                raise
+            result = run_planning_review(project_root, "spec-review", input_path)
+            if not result["passed"]:
+                raise DeliveryError(
+                    code="planning_review_not_passed",
+                    message="spec-review planning review returned revise; regenerate the candidate from its findings",
+                    exit_code=2,
+                    details={"stage": "spec-review", **result},
+                    suggested_action="Regenerate spec-review.json from the review findings, then rerun spec-review.",
+                )
+            return import_spec_review(project_root, payload, input_path)
 
 
 def cmd_arch_design(args: argparse.Namespace) -> int:
@@ -2079,7 +2254,21 @@ def cmd_decompose(args: argparse.Namespace) -> int:
             required_fields=["items", "delivery_complexity", "validation_gates"],
         )
         assert isinstance(payload, dict)
-        return import_decompose(project_root, payload, input_path)
+        try:
+            return import_decompose(project_root, payload, input_path)
+        except DeliveryError as exc:
+            if exc.code not in {"planning_review_required", "planning_review_stale", "planning_review_runner_required"}:
+                raise
+            result = run_planning_review(project_root, "task-decompose", input_path)
+            if not result["passed"]:
+                raise DeliveryError(
+                    code="planning_review_not_passed",
+                    message="task-decompose planning review returned revise; regenerate the candidate from its findings",
+                    exit_code=2,
+                    details={"stage": "task-decompose", **result},
+                    suggested_action="Regenerate task-decompose.json from the review findings, then rerun decompose.",
+                )
+            return import_decompose(project_root, payload, input_path)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -2401,7 +2590,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_action = subparsers.add_parser("task")
     task_action.add_argument("--project", required=True)
     task_action.add_argument("--task-id", required=True)
-    task_action.add_argument("--action", choices=["accept", "reset-repair"], required=True)
+    task_action.add_argument("--action", choices=["accept", "reset-repair", "rerun-system-gap-fix"], required=True)
     task_action.add_argument("--reason", required=True)
     task_action.set_defaults(func=cmd_task)
 

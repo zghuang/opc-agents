@@ -4,20 +4,58 @@ import json
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .environment_repair import ENVIRONMENT_REPAIR_TASK_PREFIX, build_environment_repair_plan, has_environment_failures
+from .config_validation import config_validation_summary, validate_project_config_files
+from .environment_repair import (
+    ENVIRONMENT_REPAIR_TASK_PREFIX,
+    build_environment_repair_plan,
+    has_environment_failures,
+)
 from .errors import DeliveryError
 from .gates import refresh_gates
-from .loop_gitops import clear_task_exception_patch_conflict, ensure_git_repo, git_commit_task, git_commit_timestamp, git_head_sha, git_latest_task_commit, git_stage_task_snapshot, is_runtime_protected_framework_artifact, park_task_exception_changes, repair_invalid_verified_tasks, review_artifact_status, task_scoped_changed_paths
-from .loop_gitops import git_changed_paths, restore_paths_to_head, task_scope_delta
-from .loop_reporting import PAUSE_FILE, project_summary, render_release_evidence, status
+from .loop_gitops import (
+    blocking_verified_task_issues,
+    clear_task_exception_patch_conflict,
+    ensure_git_repo,
+    git_changed_paths,
+    git_commit_task,
+    git_commit_timestamp,
+    git_head_sha,
+    git_latest_task_commit,
+    git_stage_task_snapshot,
+    is_runtime_protected_framework_artifact,
+    park_task_exception_changes,
+    repair_invalid_verified_tasks,
+    restore_paths_to_head,
+    review_artifact_status,
+    task_scope_delta,
+    task_scoped_changed_paths,
+    try_reapply_task_exception_patch,
+)
+from .loop_reporting import PAUSE_FILE, project_summary, render_release_evidence
 from .loop_review import write_code_review_request, write_final_review_request
-from .production_semantics import SemanticFinding, scan_production_semantics, write_semantic_scan_report
+from .loop_task_prompt import (
+    build_fix_prompt,
+    build_stalled_recovery_prompt,
+    build_task_prompt,
+)
+from .production_semantics import (
+    SemanticFinding,
+    scan_production_semantics,
+    write_semantic_scan_report,
+)
 from .runtime_config import resolve_runtime
 from .scaffold import scaffold_project
-from .session import RuntimeErrorResponse, RuntimeSession, current_session, execute_in_session, retire_session, save_current_session, start_task_session, touch_session
+from .session import (
+    RuntimeErrorResponse,
+    RuntimeSession,
+    current_session,
+    execute_in_session,
+    retire_session,
+    save_current_session,
+    start_task_session,
+    touch_session,
+)
 from .stack_contracts import PYTHON_REACT_CONTRACT, backend_test_root
-from .builtin_tasks import FRONTEND_API_AUDIT_TASK_ID
-from .config_validation import config_validation_summary, validate_project_config_files
 from .state import (
     clear_task_runtime_failure,
     ensure_runtime_dirs,
@@ -27,13 +65,15 @@ from .state import (
     remember_task_runtime_failure,
     repeated_task_runtime_failure_block,
     save_task_runtime_state,
+    append_task_log_event,
     utc_now_iso,
 )
+from .system_gap_ledger import system_gap_ledger_issues
 from .task import (
     FINAL_VERIFY_TASK_ID,
     PREFINAL_AUDIT_TASK_ID,
-    SCAFFOLD_TASK_ID,
     SCAFFOLD_OUTPUT_PATHS,
+    SCAFFOLD_TASK_ID,
     SHARED_FOUNDATION_TASK_ID,
     Task,
     all_tasks,
@@ -45,16 +85,69 @@ from .task import (
     reset_task,
     save_tasks,
 )
-from .test_env import project_has_browser_e2e, warm_browser_e2e_environment, warm_shared_test_environment
-from .loop_task_prompt import build_fix_prompt, build_scope_fix_prompt, build_stalled_recovery_prompt, build_task_prompt
-from .verify import infer_final_repair_candidates, is_command_test_spec, is_path_test_spec, run_full_suite, run_task_tests, test_results_to_summary, write_final_repair_report
-
+from .test_env import (
+    project_has_browser_e2e,
+    warm_browser_e2e_environment,
+    warm_shared_test_environment,
+)
+from .verify import (
+    infer_final_repair_candidates,
+    is_command_test_spec,
+    run_full_suite,
+    run_task_tests,
+    test_results_to_summary,
+    write_final_repair_report,
+)
 
 MAX_TEST_FIX_ATTEMPTS = 3
 MAX_STALLED_RUNTIME_RECOVERIES = 2
+MAX_STARTUP_RUNTIME_RETRIES = 1
 MAX_FINAL_REPAIR_ITERATIONS = 3
 FINAL_REPAIR_TASK_PREFIX = "Final Verification Repair Bundle"
 FINAL_REVIEW_REPAIR_TASK_PREFIX = "Final Review Repair Bundle"
+
+
+def _final_release_hard_gates(
+    *,
+    full_suite_passed: bool,
+    requirement_coverage: dict[str, Any],
+    missing_test_types: list[tuple[str, str]],
+    non_verified_gates: list[dict[str, Any]],
+    semantic_findings: list[SemanticFinding],
+    system_gap_issues: list[str],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "system_gap_fix",
+            "status": "pass" if not system_gap_issues else "fail",
+            "evidence": ["docs/reviews/system-gap-fix.json"],
+        },
+        {
+            "id": "full_suite",
+            "status": "pass" if full_suite_passed else "fail",
+            "evidence": ["docs/test-results.json"],
+        },
+        {
+            "id": "requirement_coverage",
+            "status": "pass" if requirement_coverage.get("all_covered") else "fail",
+            "evidence": ["docs/work-items.json", "docs/requirements.json"],
+        },
+        {
+            "id": "test_type_coverage",
+            "status": "pass" if not missing_test_types else "fail",
+            "evidence": ["docs/test-results.json", "docs/gates.json"],
+        },
+        {
+            "id": "validation_gates",
+            "status": "pass" if not non_verified_gates else "fail",
+            "evidence": ["docs/gates.json"],
+        },
+        {
+            "id": "production_semantics",
+            "status": "pass" if not semantic_findings else "fail",
+            "evidence": ["docs/reviews/production-semantic-scan.md"],
+        },
+    ]
 
 
 def _refresh_project_summary_after_task_update(project_root: Path | str) -> None:
@@ -424,6 +517,26 @@ def _invalidate_prefinal_audit_after_repair(tasks: list[Task], repair_task_id: s
         return tasks
     updated: list[Task] = []
     for task in tasks:
+        if task.id == PREFINAL_AUDIT_TASK_ID:
+            data = task.to_dict()
+            dependencies = list(data.get("dependencies", []))
+            if repair_task_id not in dependencies:
+                dependencies.append(repair_task_id)
+            data.update(
+                {
+                    "status": "pending",
+                    "dependencies": dependencies,
+                    "git_commit": None,
+                    "completed_at": None,
+                    "review_status": None,
+                    "review_artifact": None,
+                    "reviewed_at": None,
+                    "verified_at": None,
+                    "blocked_reason": "System Gap Fix must re-scan after final repair task " + repair_task_id,
+                }
+            )
+            updated.append(Task.from_dict(data))
+            continue
         if task.id == FINAL_VERIFY_TASK_ID:
             data = task.to_dict()
             dependencies = list(data.get("dependencies", []))
@@ -433,6 +546,29 @@ def _invalidate_prefinal_audit_after_repair(tasks: list[Task], repair_task_id: s
             updated.append(Task.from_dict(data))
             continue
         updated.append(task)
+    return updated
+
+
+def _requeue_system_gap_fix(tasks: list[Task], reason: str) -> list[Task]:
+    updated: list[Task] = []
+    for task in tasks:
+        if task.id != PREFINAL_AUDIT_TASK_ID:
+            updated.append(task)
+            continue
+        data = task.to_dict()
+        data.update(
+            {
+                "status": "pending",
+                "git_commit": None,
+                "completed_at": None,
+                "review_status": None,
+                "review_artifact": None,
+                "reviewed_at": None,
+                "verified_at": None,
+                "blocked_reason": reason,
+            }
+        )
+        updated.append(Task.from_dict(data))
     return updated
 
 
@@ -478,6 +614,9 @@ def recover(project_root: Path | str) -> list[Task]:
                 "review_artifact": review_artifact,
                 "reviewed_at": task.reviewed_at or commit_ts,
                 "verified_at": task.verified_at or commit_ts,
+                "verification_source": "reconcile_review_evidence",
+                "verification_actor": "framework",
+                "verification_reason": "reconciled existing pass review and task-owned commit",
                 "blocked_reason": None,
                 "attempts": max(task.attempts, 1),
             }
@@ -595,9 +734,8 @@ class DeliveryLoop:
         for task in pending_tasks:
             for dependency_id in task.dependencies:
                 dependency = by_id.get(dependency_id)
-                if dependency is not None and dependency.status == "exception":
-                    if dependency.id not in candidate_ids:
-                        candidate_ids.append(dependency.id)
+                if dependency is not None and dependency.status == "exception" and dependency.id not in candidate_ids:
+                    candidate_ids.append(dependency.id)
         for task_id in candidate_ids:
             candidate = by_id.get(task_id)
             if candidate is None:
@@ -630,6 +768,52 @@ class DeliveryLoop:
     def _execute_session_prompt(self, task_id: str, session: RuntimeSession, prompt: str) -> None:
         execute_in_session(self.project_root, session, prompt)
         self._sync_active_task_session_id(task_id, session)
+
+    def _is_startup_runtime_interruption(self, task: Task, exc: RuntimeErrorResponse) -> bool:
+        if exc.kind != "runtime_interrupted":
+            return False
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
+        started_at = str(runtime_state.get("started_at") or "").strip()
+        last_output_at = str(runtime_state.get("last_output_at") or "").strip()
+        return bool(
+            started_at
+            and last_output_at
+            and last_output_at >= started_at
+            and not runtime_state.get("last_tool_at")
+            and not runtime_state.get("last_mutation_at")
+            and int(runtime_state.get("startup_retry_count") or 0) < MAX_STARTUP_RUNTIME_RETRIES
+        )
+
+    def _prepare_startup_runtime_retry(self, task: Task, session: RuntimeSession) -> tuple[bool, str]:
+        runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
+        retry_count = int(runtime_state.get("startup_retry_count") or 0) + 1
+        tasks = reset_task(all_tasks(self.project_root), task.id, blocked_reason="runtime startup interrupted; fresh retry in progress")
+        save_tasks(self.project_root, tasks)
+        save_task_runtime_state(
+            self.project_root,
+            task.id,
+            {
+                "status": "interrupted",
+                "completed_at": None,
+                "exit_code": None,
+                "session_id": None,
+                "last_output_at": None,
+                "last_session_update_at": None,
+                "last_tool_at": None,
+                "last_mutation_at": None,
+                "startup_retry_count": retry_count,
+                "recovery_prompt": None,
+                "recovery_reason": "runtime_startup",
+                "recovery_requested_at": utc_now_iso(),
+            },
+        )
+        retire_session(self.project_root, session)
+        return False, "stalled_recovery"
+
+    def _handle_runtime_interruption(self, task: Task, session: RuntimeSession, exc: RuntimeErrorResponse) -> tuple[bool, str]:
+        if self._is_startup_runtime_interruption(task, exc):
+            return self._prepare_startup_runtime_retry(task, session)
+        return self._prepare_stalled_runtime_recovery(task, session, exc)
 
     def _prepare_stalled_runtime_recovery(self, task: Task, session: RuntimeSession, exc: RuntimeErrorResponse) -> tuple[bool, str]:
         runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, task.id))
@@ -727,6 +911,9 @@ class DeliveryLoop:
                 review_artifact=review_artifact,
                 reviewed_at=utc_now_iso(),
                 git_commit=commit_sha,
+                verification_source="builtin_scaffold",
+                verification_actor="framework",
+                verification_reason="built-in scaffold completed and passed deterministic review",
                 blocked_reason=None,
                 attempts=1,
             )
@@ -802,7 +989,7 @@ class DeliveryLoop:
                     self._execute_session_prompt(task.id, session, recovery_prompt)
                 except RuntimeErrorResponse as exc:
                     if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
-                        return self._prepare_stalled_runtime_recovery(task, session, exc)
+                        return self._handle_runtime_interruption(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
                 save_task_runtime_state(
                     self.project_root,
@@ -820,7 +1007,7 @@ class DeliveryLoop:
                     self._execute_session_prompt(task.id, session, prompt)
                 except RuntimeErrorResponse as exc:
                     if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
-                        return self._prepare_stalled_runtime_recovery(task, session, exc)
+                        return self._handle_runtime_interruption(task, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
                 if force_task_prompt:
                     save_task_runtime_state(
@@ -834,7 +1021,6 @@ class DeliveryLoop:
             elif runtime_completed:
                 clear_task_runtime_failure(self.project_root, task.id)
             last_block_reason = "failed after retry budget was exhausted"
-            review_artifact_path: str | None = None
             review_status: str | None = None
             cycle_count = 0
             test_fix_attempts = 0
@@ -922,7 +1108,7 @@ class DeliveryLoop:
                     self._execute_session_prompt(current.id, session, fix_prompt)
                 except RuntimeErrorResponse as exc:
                     if exc.kind in {"stalled_runtime", "runtime_interrupted"}:
-                        return self._prepare_stalled_runtime_recovery(current, session, exc)
+                        return self._handle_runtime_interruption(current, session, exc)
                     return self._block_task_for_runtime_failure(task.id, session, exc)
             tasks = all_tasks(self.project_root)
             patch_relative_path = park_task_exception_changes(self.project_root, task)
@@ -992,6 +1178,11 @@ class DeliveryLoop:
         )
         patch_relative_path = park_task_exception_changes(self.project_root, current) if current is not None else None
         patch_notice = f" [exception patch: {patch_relative_path}]" if patch_relative_path else ""
+        patch_provenance: dict[str, Any] = {
+            "status": "created" if patch_relative_path else "not_created",
+            "patch_path": patch_relative_path,
+            "created_at": utc_now_iso(),
+        }
         tasks = all_tasks(self.project_root)
         repeated_block = repeated_task_runtime_failure_block(self.project_root, task_id)
         blocked_reason = repeated_block["message"] if isinstance(repeated_block, dict) else (failure_prefix + failure_message)
@@ -1012,6 +1203,13 @@ class DeliveryLoop:
             self.project_root,
             task_id,
             {
+                "status": "exception",
+                "completed_at": utc_now_iso(),
+                "exit_code": exc.returncode,
+                "session_id": resolved_session_id,
+                "failure_kind": exc.kind,
+                "failure_message": failure_message,
+                "recovery_prompt": None,
                 "escalation": {
                     "status": "required",
                     "kind": "runtime_failure",
@@ -1020,7 +1218,8 @@ class DeliveryLoop:
                     "session_id": resolved_session_id,
                     "failure_kind": exc.kind,
                     "exception_report": exception_report,
-                }
+                },
+                "exception_patch_provenance": patch_provenance,
             },
         )
         _release_session_after_exception(self.project_root, session)
@@ -1045,6 +1244,56 @@ class DeliveryLoop:
                 "repair_report": None,
                 "deferred_task_ids": incomplete_non_final_feature_ids,
             }
+        invalid_verified = blocking_verified_task_issues(self.project_root, tasks)
+        invalid_verified.pop(FINAL_VERIFY_TASK_ID, None)
+        if invalid_verified:
+            repair_candidates = list(invalid_verified)
+            tasks, repair_task_id, repair_limit_reached = _ensure_final_repair_task(
+                self.project_root,
+                tasks,
+                repair_candidates=repair_candidates,
+                results=[],
+                missing_test_types=[],
+                non_verified_gates=[],
+            )
+            if repair_task_id and not repair_limit_reached:
+                tasks = _invalidate_prefinal_audit_after_repair(tasks, repair_task_id)
+            tasks = mark_task(
+                tasks,
+                FINAL_VERIFY_TASK_ID,
+                "blocked",
+                completed_at=None,
+                review_status=None,
+                review_artifact=None,
+                reviewed_at=None,
+                verified_at=None,
+                blocked_reason=(
+                    f"final verification found invalid verified-task evidence; repair through {repair_task_id}"
+                    if repair_task_id
+                    else "final verification found invalid verified-task evidence and cannot create another repair bundle"
+                ),
+            )
+            save_tasks(self.project_root, tasks)
+            save_task_runtime_state(
+                self.project_root,
+                FINAL_VERIFY_TASK_ID,
+                {
+                    "final_verify_status": "repair_required" if repair_task_id else "blocked",
+                    "final_verify_invalid_verified_tasks": invalid_verified,
+                    "repair_candidates": repair_candidates,
+                    "repair_task_id": repair_task_id,
+                    "final_repair_limit_reached": repair_limit_reached,
+                },
+            )
+            return {
+                "passed": False,
+                "status": "repair_required" if repair_task_id else "blocked",
+                "summary": "final verification found invalid verified-task evidence",
+                "repair_candidates": repair_candidates,
+                "repair_task_id": repair_task_id,
+                "repair_report": None,
+                "invalid_verified_tasks": invalid_verified,
+            }
         results = run_full_suite(self.project_root, mode=suite_mode)
         summary = test_results_to_summary(results)
         gates_payload = refresh_gates(self.project_root)
@@ -1054,6 +1303,44 @@ class DeliveryLoop:
         requirement_coverage = check_requirements_coverage(self.project_root, requirements_payload)
         missing_test_types = check_test_type_coverage(self.project_root)
         semantic_findings = scan_production_semantics(self.project_root)
+        system_gap_issues = system_gap_ledger_issues(self.project_root)
+        environment_blocked = has_environment_failures(results)
+        has_system_gap_fix = any(task.id == PREFINAL_AUDIT_TASK_ID for task in tasks)
+        effective_system_gap_issues = system_gap_issues if has_system_gap_fix else []
+        hard_gates = _final_release_hard_gates(
+            full_suite_passed=all(result.passed for result in results),
+            requirement_coverage=requirement_coverage,
+            missing_test_types=missing_test_types,
+            non_verified_gates=non_verified_gates,
+            semantic_findings=semantic_findings,
+            system_gap_issues=effective_system_gap_issues,
+        )
+        if effective_system_gap_issues and not environment_blocked:
+            tasks = _requeue_system_gap_fix(
+                tasks,
+                "System Gap Fix must re-scan before final verification: " + "; ".join(effective_system_gap_issues[:3]),
+            )
+            save_tasks(self.project_root, tasks)
+            save_task_runtime_state(
+                self.project_root,
+                FINAL_VERIFY_TASK_ID,
+                {
+                    "final_verify_status": "repair_required",
+                    "final_verify_system_gap_issues": effective_system_gap_issues,
+                    "final_release_hard_gates": hard_gates,
+                    "repair_candidates": [PREFINAL_AUDIT_TASK_ID],
+                    "repair_task_id": PREFINAL_AUDIT_TASK_ID,
+                },
+            )
+            return {
+                "passed": False,
+                "status": "repair_required",
+                "summary": "final verification requires a fresh System Gap Fix scan",
+                "repair_candidates": [PREFINAL_AUDIT_TASK_ID],
+                "repair_task_id": PREFINAL_AUDIT_TASK_ID,
+                "repair_report": None,
+                "system_gap_issues": effective_system_gap_issues,
+            }
         semantic_report_artifact = write_semantic_scan_report(self.project_root, semantic_findings)
         release_path = render_release_evidence(self.project_root, summary, requirement_coverage, missing_test_types)
         final_review_path = self.project_root / "docs" / "reviews" / "final-review.md"
@@ -1064,9 +1351,8 @@ class DeliveryLoop:
                 if line.lower().startswith("status:"):
                     final_review_status = line.split(":", 1)[1].strip()
                     break
-        ready_for_final_review = all(result.passed for result in results) and requirement_coverage["all_covered"] and not missing_test_types and not non_verified_gates and not semantic_findings
+        ready_for_final_review = all(result.passed for result in results) and requirement_coverage["all_covered"] and not missing_test_types and not non_verified_gates and not semantic_findings and not effective_system_gap_issues
         final_pass = ready_for_final_review and str(final_review_status or "").strip().casefold() == "pass"
-        environment_blocked = has_environment_failures(results)
         if environment_blocked:
             repair_candidates: list[str] = []
         else:
@@ -1088,9 +1374,7 @@ class DeliveryLoop:
         repair_required = (environment_blocked or bool(repair_candidates)) and not repair_path_exhausted
         repair_task_id = None
         final_repair_limit_reached = False
-        if environment_blocked and current_repair_is_environment and current_repair_task is not None and current_repair_task.status == "exception":
-            repair_task_id = current_repair_task.id
-        elif repair_candidates and current_repair_task is not None and current_repair_task.status == "exception":
+        if (environment_blocked and current_repair_is_environment and current_repair_task is not None and current_repair_task.status == "exception") or (repair_candidates and current_repair_task is not None and current_repair_task.status == "exception"):
             repair_task_id = current_repair_task.id
         elif repair_required and environment_blocked:
             environment_plan = build_environment_repair_plan(
@@ -1140,6 +1424,8 @@ class DeliveryLoop:
                     for gate in non_verified_gates
                 ],
                 "final_verify_semantic_findings": [finding.__dict__ for finding in semantic_findings],
+                "final_verify_system_gap_issues": effective_system_gap_issues,
+                "final_release_hard_gates": hard_gates,
                 "semantic_report_artifact": semantic_report_artifact,
                 "final_repair_limit_reached": final_repair_limit_reached,
                 "final_verify_status": "pass" if final_pass else ("review_pending" if ready_for_final_review else ("environment_blocked" if environment_blocked and repair_required else ("repair_required" if repair_required else "blocked"))),
@@ -1169,6 +1455,9 @@ class DeliveryLoop:
                     review_status="pass",
                     review_artifact="docs/reviews/final-review.md",
                     reviewed_at=utc_now_iso(),
+                    verification_source="final_verification",
+                    verification_actor="framework",
+                    verification_reason="full verification and pass final review evidence",
                     blocked_reason=None,
                 )
             elif ready_for_final_review:
@@ -1279,6 +1568,45 @@ class DeliveryLoop:
             if task is None:
                 exception_retry = self._next_exception_task_to_retry(tasks)
                 if exception_retry is not None:
+                    reapply_result = try_reapply_task_exception_patch(self.project_root, exception_retry.id)
+                    prior_runtime_state = normalize_task_runtime_state(load_task_runtime_state(self.project_root, exception_retry.id))
+                    patch_was_created = str((prior_runtime_state.get("exception_patch_provenance") or {}).get("status") or "").strip() == "created"
+                    if reapply_result.get("status") == "missing" and patch_was_created:
+                        reapply_result = {
+                            **reapply_result,
+                            "status": "unaccounted_missing",
+                            "reason": "exception patch was previously created but is missing before retry",
+                        }
+                    save_task_runtime_state(
+                        self.project_root,
+                        exception_retry.id,
+                        {
+                            "exception_patch_reapply": reapply_result,
+                            "exception_patch_conflict": reapply_result if reapply_result.get("status") == "conflict" else None,
+                        },
+                    )
+                    append_task_log_event(
+                        self.project_root,
+                        runtime="framework",
+                        level="ERROR" if reapply_result.get("status") == "conflict" else "INFO",
+                        message="Exception patch reapply result",
+                        task_id=exception_retry.id,
+                        task_title=exception_retry.title,
+                        extra=reapply_result,
+                    )
+                    if reapply_result.get("status") in {"conflict", "unaccounted_missing"}:
+                        return {
+                            "status": "exception",
+                            "task_id": exception_retry.id,
+                            "reason": (
+                                "exception patch conflict requires resolution before retry"
+                                if reapply_result.get("status") == "conflict"
+                                else "exception patch disappeared before retry and requires investigation"
+                            ),
+                            "exception_task_ids": [exception_retry.id],
+                            "exception_patch_conflict": reapply_result if reapply_result.get("status") == "conflict" else None,
+                            "exception_patch_reapply": reapply_result,
+                        }
                     tasks = reset_task(tasks, exception_retry.id)
                     save_tasks(self.project_root, tasks)
                     task = next((row for row in tasks if row.id == exception_retry.id), None)

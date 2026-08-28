@@ -66,6 +66,137 @@ def test_decompose_tasks_inserts_builtin_foundations(tmp_path: Path) -> None:
     assert payload["items"][1]["intent"]["objective"].startswith("Create the minimal shared")
     assert "Do not preinstall project-wide technology packages" in payload["items"][1]["intent"]["non_goals"][-1]
 
+
+def test_decompose_tasks_keeps_generated_ids_contiguous_after_seed_merge(tmp_path: Path) -> None:
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Feature",
+                "requirements": ["REQ-001"],
+                "technology_constraints": [],
+                "output_tests": ["backend/tests/test_feature.py"],
+                "output_paths": ["backend/app/feature.py"],
+            },
+            {
+                "title": "Seed Data and Environment Tooling",
+                "requirements": ["NFR-013", "NFR-014"],
+                "output_tests": ["backend/tests/integration/test_seed_reload.py"],
+                "output_paths": ["backend/app/services/seed.py"],
+            },
+            {
+                "title": "Feature validation",
+                "task_kind": "validation",
+                "requirements": ["REQ-001"],
+                "dependencies": ["Feature"],
+                "output_tests": ["backend/tests/test_feature_validation.py"],
+                "output_paths": ["docs/reviews/test-report-feature.md"],
+            },
+        ],
+        include_shared_foundation=True,
+    )
+
+    generated_ids = [
+        int(item["id"][1:])
+        for item in payload["items"]
+        if item["id"].startswith("T") and item["id"][1:].isdigit() and 2 <= int(item["id"][1:]) < 900
+    ]
+    assert generated_ids == list(range(2, max(generated_ids) + 1))
+    foundation = next(item for item in payload["items"] if item["id"] == "T001")
+    assert {"NFR-013", "NFR-014"}.issubset(foundation["requirements"])
+    assert not any(item["title"] == "Seed Data and Environment Tooling" for item in payload["items"])
+
+
+def test_decompose_tasks_rejects_requirement_without_feature_owner(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "Policy", "summary": "Policy"}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="REQ-001"):
+        decompose_tasks(
+            tmp_path,
+            [
+                {
+                    "title": "Policy validation",
+                    "task_kind": "validation",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "output_tests": ["backend/tests/test_policy.py"],
+                    "output_paths": ["docs/reviews/policy.md"],
+                }
+            ],
+            include_shared_foundation=True,
+        )
+
+
+def test_decompose_tasks_allows_explicit_validation_only_requirement(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "Recovery check", "summary": "Recovery check", "implementation_required": False}],
+                "acceptance_scenarios": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = decompose_tasks(
+        tmp_path,
+        [
+            {
+                "title": "Recovery validation",
+                "task_kind": "validation",
+                "requirements": ["REQ-001"],
+                "acceptance_scenarios": [],
+                "output_tests": ["backend/tests/test_recovery.py"],
+                "output_paths": ["docs/reviews/recovery.md"],
+            }
+        ],
+        include_shared_foundation=True,
+    )
+
+    assert any(item["title"] == "Recovery validation" for item in payload["items"])
+
+
+def test_decompose_tasks_rejects_unowned_acceptance_scenario(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps(
+            {
+                "requirements": [{"id": "REQ-001", "title": "Policy", "summary": "Policy"}],
+                "acceptance_scenarios": [{"id": "AS-001", "title": "Policy flow", "summary": "Policy flow", "source_requirement_ids": ["REQ-001"]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="AS-001"):
+        decompose_tasks(
+            tmp_path,
+            [
+                {
+                    "title": "Policy feature",
+                    "task_kind": "feature",
+                    "requirements": ["REQ-001"],
+                    "acceptance_scenarios": [],
+                    "output_tests": ["backend/tests/test_policy.py"],
+                    "output_paths": ["backend/app/policy.py"],
+                }
+            ],
+            include_shared_foundation=True,
+        )
+
 def test_decompose_tasks_preserves_normalized_task_intent(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -539,6 +670,50 @@ def test_validate_gate_references_rejects_unknown_scope_task() -> None:
         assert "unknown task id" in str(exc)
     else:
         raise AssertionError("expected invalid gate scope task reference to fail")
+
+
+def test_import_decompose_rejects_unknown_gate_task_before_persisting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from delivery.errors import DeliveryError
+    from delivery.stage_harness import import_decompose
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "requirements.json").write_text(
+        json.dumps({"requirements": [{"id": "REQ-001", "title": "One", "summary": "One"}], "acceptance_scenarios": []}),
+        encoding="utf-8",
+    )
+    input_path = tmp_path / ".app-delivery-runtime" / "stage-inputs" / "task-decompose.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "items": [
+            {
+                "title": "Feature",
+                "requirements": ["REQ-001"],
+                "technology_constraints": [],
+                "output_tests": ["backend/tests/test_feature.py"],
+                "output_paths": ["backend/app/feature.py"],
+            }
+        ],
+        "delivery_complexity": {"tier": "S", "signals": {"estimated_tasks": 1}},
+        "validation_gates": [
+            {
+                "id": "GATE-feature",
+                "scope_tasks": ["T999"],
+                "scope_requirements": ["REQ-001"],
+                "required_test_types": ["api"],
+            }
+        ],
+    }
+    input_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr("delivery.stage_harness.require_planning_review_pass", lambda *args, **kwargs: {})
+
+    with pytest.raises(DeliveryError) as exc_info:
+        import_decompose(tmp_path, payload, input_path)
+
+    assert exc_info.value.code == "stage_output_invalid"
+    assert "unknown task id: T999" in exc_info.value.message
+    assert not (tmp_path / "docs" / "work-items.json").exists()
+    assert not (tmp_path / "docs" / "gates.json").exists()
 
 def test_validate_gate_references_rejects_unscoped_gate() -> None:
     tasks = [
@@ -1432,9 +1607,9 @@ def test_decompose_tasks_collapses_foundation_scope_task_without_exact_title_mat
     )
 
     by_id = {item["id"]: item for item in payload["items"]}
-    assert "T002" not in by_id
+    assert "T002" in by_id
     assert "backend/src/shared/services/task_manager.py" in by_id["T001"]["output_paths"]
-    assert by_id["T003"]["dependencies"] == ["T001"]
+    assert by_id["T002"]["dependencies"] == ["T001"]
 
 def test_decompose_tasks_raises_on_dependency_cycle(tmp_path: Path) -> None:
     docs_dir = tmp_path / "docs"

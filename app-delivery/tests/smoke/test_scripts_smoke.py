@@ -31,6 +31,15 @@ def test_shell_scripts_have_valid_syntax() -> None:
         assert result.returncode == 0, result.stdout
 
 
+def test_setup_opc_replaces_live_skills_directly() -> None:
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "setup-opc.sh"
+    text = script_path.read_text(encoding="utf-8")
+
+    assert "SKILLS_BACKUP_ROOT" not in text
+    assert 'rm -rf "$SKILLS_DST"' in text
+    assert 'cp -R "$INSTALL_ROOT/skills/." "$SKILLS_DST/"' in text
+
+
 def test_shell_scripts_support_help() -> None:
     scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
     for name in SCRIPTS:
